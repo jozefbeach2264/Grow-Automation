@@ -49,7 +49,7 @@ fired deterministically; the AI only sees the resulting state.
 
 ---
 
-## Quick start
+## Quick start (Linux / macOS)
 
 ```bash
 # 1. Clone
@@ -59,7 +59,8 @@ cd Grow-Automation
 # 2. Install Python dependencies
 pip install requests python-dotenv
 
-# 3. Install Ollama (https://ollama.com/download) and pull the model
+# 3. (Optional) Install Ollama and pull a model -- skip if running AI-less
+#    https://ollama.com/download
 ollama pull qwen2.5:3b-instruct
 
 # 4. Configure your environment
@@ -71,10 +72,79 @@ cp .env.example .env
 python poller.py
 ```
 
-The poller authenticates, fetches all devices, then enters a poll loop. In
-advisory mode the AI logs its reasoning but does not touch hardware. To enable
-live control of non-chemical outputs, set `ADVISORY_MODE=false` in `.env` and
-restart.
+## Quick start (Windows)
+
+The system is pure Python with no Linux-specific dependencies, so it runs
+unchanged on Windows.
+
+```powershell
+# 1. Install Python 3.11+ from python.org (tick "Add to PATH")
+# 2. (Optional) Install Ollama for Windows from https://ollama.com/download/windows
+# 3. In Windows Terminal or PowerShell:
+
+git clone https://github.com/jozefbeach2264/Grow-Automation.git
+cd Grow-Automation
+
+python -m venv venv
+.\venv\Scripts\Activate.ps1            # PowerShell
+# (use venv\Scripts\activate.bat in cmd, source venv/Scripts/activate in Git Bash)
+
+pip install requests python-dotenv
+
+ollama pull qwen2.5:3b-instruct        # only if running with AI
+
+copy .env.example .env
+notepad .env                            # fill in credentials, calendar, role mappings
+
+python poller.py
+```
+
+For long-running deployment on Windows, three options ranked best to simplest:
+
+1. **NSSM** ([nssm.cc](https://nssm.cc/)) — wraps `python poller.py` as a real
+   Windows service with auto-restart. Closest equivalent to systemd. Recommended
+   once you have plants in the loop.
+2. **Task Scheduler** — set "Trigger: at log on" with action
+   `python.exe poller.py` and a working directory. Set-and-forget for personal use.
+3. **Leave Windows Terminal open** — fine for development.
+
+Command syntax that differs from Linux/macOS:
+
+| Linux/macOS | Windows |
+|---|---|
+| `python3 poller.py` | `python poller.py` (or `py poller.py`) |
+| `source venv/bin/activate` | `venv\Scripts\Activate.ps1` (PowerShell) |
+| `cp .env.example .env` | `copy .env.example .env` |
+| `kill 1234` | `taskkill /F /PID 1234` |
+
+`nvidia-perf.service` in the repo is a systemd unit — Linux only. It locks GPU
+clocks on laptops where the driver throttles aggressively. Windows users don't
+need it; NVIDIA's Windows driver handles clocks differently.
+
+---
+
+## Run modes
+
+The poller picks behavior from two `.env` flags:
+
+| `AI_ENABLED` | `ADVISORY_MODE` | What happens |
+|---|---|---|
+| `true` | `true` | AI runs, logs proposals + deterministic enforcement plan, **no hardware writes** |
+| `true` | `false` | **Default live mode.** AI proposes, deterministic chain validates and executes, schedule + CO2 enforcement fire on top |
+| `false` | `false` | **Deterministic-only.** No LLM ever called. Schedule (lights/fans), CO2 pulse modulator, CO2 emergency dump, reservoir gates all still active. Sensor monitoring + trends tracked. Manual control via the AC Infinity app for anything chemistry-related |
+| `false` | `true` | Polling display only. No AI, no enforcement. Pure sensor read-out |
+
+**The deterministic-only mode (`AI_ENABLED=false ADVISORY_MODE=false`) is the
+right pick if:**
+
+- You don't want to run a local LLM
+- Your hardware can't run Ollama (e.g. Raspberry Pi)
+- You want a smart-thermostat + safety supervisor and prefer manual control of
+  nutrient and pH dosing
+
+In this mode the system becomes: schedule-driven lights and fans, hysteresis-
+band CO2 pulse around your per-week target, deterministic CO2 emergency dump
+on threshold breach, and live sensor + trend display. No LLM dependency.
 
 ---
 

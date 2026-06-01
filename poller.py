@@ -236,8 +236,12 @@ def main():
     token = get_or_refresh_token(EMAIL, PASSWORD, str(ENV_PATH))
     print(f"Token acquired. Polling every {INTERVAL}s. Ctrl-C to stop.\n")
 
+    # build_snapshot is needed for deterministic enforcement even when AI is off,
+    # so it imports unconditionally. The AI-specific helpers stay gated below.
+    from ai_advisor import build_snapshot
+
     if AI_ENABLED:
-        from ai_advisor import ask_ai, build_snapshot, print_advice, execute_actions, warmup
+        from ai_advisor import ask_ai, print_advice, execute_actions, warmup
         from profile_manager import (
             active_profile_label, log_cycle,
             track_actions, record_outcomes, has_pending_outcomes,
@@ -245,6 +249,15 @@ def main():
         mode = "ADVISORY" if ADVISORY_MODE else "LIVE CONTROL"
         print(f"AI advisor enabled ({mode} mode).  Profile: {active_profile_label()}")
         warmup()
+        print()
+    else:
+        mode = "ADVISORY" if ADVISORY_MODE else "DETERMINISTIC LIVE"
+        print(f"AI advisor DISABLED ({mode} mode).")
+        print(f"  - Schedule enforcement (lights/fans/CO2 pulse) "
+              f"{'ACTIVE' if not ADVISORY_MODE else 'inactive (advisory)'}")
+        print(f"  - CO2 emergency dump "
+              f"{'ACTIVE' if not ADVISORY_MODE else 'inactive (advisory)'}")
+        print(f"  - Sensor monitoring active either way")
         print()
 
     ai_failure_count = 0
@@ -258,141 +271,130 @@ def main():
                     f"DISPLAY_ORDER_{name_slug(d['name'])}", "99")))
                 print(f"{'='*60}")
                 uptime    = elapsed(START_TIME)
-                cycle_str = f"last AI: {elapsed(LAST_AI_TIME)} ago" if LAST_AI_TIME else "first cycle"
-                print(f"  Poll at {ts}  |  up: {uptime}  |  {cycle_str}  |  {len(devices)} device(s)")
+                if AI_ENABLED:
+                    cycle_str = (f"last AI: {elapsed(LAST_AI_TIME)} ago"
+                                 if LAST_AI_TIME else "first cycle")
+                else:
+                    cycle_str = "no AI"
+                print(f"  Poll at {ts}  |  up: {uptime}  |  {cycle_str}  "
+                      f"|  {len(devices)} device(s)")
                 for dev in devices:
                     print_device(dev)
                 print()
 
+                # --- Deterministic foundation -- runs regardless of AI ---
+                snapshot = build_snapshot(devices)
+
+                active = False
                 if AI_ENABLED:
-                    snapshot = build_snapshot(devices)
-                    record_outcomes(snapshot)   # settle any pending action outcomes
+                    record_outcomes(snapshot)
                     active = has_pending_outcomes()
 
-                    wl_source = snapshot.get("water_level_source", "SENSOR")
-                    if wl_source == "MANUAL":
-                        wl_trend = snapshot.get("trends", {}).get("water_level", "?")
-                        print(f"  [MANUAL] Water level: {wl_trend}  "
-                              f"(set WATER_LEVEL_TREND= in .env to change)")
-                    elif wl_source == "MISSING":
-                        print("  [WARN] Water level: no sensor and no WATER_LEVEL_TREND set -- "
-                              "res health gate will HOLD all parameters")
+                wl_source = snapshot.get("water_level_source", "SENSOR")
+                if wl_source == "MANUAL":
+                    wl_trend = snapshot.get("trends", {}).get("water_level", "?")
+                    print(f"  [MANUAL] Water level: {wl_trend}  "
+                          f"(set WATER_LEVEL_TREND= in .env to change)")
+                elif wl_source == "MISSING":
+                    print("  [WARN] Water level: no sensor and no WATER_LEVEL_TREND set -- "
+                          "res health gate will HOLD all parameters")
 
-                    rh = snapshot.get("res_health", {})
-                    if rh:
-                        print(f"  [RES] {rh['state']}  "
-                              f"water:{rh['water_trend']}  ec:{rh['ec_trend']}  "
-                              f"co2:{rh['co2_gate']}  dose:{rh['dose_gate']}  ph:{rh['ph_gate']}")
+                rh = snapshot.get("res_health", {})
+                if rh:
+                    print(f"  [RES] {rh['state']}  "
+                          f"water:{rh['water_trend']}  ec:{rh['ec_trend']}  "
+                          f"co2:{rh['co2_gate']}  dose:{rh['dose_gate']}  ph:{rh['ph_gate']}")
 
-                    # Schedule status (always shown so deltas are visible at a glance)
-                    exp = snapshot.get("expected", {})
-                    lt  = exp.get("light", {})
-                    if lt:
-                        print(f"  [SCHED] light: "
-                              f"{'ON' if lt.get('on') else 'OFF'} "
-                              f"@ speed {lt.get('speed', 0)}  ({lt.get('reason', '')})")
-                    deltas = snapshot.get("schedule_deltas", [])
-                    if deltas:
-                        for d in deltas:
-                            print(f"  [SCHED] DELTA {d['device']} port {d['port']} "
-                                  f"({d['kind']}): expected {d['expected_value']}, "
-                                  f"actual {d['actual_value']}  -- {d['reason']}")
-                    else:
-                        print("  [SCHED] all schedule outputs in sync")
+                exp = snapshot.get("expected", {})
+                lt  = exp.get("light", {})
+                if lt:
+                    print(f"  [SCHED] light: "
+                          f"{'ON' if lt.get('on') else 'OFF'} "
+                          f"@ speed {lt.get('speed', 0)}  ({lt.get('reason', '')})")
+                deltas = snapshot.get("schedule_deltas", [])
+                if deltas:
+                    for d in deltas:
+                        print(f"  [SCHED] DELTA {d['device']} port {d['port']} "
+                              f"({d['kind']}): expected {d['expected_value']}, "
+                              f"actual {d['actual_value']}  -- {d['reason']}")
+                else:
+                    print("  [SCHED] all schedule outputs in sync")
 
-                    # CO2 emergency dump -- highest priority, runs BEFORE the AI
-                    # cycle. If CO2 exceeded the trigger, force valve OFF and
-                    # exhaust to max regardless of what the AI wants.
-                    em_fired = []
-                    if not ADVISORY_MODE:
-                        em_fired = enforce_co2_emergency(snapshot, devices, token)
+                # --- Pre-AI CO2 emergency dump (highest priority) ---
+                executed_actions: list[dict] = []
+                if not ADVISORY_MODE:
+                    em_fired = enforce_co2_emergency(snapshot, devices, token)
+                    executed_actions.extend(em_fired)
 
+                # --- Optional AI cycle ---
+                ai_result = None
+                ai_next   = None
+                if AI_ENABLED:
                     print("  [AI] Thinking...", flush=True)
-                    ai_start = time.time()
-                    result = ask_ai(snapshot)
-                    if result:
+                    ai_start  = time.time()
+                    ai_result = ask_ai(snapshot)
+                    if ai_result:
                         ai_failure_count = 0
-                        ai_elapsed = elapsed(ai_start)
                         LAST_AI_TIME = time.time()
-                        print(f"  [AI] Response in {ai_elapsed}")
-                        print_advice(result)
-                        executed_actions = []
-                        if not ADVISORY_MODE and result.get("actions"):
-                            execute_actions(result, devices, token, snapshot=snapshot)
-                            executed_actions = result.get("actions", [])
-                            if executed_actions:
-                                track_actions(executed_actions, snapshot)
+                        print(f"  [AI] Response in {elapsed(ai_start)}")
+                        print_advice(ai_result)
+                        if not ADVISORY_MODE and ai_result.get("actions"):
+                            execute_actions(ai_result, devices, token, snapshot=snapshot)
+                            ai_actions = ai_result.get("actions", [])
+                            if ai_actions:
+                                track_actions(ai_actions, snapshot)
+                                executed_actions.extend(ai_actions)
                                 active = True
+                        ai_next = ai_result.get("next_check_seconds")
+                    else:
+                        ai_failure_count += 1
+                        print(f"  [AI] No result (failure #{ai_failure_count})")
 
-                        # Deterministic schedule fallback -- fires any deltas
-                        # the AI failed to correct. Only in LIVE mode.
-                        if not ADVISORY_MODE:
-                            fired = enforce_schedule_fallback(
-                                snapshot, executed_actions, devices, token)
-                            if fired:
-                                executed_actions = list(executed_actions) + fired
-                                active = True
+                # --- Schedule fallback + emergency re-check (always in LIVE) ---
+                if not ADVISORY_MODE:
+                    fired = enforce_schedule_fallback(
+                        snapshot, executed_actions, devices, token)
+                    if fired:
+                        executed_actions.extend(fired)
+                        active = True
 
-                        # Re-enforce CO2 emergency AFTER the AI cycle -- if the
-                        # AI somehow re-enabled the valve or dropped the exhaust,
-                        # we slam it back to safe state in the same cycle.
-                        if not ADVISORY_MODE and snapshot.get("co2_emergency"):
-                            re_fired = enforce_co2_emergency(snapshot, devices, token)
-                            if re_fired:
-                                executed_actions = list(executed_actions) + re_fired
-                                active = True
-
-                        # Merge any pre-AI emergency actions into the logged set
-                        if em_fired:
-                            executed_actions = list(em_fired) + list(executed_actions)
+                    if snapshot.get("co2_emergency"):
+                        re_em = enforce_co2_emergency(snapshot, devices, token)
+                        if re_em:
+                            executed_actions.extend(re_em)
                             active = True
 
-                        log_cycle(snapshot, executed_actions)
+                # --- Log cycle (when AI ran successfully) ---
+                if AI_ENABLED and ai_result:
+                    log_cycle(snapshot, executed_actions)
 
-                        # Adaptive sleep: active (adjusting) vs stable
-                        ai_next = result.get("next_check_seconds")
-                        if active or executed_actions:
-                            sleep_for = ACTIVE_INTERVAL
-                            mode_str  = "ACTIVE"
-                        else:
-                            sleep_for = STABLE_INTERVAL
-                            mode_str  = "STABLE"
-                        # AI can request a shorter check, never longer
-                        if ai_next and ai_next < sleep_for:
-                            sleep_for = max(ai_next, 30)
-                        print(f"  [--] Mode: {mode_str}  next poll in {sleep_for}s")
-                        time.sleep(sleep_for)
-                        continue
-                    else:
-                        # AI returned None -- schedule + CO2 emergency must
-                        # still be enforced before the backoff sleep.
-                        if not ADVISORY_MODE:
-                            # Emergency was already enforced pre-AI; re-check
-                            # in case CO2 climbed during the failed AI call
-                            re_em = enforce_co2_emergency(snapshot, devices, token)
-                            fired = enforce_schedule_fallback(
-                                snapshot, list(em_fired) + list(re_em),
-                                devices, token)
-                            if fired:
-                                print(f"  [SCHED] {len(fired)} fallback action(s) "
-                                      "fired despite AI failure")
+                # --- Sleep decision ---
+                if AI_ENABLED and ai_result:
+                    sleep_for = ACTIVE_INTERVAL if (active or executed_actions) else STABLE_INTERVAL
+                    mode_str  = "ACTIVE" if (active or executed_actions) else "STABLE"
+                    if ai_next and ai_next < sleep_for:
+                        sleep_for = max(ai_next, 30)
+                    print(f"  [--] Mode: {mode_str}  next poll in {sleep_for}s")
+                elif AI_ENABLED and not ai_result:
+                    sleep_for = min(INTERVAL * (2 ** min(ai_failure_count - 1, 5)), 1800)
+                    print(f"  [AI] backing off {sleep_for}s after failure #{ai_failure_count}")
+                else:
+                    # Deterministic-only mode (no AI). Faster cadence when actions
+                    # fired this cycle, regular interval otherwise.
+                    sleep_for = ACTIVE_INTERVAL if executed_actions else INTERVAL
+                    mode_str  = "DET-ACTIVE" if executed_actions else "DET-IDLE"
+                    print(f"  [--] Mode: {mode_str}  next poll in {sleep_for}s  (no AI)")
 
-                        # Exponential backoff so a broken Ollama doesn't get
-                        # hammered every 30s.
-                        ai_failure_count += 1
-                        backoff = min(INTERVAL * (2 ** min(ai_failure_count - 1, 5)), 1800)
-                        print(f"  [AI] No result -- backing off {backoff}s "
-                              f"(failure #{ai_failure_count})")
-                        time.sleep(backoff)
-                        continue
+                time.sleep(sleep_for)
 
             except ACInfinityAuthError:
                 print("Token expired -- re-authenticating...")
                 os.environ["AC_INFINITY_TOKEN"] = ""
                 token = get_or_refresh_token(EMAIL, PASSWORD, str(ENV_PATH))
+                time.sleep(INTERVAL)
             except Exception as e:
                 print(f"Poll error: {e}")
-            time.sleep(INTERVAL)
+                time.sleep(INTERVAL)
     except KeyboardInterrupt:
         print("\nStopped.")
 

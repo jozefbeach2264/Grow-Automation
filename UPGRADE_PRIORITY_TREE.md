@@ -2,6 +2,37 @@
 
 Status: draft master roadmap
 
+## Progress (2026-06-02) -- PR #1 `safety-leak-burst-verify` (pending merge)
+
+**Layer 1 -- DONE (1-6):**
+- #1 Manual kill switch / dosing disable -- `safety_state.py` chemical-only freeze
+  (`DOSING_DISABLED` + persistent `profiles/.safety_state.json`), enforced in `filter_actions`.
+- #2 Reservoir gate enforcement, #3 schema validation, #4 preflight -- shipped earlier.
+- #5 Read-after-write verification -- `read_port_state`/`verify_port_state`; failed
+  doser/pH stop -> retry -> freeze dosing. `VERIFY_WRITES`.
+- #6 Persistent lockouts -- shipped earlier.
+
+**Also shipped this session:**
+- Reservoir-burst response (water/chemical only: stop dosers + close CO2; lights/vent
+  NEVER cut), off the boolean leak sensor (`water_leak`) with debounce. `RES_BURST_ENABLED`.
+- Evac pump tracks leak (`EVAC_PUMP=<dev>:<port>`).
+- Two `sensorType=20` sensors split by device (`LEAK_SENSOR`): leak->water_leak, float->water_level.
+- Water-level FLOAT mode (`WATER_LEVEL_FLOAT`): boolean magnetic float, dry->FALLING/wet->STATIC.
+- `RESERVOIR_VOLUME_GAL` (default 60) in the AI snapshot.
+- Bug fixes: `labels.env` slug `RDWC_CONTROL`->`HYDROPONICS_CONTROL` (had disabled the chem
+  gate); `set_outlet` missing dev_type; CO2 pulse reopening valve during burst; burst KeyError.
+
+**Layer 1 -- REMAINING:**
+- #7 Timed dosing with forced stop (`TIMED_DOSING_PLAN.md`). Read-after-write stop
+  verification is now available to build on. Needs HDS3 + `RESERVOIR_VOLUME_GAL` for real dosing.
+- #8 Watchdog heartbeat / active-dose crash recovery (`WATCHDOG_HEARTBEAT_PLAN.md`).
+
+**Follow-ups / blockers (hardware + ops):**
+- Merge PR #1; re-ingest the local RAG afterward (index lags these changes).
+- Wire `EVAC_PUMP=Auxiliary Outputs:<port>` when the evac pump is ordered/installed.
+- Flip `WATER_LEVEL_FLOAT=false` when an ultrasonic/analog depth sensor replaces the float.
+- HDS3 hydro probe still not submerged/reading -- blocks all live chemical dosing validation.
+
 ## Purpose
 
 This file organizes the upgrade work into layers so implementation stays focused.

@@ -23,6 +23,8 @@ from ac_infinity_client import (
     parse_device,
     set_outlet,
     set_port_speed,
+    verify_port_state,
+    ramp_seconds,
 )
 from utils import name_slug
 
@@ -174,6 +176,76 @@ def enforce_co2_emergency(snapshot: dict, devices: list, token: str) -> list:
     return fired
 
 
+def enforce_res_burst(snapshot: dict, devices: list, token: str) -> list:
+    """
+    Fire the reservoir-burst shutdown deterministically. HIGHEST priority -- runs
+    before the CO2 emergency and the AI cycle. Scope is WATER/CHEMICAL ONLY: stop
+    dosers + close the CO2 valve. Lights, exhaust, and fans are never commanded
+    here (cutting ventilation/lighting is never acceptable, burst or not). Also
+    trips the persistent dosing freeze so chemicals stay off until manually cleared.
+    Returns the actions actually executed (empty when no burst is active).
+    """
+    rb = snapshot.get("res_burst")
+    if not rb or not rb.get("active"):
+        return []
+
+    print(f"  [!!! RES BURST !!!] {rb['reason']}")
+    dev_map = {d["name"]: d for d in devices}
+    fired   = []
+    for a in rb.get("actions", []):
+        dev = dev_map.get(a["device"])
+        if not dev:
+            print(f"  [RES-BURST] Unknown device '{a['device']}' -- cannot enforce")
+            continue
+        try:
+            if a["action"] == "set_outlet":
+                set_outlet(token, dev["dev_id"], a["port"], bool(a["value"]), dev["type"])
+            elif a["action"] == "set_speed":
+                set_port_speed(token, dev["dev_id"], a["port"], int(a["value"]), dev["type"])
+            else:
+                print(f"  [RES-BURST] Unknown action '{a['action']}' -- skipping")
+                continue
+            print(f"  [RES-BURST] {a['device']} port {a['port']} -> "
+                  f"{a['action']}={a['value']}  ({a['reason']})")
+            fired.append(a)
+        except Exception as e:
+            print(f"  [RES-BURST] FAILED {a['device']} port {a['port']}: {e}")
+
+    # Read-after-write: confirm each doser actually reached 0; retry any that didn't.
+    # These are the most critical stops (active leak), so verification is mandatory.
+    if os.getenv("VERIFY_WRITES", "true").strip().lower() != "false":
+        for a in fired:
+            if a["action"] != "set_speed" or int(a.get("value") or 0) != 0:
+                continue
+            dev = dev_map.get(a["device"])
+            try:
+                res = verify_port_state(token, dev["dev_id"], a["port"],
+                                        {"speed_actual": 0, "tolerance": 0},
+                                        timeout_sec=ramp_seconds(0, 10) + 10)
+            except ACInfinityAuthError:
+                print(f"  [RES-BURST] auth failure verifying {a['device']} port {a['port']}")
+                continue
+            if res["ok"]:
+                print(f"  [RES-BURST] verified stop {a['device']} port {a['port']} ({res['elapsed_sec']}s)")
+            else:
+                obs = (res.get("observed") or {}).get("speed_actual")
+                print(f"  [!!! RES-BURST !!!] stop UNVERIFIED {a['device']} port {a['port']} "
+                      f"(observed speed {obs}) -- retrying")
+                try:
+                    set_port_speed(token, dev["dev_id"], a["port"], 0, dev["type"])
+                except Exception as e:
+                    print(f"  [RES-BURST] retry stop failed: {e}")
+
+    # Persist a chemical freeze so dosing stays off across cycles/restarts until the
+    # user inspects and clears it. Climate is unaffected.
+    try:
+        from safety_state import disable_dosing
+        disable_dosing(f"reservoir burst (water_leak={rb.get('water_leak')})")
+    except Exception as e:
+        print(f"  [RES-BURST] could not persist dosing freeze: {e}")
+    return fired
+
+
 def enforce_schedule_fallback(snapshot: dict, executed_actions: list,
                               devices: list, token: str) -> list:
     """
@@ -291,8 +363,11 @@ def main():
                     active = has_pending_outcomes()
 
                 wl_source = snapshot.get("water_level_source", "SENSOR")
-                if wl_source == "MANUAL":
-                    wl_trend = snapshot.get("trends", {}).get("water_level", "?")
+                wl_trend = snapshot.get("trends", {}).get("water_level", "?")
+                if wl_source == "FLOAT":
+                    print(f"  [FLOAT] Water level: {wl_trend}  "
+                          f"(magnetic float -- reposition daily to the drawdown line)")
+                elif wl_source == "MANUAL":
                     print(f"  [MANUAL] Water level: {wl_trend}  "
                           f"(set WATER_LEVEL_TREND= in .env to change)")
                 elif wl_source == "MISSING":
@@ -320,9 +395,44 @@ def main():
                 else:
                     print("  [SCHED] all schedule outputs in sync")
 
-                # --- Pre-AI CO2 emergency dump (highest priority) ---
+                # --- Reservoir leak / burst (highest priority; water/chemical only) ---
+                # Alert always, even in ADVISORY mode, so a leak is never silent.
+                leak = snapshot.get("leak", {})
+                if leak.get("wet"):
+                    print(f"  [LEAK] water_leak WET (raw={leak.get('raw')}, "
+                          f"streak={leak.get('streak')}, confirmed={leak.get('confirmed')})")
+                rb = snapshot.get("res_burst")
+                if rb and rb.get("active"):
+                    print(f"  [!!! RES BURST ALERT !!!] {rb['reason']}")
+
                 executed_actions: list[dict] = []
                 if not ADVISORY_MODE:
+                    # Burst shutdown runs before everything else (stops dosers,
+                    # closes CO2; lights/ventilation untouched).
+                    burst_fired = enforce_res_burst(snapshot, devices, token)
+                    if burst_fired:
+                        executed_actions.extend(burst_fired)
+                        active = True
+
+                    # Evac pump tracks the leak sensor (ON when confirmed wet, OFF when
+                    # dry). Independent of RES_BURST_ENABLED; gated by EVAC_PUMP config.
+                    ev = snapshot.get("evac_pump")
+                    if ev:
+                        evdev = {d["name"]: d for d in devices}.get(ev["device"])
+                        if not evdev:
+                            print(f"  [EVAC] Unknown device '{ev['device']}' -- cannot run evac pump")
+                        else:
+                            try:
+                                set_outlet(token, evdev["dev_id"], ev["port"],
+                                           bool(ev["value"]), evdev["type"])
+                                print(f"  [EVAC] {ev['device']} port {ev['port']} -> "
+                                      f"set_outlet={ev['value']}  ({ev['reason']})")
+                                executed_actions.append(ev)
+                                active = True
+                            except Exception as e:
+                                print(f"  [EVAC] FAILED {ev['device']} port {ev['port']}: {e}")
+
+                    # --- Pre-AI CO2 emergency dump ---
                     em_fired = enforce_co2_emergency(snapshot, devices, token)
                     executed_actions.extend(em_fired)
 

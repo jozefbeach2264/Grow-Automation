@@ -206,6 +206,71 @@ API call. Rules (all thresholds configurable in `.env`):
 
 ---
 
+## Read-after-write verification (`VERIFY_WRITES`)
+
+A 200 from the AC Infinity API only proves the write was *accepted*, not that the port
+physically changed. After each write the system polls readback until the port reports
+the expected state (Level 2 verification):
+
+- `read_port_state(token, dev_id, port)` / `verify_port_state(token, dev_id, port,
+  expected, ...)` live in `ac_infinity_client.py`. `expected` is `{"powered": bool}` or
+  `{"speed_actual": int, "tolerance": int}`. Returns `{ok, reason, observed, attempts,
+  elapsed_sec}`. Timeouts use the ramp model (`ramp_seconds`); outlets use 15s.
+- `ai_advisor.execute_actions` verifies every write (`_verify_executed_action`). Doser/pH
+  use tolerance 0; fans/lights tolerance 1.
+- **Critical auto-trip:** a doser/pH **STOP** that fails verification is retried once; if
+  it still won't confirm, `disable_dosing()` FREEZES dosing — a pump that won't stop is a
+  chemical hazard. (This is the safety link the dosing freeze was built for.)
+- `poller.enforce_res_burst` also verifies + retries its doser stops (most critical case).
+- Gated by `VERIFY_WRITES=true` (default). The `SIM` token always skips (sim_runner).
+
+## Kill switch & reservoir-burst shutdown (`safety_state.py`)
+
+Two **separate** safety concepts — deliberately not unified, because killing
+ventilation/lighting is itself a hazard and must never cascade from a chemical fault.
+
+**1. Chemical freeze (`dosing_disabled`) — chemicals only.**
+- Blocks doser + pH ports in `filter_actions()`. Lights, fans, exhaust, CO2 keep
+  running normally. Stops (speed 0 / outlet off) are always allowed.
+- Sources (OR'd): env `DOSING_DISABLED=true` (coarse manual), or a persisted trip in
+  `profiles/.safety_state.json` (atomic write, survives restart).
+- API: `safety_state.disable_dosing(reason)` to trip (use for fail-safe auto-trips like
+  a failed pump-stop once read-after-write lands), `clear_dosing_disable()` to lift.
+- Corrupt/missing state file → treated as NOT disabled (won't silently block).
+
+**2. Reservoir-burst shutdown — WATER/CHEMICAL ONLY. Never cuts lights or ventilation.**
+- `ai_advisor.compute_res_burst()` detects; `poller.enforce_res_burst()` actuates as the
+  highest-priority pre-AI step. Scope: stop all doser/pH ports + close the CO2 valve.
+  It does not enumerate or command `ROLE_LIGHT`, `ROLE_EXHAUST`, or `ROLE_OSC_FANS`.
+- On fire, also calls `disable_dosing()` so chemicals stay frozen until manual clear.
+- **Inert by default.** Requires `RES_BURST_ENABLED=true`. Trips off the **boolean
+  leak sensor** (`water_leak`, the `LEAK_SENSOR` device's `sensorType=20`), wet =
+  nonzero. Needs `RES_BURST_DEBOUNCE` consecutive wet reads (default 2) so one noisy
+  reading can't freeze dosing. Never triggers off `water_level` or the manual
+  `WATER_LEVEL_TREND` (false-trip protection).
+- Detected always (alert printed even in `ADVISORY_MODE`); actuates only in LIVE.
+- Wet/dry raw values confirmed `0=dry / 1=wet` on the ACI water sensors (2026-06).
+
+**3. Evac pump (`compute_evac_pump` / poller).** When the leak sensor is confirmed wet,
+turn an evac pump outlet **ON** to pump water out; turn it **OFF** when the sensor reads
+dry (so it never runs dry). Gated by `EVAC_PUMP=<device>:<port>` (blank = no action),
+independent of `RES_BURST_ENABLED`. Fires a `set_outlet` only when the desired state
+differs from the pump's current `powered` state (no redundant writes). Shares the one
+debounced leak assessment (`snapshot["leak"]`, `_assess_leak`) with res-burst, so both
+react to the same confirmed signal. Not a doser — unaffected by the dosing freeze.
+
+### Two `sensorType=20` water sensors (split by device)
+
+Both the leak detector and the reservoir-level float report as `sensorType=20`, so
+they collide on the cross-device sensor merge unless separated. `build_snapshot`
+splits them by device name:
+- `LEAK_SENSOR` device (default `Auxiliary Outputs`, accessPort 1) -> `water_leak`
+  (boolean; feeds res-burst only).
+- Any other device's `sensorType=20` (here `Hydroponics Control`, accessPort 2) ->
+  `water_level` (reservoir level; feeds `res_health` trends / manual override).
+
+---
+
 ## Reservoir health gate
 
 `res_health_check()` in `ai_advisor.py` evaluates water + EC trends each cycle.
@@ -232,19 +297,25 @@ Result is attached to every snapshot as `snapshot["res_health"]` and printed eac
 Week advancement: AI only suggests advancing `GROW_WEEK` if state has been IDEAL or GOOD
 for at least 2 consecutive cycles.
 
-### Water level manual override
+### Water level source (FLOAT / manual / analog)
 
-Water level sensor is pending (ultrasonic planned). Until then, report trend manually:
+`build_snapshot` resolves the `water_level` trend from one of three sources, in priority
+order, and reports which via `snapshot["water_level_source"]`:
 
-```
-WATER_LEVEL_TREND=FALLING   # plant drinking, res dropping
-WATER_LEVEL_TREND=STATIC    # level holding
-WATER_LEVEL_TREND=RISING    # something wrong
-WATER_LEVEL_TREND=           # clear — sensor takes over automatically
-```
+1. **`WATER_LEVEL_FLOAT=true` — boolean magnetic float (current setup).** The reservoir
+   sensor (`sensorType=20` on Hydroponics Control, accessPort 2) is a wet/dry float the
+   user repositions daily to the expected drawdown line. **dry(0) → FALLING** (water fell
+   below today's line), **wet(nonzero) → STATIC**. `_trend` is bypassed for it — a 0↔1
+   delta never clears the 1.0 threshold, so it would otherwise read STATIC forever. A
+   single float can't detect RISING; use the manual override for problem states. Source
+   reported as `FLOAT`; poller prints `[FLOAT] Water level: ...`.
+2. **`WATER_LEVEL_TREND` manual override** (`FALLING`/`STATIC`/`RISING`) — fallback when
+   FLOAT is off or the float isn't reading. Source `MANUAL`.
+3. **Analog/depth sensor via `_trend`** — for a future ultrasonic sensor. Set
+   `WATER_LEVEL_FLOAT=false` when one is installed. Source `SENSOR`.
 
-Poller prints `[MANUAL] Water level: FALLING` each cycle when override is active.
-If neither sensor nor override is present, gate sees UNKNOWN and holds all parameters.
+If none resolve, source is `MISSING` and the res-health gate sees UNKNOWN (holds all).
+Note the float is the reservoir-LEVEL sensor; the LEAK sensor is separate (`water_leak`).
 
 ---
 
@@ -447,9 +518,21 @@ PH_LOCKOUT_MINUTES=20
 MAX_DOSER_SPEED=2               # global speed cap for doser ports (per-port overrides win)
 MAX_DOSE_ML_CYCLE=50
 OUTCOME_WAIT_CYCLES=2           # cycles (× POLL_INTERVAL_ACTIVE) before reading outcome
+VERIFY_WRITES=true              # read-after-write verify; failed doser/pH stop -> retry then freeze dosing
 
-# Water level (manual until ultrasonic sensor installed)
-WATER_LEVEL_TREND=FALLING       # FALLING / STATIC / RISING / blank=use sensor
+# Reservoir
+RESERVOIR_VOLUME_GAL=60         # active filled volume; anchors mL->ppm/pH dose math. Default 60, <=0 falls back to 60. Surfaced in AI snapshot as reservoir_volume_gal.
+
+# Safety kill switches
+DOSING_DISABLED=false           # true = freeze doser/pH ports only (climate untouched)
+RES_BURST_ENABLED=false         # arm reservoir-burst shutdown (water/chemical only; never cuts lights/vent)
+RES_BURST_DEBOUNCE=2            # consecutive WET leak reads before tripping (1 = first read)
+LEAK_SENSOR=Auxiliary Outputs   # device whose sensorType=20 is the boolean leak detector (-> water_leak)
+EVAC_PUMP=                      # <device>:<port> evac pump outlet (ON while leak wet, OFF when dry); blank = none
+
+# Water level -- FLOAT (boolean magnetic float, repositioned daily) takes priority
+WATER_LEVEL_FLOAT=true          # true: dry(0)->FALLING, wet(1)->STATIC. false when analog/ultrasonic installed
+WATER_LEVEL_TREND=FALLING       # manual fallback: FALLING / STATIC / RISING / blank
 
 # Nutrient targets
 PPM_SCALE=500                   # 500=Hanna/Eutech  700=Truncheon/Bluelab

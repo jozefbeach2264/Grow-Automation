@@ -17,6 +17,7 @@ from grow_state import current_grow_week_and_stage, days_into_current_stage
 from schedule import (compute_schedule_deltas, expected_light_state,
                       expected_osc_fan_state, compute_co2_emergency,
                       compute_co2_pulse)
+from safety_state import dosing_disable_status, disable_dosing
 
 OLLAMA_HOST   = os.getenv("OLLAMA_HOST",   "http://localhost:11434")
 # Default chosen via head-to-head benchmark (model_benchmark.py): qwen2.5:3b-instruct
@@ -45,6 +46,17 @@ def _max_doser_speed() -> int:
 
 def _max_dose_ml_cycle() -> float:
     return float(os.getenv("MAX_DOSE_ML_CYCLE", "50.0"))
+
+def _reservoir_volume_gal() -> float:
+    """Active reservoir volume in gallons. Dose-size math (mL delivered -> ppm /
+    pH shift) is meaningless without it -- a 0.5 mL pH dose hits very differently
+    in 20 gal vs 60 gal. Default 60; override with RESERVOIR_VOLUME_GAL. A bad/
+    non-positive value falls back to the 60 gal default rather than poisoning math."""
+    try:
+        vol = float(os.getenv("RESERVOIR_VOLUME_GAL", "60"))
+    except ValueError:
+        return 60.0
+    return vol if vol > 0 else 60.0
 
 
 # Lockout state. Loaded from disk on module import; persisted on every update
@@ -291,6 +303,12 @@ def filter_actions(actions: list, snapshot: dict | None = None) -> list:
     ph_gate    = res_health.get("ph_gate",   "HOLD")
     co2_gate   = res_health.get("co2_gate",  "HOLD")
 
+    # Chemical-only freeze (manual kill via DOSING_DISABLED=true, or a fail-safe
+    # auto-trip after a failed pump-stop). Blocks doser/pH ports only -- climate
+    # (lights, fans, exhaust, CO2) is intentionally left running, since killing
+    # ventilation/lighting is its own hazard. Stops stay allowed (is_safety_dir).
+    dosing_off, dosing_reason = dosing_disable_status()
+
     for a in actions:
         key      = f"{a['device']}:{a['port']}"
         is_ph    = _is_ph_port(a["device"], a["port"])
@@ -304,6 +322,12 @@ def filter_actions(actions: list, snapshot: dict | None = None) -> list:
         is_stop_speed = (action_type == "set_speed"  and int(value or 0) == 0)
         is_outlet_off = (action_type == "set_outlet" and not bool(value))
         is_safety_dir = is_stop_speed or is_outlet_off
+
+        # 0-. Chemical freeze: block any dosing-direction action on doser/pH ports.
+        #     Climate ports are unaffected. Stops fall through (is_safety_dir).
+        if dosing_off and (is_doser or is_ph) and not is_safety_dir:
+            print(f"  [SAFETY] Blocked {key}: dosing disabled -- {dosing_reason}")
+            continue
 
         # 0. Hard block: never dose pH ports without a live pH reading
         if is_ph and not is_safety_dir and "ph" not in _snapshot_sensors:
@@ -845,6 +869,115 @@ def res_health_check(trends: dict) -> dict:
     }
 
 
+_leak_wet_streak = 0  # consecutive cycles the boolean leak sensor has read wet
+
+
+def _res_burst_enabled() -> bool:
+    return os.getenv("RES_BURST_ENABLED", "").strip().lower() == "true"
+
+
+def _res_burst_debounce() -> int:
+    """Consecutive WET reads before a leak is 'confirmed' (min 1). Guards against a
+    single glitchy reading nuisance-tripping the response. Set 1 to act on first wet."""
+    try:
+        return max(1, int(os.getenv("RES_BURST_DEBOUNCE", "2")))
+    except ValueError:
+        return 2
+
+
+def _assess_leak(all_sensors: dict) -> dict:
+    """Debounced boolean leak assessment from `water_leak` (0=dry, nonzero=wet).
+    Manages the cross-cycle wet streak in ONE place so every consumer (res-burst,
+    evac pump) shares the same confirmed state. Returns {raw, wet, confirmed, streak}.
+    Must be called exactly once per cycle -- build_snapshot does this."""
+    global _leak_wet_streak
+    raw = all_sensors.get("water_leak")
+    if raw is None or float(raw) == 0.0:
+        _leak_wet_streak = 0
+        return {"raw": raw, "wet": False, "confirmed": False, "streak": 0}
+    _leak_wet_streak += 1
+    return {"raw": raw, "wet": True,
+            "confirmed": _leak_wet_streak >= _res_burst_debounce(),
+            "streak": _leak_wet_streak}
+
+
+def compute_res_burst(snapshot: dict) -> dict | None:
+    """When a leak is CONFIRMED wet (see _assess_leak) and RES_BURST_ENABLED, return a
+    WATER/CHEMICAL-ONLY shutdown: stop every doser/pH port + close the CO2 valve.
+    Lights and ventilation are NEVER cut -- there is deliberately no full-power kill.
+    Reads snapshot['leak']; never touches water_level or the manual WATER_LEVEL_TREND.
+    """
+    if not _res_burst_enabled():
+        return None
+    leak = snapshot.get("leak") or {}
+    if not leak.get("confirmed"):
+        return None
+
+    # Shutdown scope: WATER/CHEMICAL ONLY. Stop every doser/pH port and close the CO2
+    # valve. Lights, exhaust, and fans are deliberately never enumerated or commanded.
+    actions: list[dict] = []
+    for dev in snapshot.get("devices", []):
+        name = dev.get("name")
+        for p in dev.get("ports", []):
+            port = p.get("port")
+            if _is_doser_port(name, port):
+                actions.append({"device": name, "port": port, "action": "set_speed",
+                                "value": 0, "reason": "res burst -- stop doser/pH pump"})
+            elif _is_co2_valve(name, port):
+                actions.append({"device": name, "port": port, "action": "set_outlet",
+                                "value": False, "reason": "res burst -- close CO2 valve"})
+
+    return {
+        "active":     True,
+        "water_leak": leak.get("raw"),
+        "streak":     leak.get("streak"),
+        "actions":    actions,
+        "reason":     f"leak sensor wet ({leak.get('streak')} consecutive reads) "
+                      "-- reservoir leak/burst; stop dosers + close CO2 "
+                      "(lights/ventilation left running)",
+    }
+
+
+def _evac_pump_target() -> tuple[str, int] | None:
+    """Parse EVAC_PUMP=<device>:<port>. Returns (device, port) or None if unset/blank."""
+    raw = os.getenv("EVAC_PUMP", "").strip()
+    if not raw or ":" not in raw:
+        return None
+    dev, _, port = raw.rpartition(":")
+    try:
+        return dev.strip(), int(port)
+    except ValueError:
+        return None
+
+
+def compute_evac_pump(snapshot: dict) -> dict | None:
+    """Evac pump tracks the leak sensor: ON once a leak is CONFIRMED wet, OFF when dry.
+    Gated by EVAC_PUMP=<device>:<port> (no config -> no action). Returns a set_outlet
+    delta ONLY when the desired state differs from the pump's current powered state, so
+    it never spams writes or runs the pump dry. Not a doser -- not subject to the
+    dosing freeze; water removal is always desirable during a leak."""
+    tgt = _evac_pump_target()
+    if not tgt:
+        return None
+    device, port = tgt
+    leak = snapshot.get("leak") or {}
+    if leak.get("raw") is None:
+        return None  # no leak sensor reading -- do not command the pump blind
+    desired_on = bool(leak.get("confirmed"))   # ON after debounced wet; OFF when dry
+    current = None
+    for dev in snapshot.get("devices", []):
+        if dev.get("name") != device:
+            continue
+        for p in dev.get("ports", []):
+            if p.get("port") == port:
+                current = p.get("powered")
+    if current is not None and bool(current) == desired_on:
+        return None  # already in the desired state -- no redundant write
+    return {"device": device, "port": port, "action": "set_outlet", "value": desired_on,
+            "reason": ("leak confirmed -- evac pump ON" if desired_on
+                       else "leak clear -- evac pump OFF")}
+
+
 def build_snapshot(devices: list[dict]) -> dict:
     """Build a clean sensor + state snapshot to send to the model."""
     week, stage = current_grow_week_and_stage()
@@ -887,9 +1020,19 @@ def build_snapshot(devices: list[dict]) -> dict:
         for key, label in [("co2_ppm", "co2_ppm"), ("light", "light")]:
             if dev.get(key) is not None:
                 entry["sensors"][label] = dev[key]
-        # Hydro sensors
+        # Hydro sensors. The leak sensor and the reservoir-level sensor are BOTH
+        # sensorType=20 (parsed as water_level) but live on different devices, so
+        # they must be split or they collide on the cross-device merge. The device
+        # named by LEAK_SENSOR exposes its water reading as the boolean `water_leak`
+        # (feeds res-burst); any other device's water_level is the reservoir level
+        # (feeds res_health). Default leak device: "Auxiliary Outputs".
+        leak_device = os.getenv("LEAK_SENSOR", "Auxiliary Outputs").strip()
         for key in ("ph", "tds_ppm", "ec_us", "ec_ms", "water_temp_f", "water_level"):
-            if dev.get(key) is not None:
+            if dev.get(key) is None:
+                continue
+            if key == "water_level" and dev["name"] == leak_device:
+                entry["sensors"]["water_leak"] = dev[key]
+            else:
                 entry["sensors"][key] = dev[key]
         # Ports
         for p in dev.get("ports", []):
@@ -909,24 +1052,47 @@ def build_snapshot(devices: list[dict]) -> dict:
     for dev in snapshot["devices"]:
         all_sensors.update(dev.get("sensors", {}))
 
+    # Debounced leak assessment (single source of truth for res-burst + evac pump),
+    # plus the evac-pump delta (ON when leak confirmed wet, OFF when dry).
+    snapshot["leak"] = _assess_leak(all_sensors)
+    evac = compute_evac_pump(snapshot)
+    if evac:
+        snapshot["evac_pump"] = evac
+
     trends = {}
-    for label in ("ph", "ec_ms", "ec_us", "tds_ppm", "water_level"):
+    for label in ("ph", "ec_ms", "ec_us", "tds_ppm"):
         if label in all_sensors:
             trends[label] = _trend(label, all_sensors[label])
 
-    # Manual water level override -- used when sensor is absent or unreliable
-    manual_wl = os.getenv("WATER_LEVEL_TREND", "").strip().upper()
-    if manual_wl in ("FALLING", "STATIC", "RISING"):
+    # Water-level trend. Source priority:
+    #   1. Boolean magnetic float (WATER_LEVEL_FLOAT=true) -- a real sensor, manually
+    #      repositioned each day to the expected drawdown line. dry(0) = water has
+    #      fallen below today's line -> FALLING; wet(nonzero) = still at/above it ->
+    #      STATIC. A single float cannot see RISING; use the manual override for that.
+    #      _trend is NOT used here -- a 0<->1 delta never clears the 1.0 threshold.
+    #   2. Manual WATER_LEVEL_TREND override (FALLING/STATIC/RISING).
+    #   3. Analog/depth sensor via _trend (future ultrasonic).
+    float_mode = os.getenv("WATER_LEVEL_FLOAT", "").strip().lower() == "true"
+    manual_wl  = os.getenv("WATER_LEVEL_TREND", "").strip().upper()
+    if float_mode and "water_level" in all_sensors:
+        trends["water_level"] = "STATIC" if float(all_sensors["water_level"]) != 0 else "FALLING"
+        snapshot["water_level_source"] = "FLOAT"
+    elif manual_wl in ("FALLING", "STATIC", "RISING"):
         trends["water_level"] = manual_wl
         snapshot["water_level_source"] = "MANUAL"
-    elif "water_level" not in trends:
+    elif "water_level" in all_sensors:
+        trends["water_level"] = _trend("water_level", all_sensors["water_level"])
+        snapshot["water_level_source"] = "SENSOR"
+    else:
         # No sensor and no manual override -- gate will see UNKNOWN and hold
         snapshot["water_level_source"] = "MISSING"
-    else:
-        snapshot["water_level_source"] = "SENSOR"
 
     if trends:
         snapshot["trends"] = trends
+
+    # Active reservoir volume -- anchors dose-size math (mL -> ppm / pH shift).
+    # Surfaced in the snapshot so the AI computes dose impact against real volume.
+    snapshot["reservoir_volume_gal"] = _reservoir_volume_gal()
 
     # Reservoir health gate -- anchor for all parameter decisions
     snapshot["res_health"] = res_health_check(trends)
@@ -943,15 +1109,23 @@ def build_snapshot(devices: list[dict]) -> dict:
 
     snapshot["schedule_deltas"] = compute_schedule_deltas(snapshot)
 
+    # Reservoir burst -- computed BEFORE CO2 modulation so the pulse can defer to it.
+    # The only full-stop trigger, and even it is water/chemical only (lights +
+    # ventilation never cut). Inert unless RES_BURST_ENABLED + a wet leak sensor.
+    rb = compute_res_burst(snapshot)
+    if rb:
+        snapshot["res_burst"] = rb
+
     # CO2 emergency dump -- evaluated AFTER schedule deltas so AI sees both.
     # When active, deterministic enforcement in poller forces these actions
     # regardless of what the AI proposes.
     co2_em = compute_co2_emergency(snapshot)
     if co2_em:
         snapshot["co2_emergency"] = co2_em
-    else:
-        # CO2 pulse modulator -- only runs when no emergency is active.
-        # Holds co2_ppm within target +/- CO2_PULSE_BAND_PPM.
+    elif not snapshot.get("res_burst"):
+        # CO2 pulse modulator -- runs only when no emergency AND no res burst is
+        # active. During a burst the valve is force-closed; the pulse must not
+        # reopen it in the same cycle (schedule fallback runs after the burst close).
         pulse_delta = compute_co2_pulse(snapshot)
         if pulse_delta:
             snapshot["schedule_deltas"].append(pulse_delta)
@@ -1040,8 +1214,68 @@ def print_advice(result: dict):
               f"{a['action']}={a['value']}  ({a['reason']})")
 
 
+def _verify_writes_enabled(token) -> bool:
+    """Read-after-write verification is on by default. Skipped for the SIM sentinel
+    and when VERIFY_WRITES=false (test rigs / when readback churn isn't wanted)."""
+    if token == "SIM":
+        return False
+    return os.getenv("VERIFY_WRITES", "true").strip().lower() != "false"
+
+
+def _verify_executed_action(token, dev: dict, a: dict) -> dict:
+    """Poll readback to confirm a write physically took effect (Level 2 verification).
+    For a doser/pH STOP that can't be verified, retry the stop once and -- if it still
+    won't confirm -- FREEZE dosing: a pump that won't stop is a critical chemical
+    hazard. Climate is untouched. Returns the verification result dict."""
+    from ac_infinity_client import (verify_port_state, ramp_seconds,
+                                     set_port_speed, ACInfinityAuthError)
+    device, port, act, val = a["device"], a["port"], a["action"], a.get("value")
+    is_chem = _is_doser_port(device, port) or _is_ph_port(device, port)
+
+    if act == "set_outlet":
+        expected, timeout = {"powered": bool(val)}, 15.0
+    else:  # set_speed
+        expected = {"speed_actual": int(val), "tolerance": 0 if is_chem else 1}
+        timeout = ramp_seconds(int(val), 10) + 10.0
+
+    try:
+        res = verify_port_state(token, dev["dev_id"], port, expected, timeout_sec=timeout)
+    except ACInfinityAuthError:
+        print(f"  [VERIFY] auth failure verifying {device} port {port} -- poller will re-auth")
+        return {"ok": False, "reason": "auth_failed"}
+
+    if res["ok"]:
+        print(f"  [VERIFY] {device} port {port} {act}={val} -> verified ({res['elapsed_sec']}s)")
+        return res
+    print(f"  [VERIFY] {device} port {port} {act}={val} -> UNVERIFIED: {res['reason']}")
+
+    is_stop = (act == "set_speed" and int(val or 0) == 0) or (act == "set_outlet" and not bool(val))
+    if is_chem and is_stop:
+        print(f"  [VERIFY] CRITICAL: doser/pH stop unverified on {device} port {port} -- retrying stop")
+        try:
+            set_port_speed(token, dev["dev_id"], port, 0, dev["type"])
+        except Exception as e:
+            print(f"  [VERIFY] retry stop write failed: {e}")
+        try:
+            res2 = verify_port_state(token, dev["dev_id"], port,
+                                     {"speed_actual": 0, "tolerance": 0},
+                                     timeout_sec=ramp_seconds(0, 10) + 10.0)
+        except ACInfinityAuthError:
+            res2 = {"ok": False, "reason": "auth_failed", "observed": None}
+        if res2["ok"]:
+            print(f"  [VERIFY] retry stop verified ({res2['elapsed_sec']}s)")
+            return res2
+        obs = (res2.get("observed") or {}).get("speed_actual")
+        disable_dosing(f"doser/pH stop NOT verified on {device} port {port} "
+                       f"(observed speed {obs}) -- pump may still be running")
+        print(f"  [!!! VERIFY CRITICAL !!!] {device} port {port} still not stopped -- DOSING FROZEN")
+        return res2
+    return res
+
+
 def execute_actions(result: dict, devices: list[dict], token: str, snapshot: dict | None = None):
-    """Validate -> safety-gate -> execute approved actions via the AC Infinity API."""
+    """Validate -> safety-gate -> execute approved actions via the AC Infinity API.
+    Each successful write is read-after-write verified (unless disabled / SIM)."""
     from ac_infinity_client import set_port_speed, set_outlet
 
     proposed  = result.get("actions", [])
@@ -1056,6 +1290,7 @@ def execute_actions(result: dict, devices: list[dict], token: str, snapshot: dic
         print(f"  [SAFETY] {blocked} action(s) blocked by safety gate")
 
     dev_map = {d["name"]: d for d in devices}
+    verify_enabled = _verify_writes_enabled(token)
     executed = []
     for a in safe_actions:
         dev = dev_map.get(a["device"])
@@ -1064,7 +1299,7 @@ def execute_actions(result: dict, devices: list[dict], token: str, snapshot: dic
             continue
         try:
             if a["action"] == "set_outlet":
-                set_outlet(token, dev["dev_id"], a["port"], bool(a["value"]))
+                set_outlet(token, dev["dev_id"], a["port"], bool(a["value"]), dev["type"])
             elif a["action"] == "set_speed":
                 set_port_speed(token, dev["dev_id"], a["port"],
                                int(a["value"]), dev["type"])
@@ -1076,6 +1311,9 @@ def execute_actions(result: dict, devices: list[dict], token: str, snapshot: dic
             executed.append(a)
         except Exception as e:
             print(f"  [EXEC] Failed {a['device']} port {a['port']}: {e}")
+            continue
+        if verify_enabled:
+            _verify_executed_action(token, dev, a)
 
     if executed:
         record_actions(executed)

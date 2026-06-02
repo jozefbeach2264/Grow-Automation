@@ -320,3 +320,84 @@ def ramp_seconds(target_speed: int, current_speed: int = 0, buffer: float = 2.0)
     Add `buffer` (default 2s) for API latency and settling.
     """
     return abs(int(target_speed) - int(current_speed)) + buffer
+
+
+def read_port_state(token: str, dev_id: str, port: int) -> dict | None:
+    """Fetch the current state of a single port, looked up by dev_id (names can
+    change). Returns a normalized dict, or None if device/port isn't found.
+    Raises ACInfinityAuthError on auth failure so the caller can re-auth."""
+    for raw in fetch_all_devices(token):
+        if raw.get("devId") != dev_id:
+            continue
+        dev = parse_device(raw)
+        for p in dev.get("ports", []):
+            if p.get("port") == port:
+                return {
+                    "device_name":  dev.get("name"),
+                    "dev_id":       dev_id,
+                    "dev_type":     dev.get("type"),
+                    "port":         port,
+                    "online":       p.get("online"),
+                    "is_outlet":    p.get("is_outlet"),
+                    "powered":      p.get("powered"),
+                    "speed_actual": p.get("speed_actual"),
+                    "speed_target": p.get("speed_target"),
+                    "mode":         p.get("mode"),
+                }
+    return None
+
+
+def verify_port_state(token: str, dev_id: str, port: int, expected: dict,
+                      timeout_sec: float = 15.0, poll_sec: float = 2.0,
+                      initial_delay: float = 2.0) -> dict:
+    """
+    Read-after-write check: poll the port until it reports `expected` or times out.
+    A 200 from the write only proves the API accepted it -- this proves the port
+    physically reached the state.
+
+    expected shapes:
+        {"powered": True/False}
+        {"speed_actual": <int>, "tolerance": <int, default 0>}
+
+    Returns: {ok, reason, expected, observed, attempts, elapsed_sec}.
+    ACInfinityAuthError propagates so the caller can re-auth.
+    """
+    start = time.monotonic()
+    if initial_delay > 0:
+        time.sleep(initial_delay)
+    attempts = 0
+    observed = None
+    last_reason = "no readback"
+    while time.monotonic() - start < timeout_sec:
+        attempts += 1
+        try:
+            st = read_port_state(token, dev_id, port)
+        except ACInfinityAuthError:
+            raise
+        except Exception as e:
+            last_reason = f"readback error: {e}"
+            time.sleep(poll_sec)
+            continue
+        if st is None:
+            last_reason = "port not found in readback"
+            time.sleep(poll_sec)
+            continue
+        observed = st
+        if "powered" in expected:
+            if bool(st.get("powered")) == bool(expected["powered"]):
+                return {"ok": True, "reason": "verified", "expected": expected,
+                        "observed": st, "attempts": attempts,
+                        "elapsed_sec": round(time.monotonic() - start, 1)}
+            last_reason = f"powered={st.get('powered')} != {expected['powered']}"
+        elif "speed_actual" in expected:
+            tol = int(expected.get("tolerance", 0))
+            act = st.get("speed_actual")
+            if act is not None and abs(int(act) - int(expected["speed_actual"])) <= tol:
+                return {"ok": True, "reason": "verified", "expected": expected,
+                        "observed": st, "attempts": attempts,
+                        "elapsed_sec": round(time.monotonic() - start, 1)}
+            last_reason = f"speed_actual={act} != {expected['speed_actual']} (+/-{tol})"
+        time.sleep(poll_sec)
+    return {"ok": False, "reason": f"timeout: {last_reason}", "expected": expected,
+            "observed": observed, "attempts": attempts,
+            "elapsed_sec": round(time.monotonic() - start, 1)}

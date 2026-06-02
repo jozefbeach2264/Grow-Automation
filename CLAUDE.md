@@ -100,7 +100,9 @@ Ports 3+4 are pH ports via `PH_PORTS_RDWC_CONTROL=3,4` — safety gate applies l
 - All sensor data nested under `raw["deviceInfo"]` — not at the top level
 - Ports at `raw["deviceInfo"]["ports"]` (not "portInfos")
 - Sensor readings in `deviceInfo["sensors"][]` as `{sensorType, sensorData}` pairs
-- Raw sensor values are integers scaled by 100 (divide by 100.0 for real value)
+- Raw sensor values are integers scaled by 100 (divide by 100.0) -- EXCEPT HDS3
+  EC uS/cm (type 14) and TDS ppm (type 16), which are scaled by 10. Per-type factors
+  live in `SENSOR_TYPE` in `ac_infinity_client.py`; never assume a blanket /100.
 - `-32768` (INT16_MIN) is the "no sensor connected" sentinel — skip these
 - `sensorData == 0` also means no reading — skip these too
 
@@ -137,8 +139,8 @@ to be enabled manually after NM brings the hotspot up.
 7  = built-in VPD kPa (*100)      0  = external temp F (*100)
 2  = external humidity (*100)      3  = external VPD (*100)
 11 = CO2 ppm (raw)                12 = light (raw)
-13 = pH (*100)                    14 = EC uS/cm (*100)
-15 = EC mS/cm (*100)              16 = TDS ppm (*100)
+13 = pH (*100)                    14 = EC uS/cm (*10)   <- HDS3 scales /10 not /100
+15 = EC mS/cm (*100, UNVERIFIED)  16 = TDS ppm (*10)    <- verified vs controller 2026-06-02
 18 = water temp F (*100)          20 = water level (raw)
 ```
 

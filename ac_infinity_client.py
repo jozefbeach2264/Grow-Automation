@@ -44,11 +44,11 @@ SENSOR_TYPE = {
     7:  ("vpd",             100.0),   # built-in VPD, kPa*100
     11: ("co2_ppm",           1.0),   # CO2, raw ppm
     12: ("light",             1.0),   # light sensor, raw value
-    13: ("ph",              100.0),   # HDS3 pH*100
-    14: ("ec_us",           100.0),   # HDS3 EC µS/cm*100
-    15: ("ec_ms",           100.0),   # HDS3 EC mS/cm*100
-    16: ("tds_ppm",         100.0),   # HDS3 TDS ppm*100
-    17: ("tds_ppt",         100.0),   # HDS3 TDS ppt*100
+    13: ("ph",              100.0),   # HDS3 pH*100         (raw 738 -> 7.38, verified)
+    14: ("ec_us",            10.0),   # HDS3 EC uS/cm*10    (raw 2334 -> 233.4, verified 2026-06-02)
+    15: ("ec_ms",           100.0),   # HDS3 EC mS/cm -- scale UNVERIFIED (probe not reporting type 15)
+    16: ("tds_ppm",          10.0),   # HDS3 TDS ppm*10     (raw 1657 -> 165.7, matches controller 2026-06-02)
+    17: ("tds_ppt",         100.0),   # HDS3 TDS ppt -- scale UNVERIFIED (probe not reporting type 17)
     18: ("water_temp_f",    100.0),   # HDS3 water temp°F*100
     19: ("water_temp_c",    100.0),   # HDS3 water temp°C*100
     20: ("water_level",       1.0),   # water level sensor, raw

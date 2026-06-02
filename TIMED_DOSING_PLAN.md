@@ -1,6 +1,23 @@
 # Timed Dosing And Forced Stop Plan
 
-Status: draft for review
+Status: NOT STARTED -- prerequisites now in place (2026-06-02)
+
+## Implementation status (2026-06-02)
+
+NOT STARTED, but the scaffolding it depends on now exists:
+- Stop verification (`verify_port_state`, retry-then-freeze) -- DONE, see
+  READBACK_VERIFICATION_PLAN. The "always command 0 in finally, verify it reached 0"
+  requirement is satisfiable today.
+- Crash-safe active-dose record -- `runtime_state.begin_active_dose()` /
+  `mark_active_dose_stopped()` / `clear_active_dose()` are wired; `timed_dose()` only needs
+  to write the record before starting the pump and clear it after the verified stop.
+- The watchdog reads that record via `active_dose_window_port()`, so a legitimate in-window
+  dose is left alone while orphans are killed.
+- Ramp model (`ramp_seconds`, 1 speed/sec) is measured and available for run-time math.
+
+BLOCKED ON HARDWARE: real dosing needs the HDS3 probe reading + `RESERVOIR_VOLUME_GAL`
+(for mL->ppm/pH math) and calibrated per-pump flow. Logic + sim tests can be written now;
+live validation waits on the bucket/probe test.
 
 ## Goal
 

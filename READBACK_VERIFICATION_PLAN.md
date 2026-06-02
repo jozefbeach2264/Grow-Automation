@@ -1,6 +1,23 @@
 # Read-After-Write And Stop Verification Plan
 
-Status: draft for review
+Status: IMPLEMENTED -- Layer 1 #5 (2026-06-02)
+
+## Implementation status (2026-06-02)
+
+DONE. Level 2 readback verification is live:
+- `read_port_state()` / `verify_port_state()` in `ac_infinity_client.py` poll readback
+  until the port reports the expected state (or timeout from the ramp model; outlets 15s).
+- `ai_advisor.execute_actions` verifies every write (`_verify_executed_action`); doser/pH
+  use tolerance 0, fans/lights tolerance 1.
+- A doser/pH STOP that fails verification is retried once, then FREEZES dosing via
+  `safety_state.disable_dosing()` (a pump that won't stop is a chemical hazard).
+- `poller.enforce_res_burst` and the new `poller.doser_watchdog` / `_verified_doser_stop`
+  also verify + retry their doser stops.
+- Gated by `VERIFY_WRITES=true` (default); the `SIM` token always skips.
+
+Remaining (with #7 timed dosing): start-verification ("pump confirmed running from 0")
+feeds the interrupted-dose estimate -- the field is wired (`active_dose.start_verified`)
+but only populated once timed dosing exists.
 
 ## Goal
 

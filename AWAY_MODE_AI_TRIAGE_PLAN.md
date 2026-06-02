@@ -1,6 +1,14 @@
 # Away-Mode AI Triage Plan
 
-Status: draft for review
+Status: NOT STARTED -- Layer 3, gated behind Layers 1-2 (2026-06-02)
+
+## Implementation status (2026-06-02)
+
+NOT STARTED. This is Layer 3 and must wait until Layer 1 is complete (only #7 timed dosing
+remains, blocked on HDS3) and Layer 2 supervised live testing has proven the control path.
+No deterministic stressor list, playbook registry, or escalation yet. The safety primitives
+it will lean on -- reservoir gate, dosing freeze, res-burst, read-after-write, crash
+recovery -- are now in place, so this becomes actionable once live control is trusted.
 
 ## Goal
 

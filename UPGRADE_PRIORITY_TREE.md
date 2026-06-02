@@ -24,8 +24,29 @@ Status: draft master roadmap
 
 **Layer 1 -- REMAINING:**
 - #7 Timed dosing with forced stop (`TIMED_DOSING_PLAN.md`). Read-after-write stop
-  verification is now available to build on. Needs HDS3 + `RESERVOIR_VOLUME_GAL` for real dosing.
-- #8 Watchdog heartbeat / active-dose crash recovery (`WATCHDOG_HEARTBEAT_PLAN.md`).
+  verification is now available to build on, and `runtime_state.begin_active_dose()` /
+  `active_dose_window_port()` are wired so timed dosing only needs to populate the
+  active-dose record. Needs HDS3 + `RESERVOIR_VOLUME_GAL` for real dosing.
+
+**Layer 1 -- #8 watchdog/crash recovery: foundation DONE (`runtime_state.py`).**
+What is wired now (no hardware needed):
+- Heartbeat to `profiles/.runtime_state.json` each cycle (phase, pid, boot_id, wall +
+  monotonic clocks, last poll/api/readback ok). `HEARTBEAT_ENABLED`.
+- Startup crash recovery (`poller.recover_on_startup`): diagnoses how the last run
+  ended (clean / crash / reboot via boot_id / mid-dose), estimates an interrupted dose,
+  stops any running chemical pump, then freezes dosing + opens high-alert.
+- **Nonzero-doser watchdog** (`poller.doser_watchdog`): a doser/pH port running outside
+  an active-dose window is an orphan -> stop + verify + retry + freeze + high-alert.
+  Detect-always / actuate-in-LIVE (same contract as res-burst). `DOSER_WATCHDOG_ENABLED`.
+- High-alert reservoir polling: persisted faster-poll window after a scare
+  (`HIGH_ALERT_POLL_INTERVAL`, `HIGH_ALERT_DURATION_MINUTES`), auto-expires.
+- Append-only event log `profiles/events.jsonl` (process_restarted, active_dose_recovered,
+  stop_recovery_*, estimated_overdose_window, high_alert_*) -- also the Layer 2 ledger seed.
+- Clean-shutdown marker on exit so the next start can tell crash from clean stop.
+- 34/34 self-tests pass (`watchdog_test.py`, mocked hardware).
+Deferred to #7 / hardware: precise interrupted-dose math (needs the active-dose record's
+planned fields from timed dosing); sensor/API freshness watchdogs (need HDS3); systemd
+`Restart=always` + `WatchdogSec` unit.
 
 **Follow-ups / blockers (hardware + ops):**
 - Merge PR #1; re-ingest the local RAG afterward (index lags these changes).

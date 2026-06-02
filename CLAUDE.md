@@ -76,6 +76,7 @@ Ports 3+4 are pH ports via `PH_PORTS_RDWC_CONTROL=3,4` — safety gate applies l
 | `ai_advisor.py` | Ollama reasoning layer (qwen2.5:3b-instruct default), safety gate, res health, trend detection |
 | `profile_manager.py` | Strain profiles, outcome tracking, calibration context builder |
 | `grow_state.py` | Auto-compute current week + stage from `GROW_START_DATE` and `VEG_DAYS` |
+| `runtime_state.py` | Heartbeat, active-dose record, high-alert window, event log -- crash recovery |
 | `utils.py` | Shared text utils (currently just `name_slug`) |
 | `ramp_probe.py` | Standalone CTR89Q port ramp-rate measurement tool |
 | `labels.env` | Port labels, doser ports, pH ports, per-port speed caps, HIDE_AIR flags |
@@ -258,6 +259,41 @@ independent of `RES_BURST_ENABLED`. Fires a `set_outlet` only when the desired s
 differs from the pump's current `powered` state (no redundant writes). Shares the one
 debounced leak assessment (`snapshot["leak"]`, `_assess_leak`) with res-burst, so both
 react to the same confirmed signal. Not a doser — unaffected by the dosing freeze.
+
+## Watchdog & crash recovery (`runtime_state.py`)
+
+Detects a process crash / power loss mid-dose and makes sure no chemical pump is left
+running. Separate from `safety_state.py` (which owns the persistent dosing freeze) --
+this module owns liveness. Two clocks per `WATCHDOG_HEARTBEAT_PLAN.md`: wall clock for
+timestamps/cross-restart math, monotonic for in-process durations (never time a dose
+with the wall clock -- NTP can jump it).
+
+- **Heartbeat** -> `profiles/.runtime_state.json` (atomic, corrupt-tolerant): phase, pid,
+  `boot_id` (changes on reboot, so crash vs reboot is distinguishable), wall + monotonic
+  time, last poll/api/readback ok. Written each cycle by `poller.heartbeat()`. Clean exit
+  writes phase `shutdown`; any other phase on next start = unclean. `HEARTBEAT_ENABLED`.
+- **Startup recovery** (`poller.recover_on_startup`, runs before AI/polling): diagnoses the
+  last run (`diagnose_restart`), estimates an interrupted dose, stops any running chemical
+  pump, then freezes dosing + opens high-alert. Crash mid-dose with nothing currently
+  running still freezes (the gap is unknowable).
+- **Nonzero-doser watchdog** (`poller.doser_watchdog`, every cycle): a doser/pH port
+  running outside an active-dose window is an orphan -> stop + verify + retry + freeze +
+  high-alert. Detect-always / actuate-in-LIVE (same contract as res-burst).
+  `DOSER_WATCHDOG_ENABLED`. `_verified_doser_stop()` is the shared stop+verify+retry helper.
+- **Active-dose record** (`begin_active_dose` / `active_dose_window_port` / `clear_active_dose`):
+  written BEFORE a pump starts so a crash is recoverable. Structure wired now; timed dosing
+  (#7) populates the planned fields. `active_dose_window_port()` returns None until then,
+  so the watchdog treats every running doser as an orphan (correct -- nothing should dose yet).
+- **High-alert window** (`start_high_alert` / `high_alert_status`): persisted faster
+  reservoir polling after a scare; clamps the sleep down to `HIGH_ALERT_POLL_INTERVAL` for
+  `HIGH_ALERT_DURATION_MINUTES`, auto-expires on read. Does not itself gate chemicals
+  (the freeze does that independently).
+- **Event log** `profiles/events.jsonl` (append-only JSONL, `record_event`): process_started,
+  process_restarted, active_dose_*, stop_recovery_*, estimated_overdose_window, high_alert_*,
+  clean_shutdown. Doubles as the Layer 2 action-ledger seed.
+- Tests: `watchdog_test.py` (34 cases, mocked hardware + temp state files).
+- Deferred to #7/hardware: precise dose-estimate math, sensor/API freshness watchdogs
+  (need HDS3), systemd `Restart=always`/`WatchdogSec`.
 
 ### Two `sensorType=20` water sensors (split by device)
 

@@ -27,6 +27,7 @@ from ac_infinity_client import (
     ramp_seconds,
 )
 from utils import name_slug
+import runtime_state
 
 EMAIL           = os.getenv("AC_INFINITY_EMAIL", "")
 PASSWORD        = os.getenv("AC_INFINITY_PASSWORD", "")
@@ -35,6 +36,9 @@ STABLE_INTERVAL = int(os.getenv("POLL_INTERVAL_STABLE", "900"))
 ACTIVE_INTERVAL = int(os.getenv("POLL_INTERVAL_ACTIVE", "60"))
 AI_ENABLED      = os.getenv("AI_ENABLED", "false").lower() == "true"
 ADVISORY_MODE   = os.getenv("ADVISORY_MODE", "true").lower() != "false"
+HEARTBEAT_ENABLED      = os.getenv("HEARTBEAT_ENABLED", "true").strip().lower() != "false"
+DOSER_WATCHDOG_ENABLED = os.getenv("DOSER_WATCHDOG_ENABLED", "true").strip().lower() != "false"
+VERIFY_WRITES          = os.getenv("VERIFY_WRITES", "true").strip().lower() != "false"
 
 START_TIME     = time.time()
 LAST_AI_TIME   = None
@@ -62,6 +66,30 @@ def is_doser_port(dev_name: str, port: int) -> bool:
     if not ports_str:
         return False
     return str(port) in [p.strip() for p in ports_str.split(",")]
+
+
+def is_ph_port(dev_name: str, port: int) -> bool:
+    ports_str = os.getenv(f"PH_PORTS_{name_slug(dev_name)}", "")
+    if not ports_str:
+        return False
+    return str(port) in [p.strip() for p in ports_str.split(",")]
+
+
+def is_chem_port(dev_name: str, port: int) -> bool:
+    """Any port that delivers chemicals -- doser or pH. These should sit at speed 0
+    unless an active timed dose says otherwise; the watchdog enforces that."""
+    return is_doser_port(dev_name, port) or is_ph_port(dev_name, port)
+
+
+def heartbeat(phase: str, **kwargs) -> None:
+    """Thin wrapper so heartbeat writes are a no-op when disabled, and a heartbeat
+    failure can never take down the poll loop."""
+    if not HEARTBEAT_ENABLED:
+        return
+    try:
+        runtime_state.write_heartbeat(phase, **kwargs)
+    except Exception as e:
+        print(f"  [HB] heartbeat write failed ({phase}): {e}")
 
 
 def print_device(dev: dict):
@@ -246,6 +274,151 @@ def enforce_res_burst(snapshot: dict, devices: list, token: str) -> list:
     return fired
 
 
+def _verified_doser_stop(token: str, dev: dict, port: int, tag: str) -> bool:
+    """Command a doser/pH port to speed 0 and confirm via readback; one retry if the
+    first stop will not verify. Returns True only when the port is confirmed at 0.
+    Caller owns the freeze/alert policy on a False return."""
+    try:
+        set_port_speed(token, dev["dev_id"], port, 0, dev["type"])
+    except Exception as e:
+        print(f"  [{tag}] stop write FAILED {dev['name']} port {port}: {e}")
+        return False
+    if not VERIFY_WRITES:
+        return True
+    for attempt in (1, 2):
+        try:
+            res = verify_port_state(token, dev["dev_id"], port,
+                                    {"speed_actual": 0, "tolerance": 0},
+                                    timeout_sec=ramp_seconds(0, 10) + 10)
+        except ACInfinityAuthError:
+            print(f"  [{tag}] auth failure verifying {dev['name']} port {port}")
+            return False
+        if res["ok"]:
+            print(f"  [{tag}] verified stop {dev['name']} port {port} ({res['elapsed_sec']}s)")
+            return True
+        obs = (res.get("observed") or {}).get("speed_actual")
+        if attempt == 1:
+            print(f"  [{tag}] stop UNVERIFIED {dev['name']} port {port} "
+                  f"(observed speed {obs}) -- retrying")
+            try:
+                set_port_speed(token, dev["dev_id"], port, 0, dev["type"])
+            except Exception as e:
+                print(f"  [{tag}] retry stop write failed: {e}")
+                return False
+    return False
+
+
+def doser_watchdog(devices: list, token: str, startup: bool = False) -> list:
+    """Stop any doser/pH port found running outside a legitimate active-dose window.
+
+    A chemical pump should be at speed 0 unless timed dosing (#7) has an in-window
+    active_dose record vouching for it. Anything else -- a pump left running by a
+    crash, a glitch, or a manual change -- is an orphan and a chemical hazard.
+
+    Same contract as the reservoir-burst path: detect (alert + event) in EVERY mode,
+    but only actuate in LIVE. On any orphan it actuates in LIVE, it freezes dosing and
+    opens a high-alert reservoir-polling window. Returns the stop actions executed."""
+    if not DOSER_WATCHDOG_ENABLED:
+        return []
+
+    allowed_port = runtime_state.active_dose_window_port()  # None until #7 lands
+    orphans = []
+    for dev in devices:
+        for p in dev["ports"]:
+            if p.get("is_outlet"):
+                continue
+            port = p["port"]
+            if not is_chem_port(dev["name"], port):
+                continue
+            spd = p.get("speed_actual") or 0
+            if spd <= 0:
+                continue
+            if allowed_port is not None and port == allowed_port:
+                continue  # legitimate in-window dose
+            orphans.append((dev, port, spd))
+
+    if not orphans:
+        return []
+
+    tag = "STARTUP-RECOVERY" if startup else "DOSER-WATCHDOG"
+    fired = []
+    for dev, port, spd in orphans:
+        label = get_port_label(dev["name"], port, "")
+        print(f"  [!!! {tag} !!!] {dev['name']} port {port} ({label}) running at speed "
+              f"{spd} outside any dose window -- orphan chemical pump")
+        runtime_state.record_event(
+            "active_dose_recovered" if startup else "hardware_watchdog_nonzero_doser",
+            device=dev["name"], port=port, observed_speed=spd, startup=startup)
+        if ADVISORY_MODE:
+            print(f"  [{tag}] ADVISORY -- not actuating (would stop {dev['name']} port {port})")
+            continue
+        ok = _verified_doser_stop(token, dev, port, tag)
+        runtime_state.record_event("stop_recovery_verified" if ok else "stop_recovery_failed",
+                                   device=dev["name"], port=port)
+        fired.append({"device": dev["name"], "port": port,
+                      "action": "set_speed", "value": 0,
+                      "reason": f"{tag.lower()} orphan pump"})
+
+    if fired:  # LIVE only -- we actuated, so lock chemicals down and watch the res
+        try:
+            from safety_state import disable_dosing
+            disable_dosing(f"{tag.lower()}: orphan chemical pump found running")
+        except Exception as e:
+            print(f"  [{tag}] could not persist dosing freeze: {e}")
+        runtime_state.start_high_alert(f"{tag.lower()} stopped an orphan chemical pump")
+    return fired
+
+
+def recover_on_startup(token: str) -> None:
+    """Pre-loop crash-recovery check (rollout step 3 of WATCHDOG_HEARTBEAT_PLAN).
+    Diagnose how the previous run ended, estimate any interrupted dose, then poll the
+    hardware and stop any chemical pump still running. Runs before AI / normal
+    polling so a pump left on by a crash is dealt with first."""
+    diag = runtime_state.diagnose_restart()
+    if diag["fresh"]:
+        runtime_state.record_event("process_started", fresh=True)
+        print("  [RECOVERY] fresh start -- no prior runtime state.")
+    elif diag["clean"]:
+        runtime_state.record_event("process_started", clean=True)
+        print("  [RECOVERY] previous run exited cleanly.")
+    else:
+        print(f"  [!!! RECOVERY !!!] previous run did NOT exit cleanly -- "
+              f"last_phase={diag['last_phase']} rebooted={diag['rebooted']} "
+              f"disconnect={diag['disconnect_sec']}s had_active_dose={diag['had_active_dose']}")
+        runtime_state.record_event("process_restarted", **diag)
+
+    ad = runtime_state.get_active_dose()
+    if ad and ad.get("status") == "pump_running":
+        est = runtime_state.estimate_interrupted_dose(ad, time.time())
+        print(f"  [RECOVERY] interrupted dose on {ad.get('device')} port {ad.get('port')}: "
+              f"est {est['estimated_actual_ml_min']}-{est['estimated_actual_ml_max']} mL "
+              f"actual (best {est['estimated_actual_ml_best']})")
+        runtime_state.record_event("estimated_overdose_window",
+                                   device=ad.get("device"), port=ad.get("port"), **est)
+
+    # Poll and stop any running chemical pump.
+    try:
+        devices = poll_once(token)
+    except Exception as e:
+        print(f"  [RECOVERY] could not poll for recovery scan: {e} -- main loop will retry")
+        return
+    fired = doser_watchdog(devices, token, startup=True)
+
+    # If the previous run died mid-dose we cannot prove what happened during the gap,
+    # so freeze + high-alert even if nothing is currently running.
+    if not ADVISORY_MODE and not diag["clean"] and diag["had_active_dose"] and not fired:
+        try:
+            from safety_state import disable_dosing
+            disable_dosing("crash recovery -- dose state unknown across restart")
+        except Exception as e:
+            print(f"  [RECOVERY] could not persist dosing freeze: {e}")
+        runtime_state.start_high_alert("crash recovery -- interrupted dose, reservoir unverified")
+
+    if ad:  # the record has now been handled; clear it so it can't re-trigger
+        runtime_state.mark_active_dose_stopped(verified=bool(fired), recovered=True)
+        runtime_state.clear_active_dose()
+
+
 def enforce_schedule_fallback(snapshot: dict, executed_actions: list,
                               devices: list, token: str) -> list:
     """
@@ -332,12 +505,27 @@ def main():
         print(f"  - Sensor monitoring active either way")
         print()
 
+    # --- Crash recovery: deal with any pump left running by a previous crash
+    #     BEFORE normal polling / AI (rollout step 3 of the watchdog plan). ---
+    heartbeat("starting")
+    try:
+        recover_on_startup(token)
+    except ACInfinityAuthError:
+        print("  [RECOVERY] token expired during recovery -- re-authenticating...")
+        os.environ["AC_INFINITY_TOKEN"] = ""
+        token = get_or_refresh_token(EMAIL, PASSWORD, str(ENV_PATH))
+        recover_on_startup(token)
+    except Exception as e:
+        print(f"  [RECOVERY] recovery check error: {e}")
+    print()
+
     ai_failure_count = 0
     try:
         while True:
             try:
                 global LAST_AI_TIME
                 ts = time.strftime("%Y-%m-%d %H:%M:%S")
+                heartbeat("polling_devices")
                 devices = poll_once(token)
                 devices.sort(key=lambda d: int(os.getenv(
                     f"DISPLAY_ORDER_{name_slug(d['name'])}", "99")))
@@ -355,6 +543,7 @@ def main():
                 print()
 
                 # --- Deterministic foundation -- runs regardless of AI ---
+                heartbeat("building_snapshot", poll_ok=True, api_ok=True)
                 snapshot = build_snapshot(devices)
 
                 active = False
@@ -406,6 +595,16 @@ def main():
                     print(f"  [!!! RES BURST ALERT !!!] {rb['reason']}")
 
                 executed_actions: list[dict] = []
+
+                # Orphan-pump watchdog: a chemical pump should sit at speed 0 unless
+                # an active timed dose vouches for it. Detect/alert in any mode,
+                # actuate (stop + freeze + high-alert) only in LIVE. Runs first so a
+                # runaway pump is dealt with ahead of everything else.
+                wd_fired = doser_watchdog(devices, token)
+                if wd_fired:
+                    executed_actions.extend(wd_fired)
+                    active = True
+
                 if not ADVISORY_MODE:
                     # Burst shutdown runs before everything else (stops dosers,
                     # closes CO2; lights/ventilation untouched).
@@ -495,18 +694,37 @@ def main():
                     mode_str  = "DET-ACTIVE" if executed_actions else "DET-IDLE"
                     print(f"  [--] Mode: {mode_str}  next poll in {sleep_for}s  (no AI)")
 
+                # High-alert reservoir polling: after a recovery/scare, poll faster
+                # for a bounded, persisted window. Never lengthens the chosen sleep.
+                ha_active, ha_remaining, ha_reason = runtime_state.high_alert_status()
+                if ha_active:
+                    ha_iv = runtime_state.high_alert_poll_interval()
+                    if ha_iv < sleep_for:
+                        sleep_for = ha_iv
+                    print(f"  [HIGH-ALERT] {ha_reason} -- {ha_remaining}s left; "
+                          f"polling every {sleep_for}s")
+
+                heartbeat("sleeping")
                 time.sleep(sleep_for)
 
             except ACInfinityAuthError:
                 print("Token expired -- re-authenticating...")
+                heartbeat("error_backoff", api_ok=False)
                 os.environ["AC_INFINITY_TOKEN"] = ""
                 token = get_or_refresh_token(EMAIL, PASSWORD, str(ENV_PATH))
                 time.sleep(INTERVAL)
             except Exception as e:
                 print(f"Poll error: {e}")
+                heartbeat("error_backoff", poll_ok=False)
                 time.sleep(INTERVAL)
     except KeyboardInterrupt:
         print("\nStopped.")
+    finally:
+        if HEARTBEAT_ENABLED:
+            try:
+                runtime_state.mark_clean_shutdown()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

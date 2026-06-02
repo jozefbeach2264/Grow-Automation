@@ -321,7 +321,7 @@ def doser_watchdog(devices: list, token: str, startup: bool = False) -> list:
     if not DOSER_WATCHDOG_ENABLED:
         return []
 
-    allowed_port = runtime_state.active_dose_window_port()  # None until #7 lands
+    allowed_ports = runtime_state.active_dose_window_ports()  # in-window timed dose(s)
     orphans = []
     for dev in devices:
         for p in dev["ports"]:
@@ -333,7 +333,7 @@ def doser_watchdog(devices: list, token: str, startup: bool = False) -> list:
             spd = p.get("speed_actual") or 0
             if spd <= 0:
                 continue
-            if allowed_port is not None and port == allowed_port:
+            if port in allowed_ports:
                 continue  # legitimate in-window dose
             orphans.append((dev, port, spd))
 

@@ -77,6 +77,7 @@ Ports 3+4 are pH ports via `PH_PORTS_RDWC_CONTROL=3,4` — safety gate applies l
 | `profile_manager.py` | Strain profiles, outcome tracking, calibration context builder |
 | `grow_state.py` | Auto-compute current week + stage from `GROW_START_DATE` and `VEG_DAYS` |
 | `runtime_state.py` | Heartbeat, active-dose record, high-alert window, event log -- crash recovery |
+| `dosing.py` | Timed dosing with forced stop (#7) -- bounded doses, ramp math, playbooks |
 | `utils.py` | Shared text utils (currently just `name_slug`) |
 | `ramp_probe.py` | Standalone CTR89Q port ramp-rate measurement tool |
 | `labels.env` | Port labels, doser ports, pH ports, per-port speed caps, HIDE_AIR flags |
@@ -261,6 +262,33 @@ independent of `RES_BURST_ENABLED`. Fires a `set_outlet` only when the desired s
 differs from the pump's current `powered` state (no redundant writes). Shares the one
 debounced leak assessment (`snapshot["leak"]`, `_assess_leak`) with res-burst, so both
 react to the same confirmed signal. Not a doser — unaffected by the dosing freeze.
+
+## Timed dosing with forced stop (`dosing.py`)
+
+Bounded doses that replace open-ended `set_port_speed` for chemicals (Layer 1 #7).
+`calculate_timed_dose(speed, target_ml, flow_ml_min, ramp_rate)` is pure math: ramp-up
+and ramp-down each deliver ~(S/2)*flow over the ramp time, the hold delivers the rest;
+a `target_ml` below the minimum ramp-only pulse is rejected as below hardware resolution.
+
+`timed_dose(token, dev, port, speed, target_ml, solution, strength, advisory)`:
+1. verify port at 0, 2. persist a crash-safe active-dose record (watchdog leaves it alone),
+3. start pump, best-effort start-confirm for long doses, 4. hold `on_ms` on a monotonic
+clock, 5. ALWAYS stop in `finally` + verify (retry once), 6. on unverified stop ->
+`safety_state.disable_dosing()` + high-alert. `timed_dose_pair(ports=[1,2], ...)` doses
+nutrient V1+V2 together: both start, both stop, freeze if either start/stop fails.
+
+- Flow model 21 mL/min/speed (override `FLOW_ML_MIN_<SLUG>_<port>`); ramp 1 speed/sec
+  (`RAMP_SPEED_PER_SEC`). Dose sizes: `PH_MICRODOSE_ML`, `PH_SMALL_DOSE_ML`,
+  `NUTE_MICRODOSE_ML_EACH`, `NUTE_SMALL_DOSE_ML_EACH` (code-owned).
+- **Diluted tests:** `STRENGTH_FACTOR_<SLUG>_<port>` (<1.0) converts actual mL to
+  full-strength-equivalent so diluted observations don't fool calibration. Dose math is
+  always in actual mL delivered.
+- **Playbooks** (`PLAYBOOKS` / `resolve_playbook`): the only chemical actions the AI may
+  pick (e.g. `timed_ph_down_microdose`, `timed_nutrient_microdose`); code maps name ->
+  speed + dose size. AI never chooses raw pump duration.
+- pH is always speed 1 (strictest path). Reservoir-gate / lockout / schema enforcement
+  stays in `filter_actions`/`validate_actions` -- callers gate before dosing.
+- Tests: `dosing_test.py` (34 cases). Live validation pending HDS3 + `RESERVOIR_VOLUME_GAL`.
 
 ## Watchdog & crash recovery (`runtime_state.py`)
 

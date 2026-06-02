@@ -1,23 +1,29 @@
 # Timed Dosing And Forced Stop Plan
 
-Status: NOT STARTED -- prerequisites now in place (2026-06-02)
+Status: CORE IMPLEMENTED -- live validation pending HDS3 (2026-06-02)
 
 ## Implementation status (2026-06-02)
 
-NOT STARTED, but the scaffolding it depends on now exists:
-- Stop verification (`verify_port_state`, retry-then-freeze) -- DONE, see
-  READBACK_VERIFICATION_PLAN. The "always command 0 in finally, verify it reached 0"
-  requirement is satisfiable today.
-- Crash-safe active-dose record -- `runtime_state.begin_active_dose()` /
-  `mark_active_dose_stopped()` / `clear_active_dose()` are wired; `timed_dose()` only needs
-  to write the record before starting the pump and clear it after the verified stop.
-- The watchdog reads that record via `active_dose_window_port()`, so a legitimate in-window
-  dose is left alone while orphans are killed.
-- Ramp model (`ramp_seconds`, 1 speed/sec) is measured and available for run-time math.
+CORE DONE in `dosing.py` (34/34 tests in `dosing_test.py`):
+- `calculate_timed_dose()` -- pure ramp/hold math; rejects doses below the minimum
+  ramp-only pulse (below hardware resolution).
+- `timed_dose()` -- verify-at-0 -> persist active-dose record -> start -> hold on a
+  monotonic clock -> ALWAYS stop in `finally` -> verify (retry once) -> freeze + high-alert
+  on unverified stop. Best-effort start-confirm for long doses.
+- `timed_dose_pair([1,2], ...)` -- nutrient V1+V2 dosed together; both start, both stop,
+  freeze if either start/stop fails.
+- `strength_factor` -> full-strength-equivalent mL for diluted-stock tests.
+- Playbook registry (`PLAYBOOKS` / `resolve_playbook`) -- code owns speed + dose size; the
+  AI only picks a playbook name.
+- Crash-safe via `runtime_state` active-dose record; the watchdog's
+  `active_dose_window_ports()` leaves an in-window dose alone while killing orphans.
 
-BLOCKED ON HARDWARE: real dosing needs the HDS3 probe reading + `RESERVOIR_VOLUME_GAL`
-(for mL->ppm/pH math) and calibrated per-pump flow. Logic + sim tests can be written now;
-live validation waits on the bucket/probe test.
+REMAINING:
+- Wire `dosing` into the AI/execution path (`execute_actions`) so playbook actions
+  actually route through `timed_dose` instead of raw `set_port_speed`.
+- Per-pump flow calibration (`FLOW_ML_MIN_<SLUG>_<port>`) by pumping into a measuring cup.
+- Verify pH moved in the expected direction after a pH dose (needs HDS3).
+- LIVE validation: needs HDS3 reading + `RESERVOIR_VOLUME_GAL`. Ready for the bucket test.
 
 ## Goal
 

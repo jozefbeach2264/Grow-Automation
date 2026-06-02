@@ -122,7 +122,7 @@ check("clean shutdown flagged", d["clean"] is True)
 print("\n== runtime_state: active dose record + window ==")
 reset_state()
 check("no active dose initially", runtime_state.get_active_dose() is None)
-check("no dose window port initially", runtime_state.active_dose_window_port() is None)
+check("no dose window port initially", runtime_state.active_dose_window_ports() == set())
 
 runtime_state.begin_active_dose({
     "device": "RDWC Control", "dev_id": "d-rdwc", "port": 4, "speed": 2,
@@ -133,13 +133,13 @@ runtime_state.begin_active_dose({
 check("active dose stored as pump_running",
       (runtime_state.get_active_dose() or {}).get("status") == "pump_running")
 check("in-window dose vouches for its port (no orphan)",
-      runtime_state.active_dose_window_port() == 4)
+      runtime_state.active_dose_window_ports() == {4})
 
 # Past the planned stop + grace -> no longer vouched.
 ad = runtime_state.get_active_dose()
 ad["planned_stop_wall_ts"] = time.time() - 100
 runtime_state._save({"heartbeat": None, "active_dose": ad, "high_alert": None})
-check("expired dose window no longer vouches", runtime_state.active_dose_window_port() is None)
+check("expired dose window no longer vouches", runtime_state.active_dose_window_ports() == set())
 
 runtime_state.clear_active_dose()
 check("active dose cleared", runtime_state.get_active_dose() is None)

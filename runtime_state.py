@@ -162,6 +162,12 @@ def begin_active_dose(record: dict) -> None:
     start_verified. status is forced to 'pump_running'."""
     state = _load()
     rec = dict(record)
+    # Accept either a single `port` or a list of `ports` (nutrient pair). Keep both
+    # populated so the watchdog window and the human-readable messages both work.
+    if "ports" not in rec and rec.get("port") is not None:
+        rec["ports"] = [rec["port"]]
+    if "port" not in rec and rec.get("ports"):
+        rec["port"] = rec["ports"][0]
     rec.setdefault("started_wall_time_utc", _utc_now_iso())
     rec.setdefault("started_wall_ts", time.time())
     rec.setdefault("started_monotonic", time.monotonic())
@@ -170,6 +176,19 @@ def begin_active_dose(record: dict) -> None:
     _save(state)
     record_event("active_dose_started", **{k: rec.get(k) for k in
                  ("device", "port", "speed", "target_ml", "planned_stop_wall_ts")})
+
+
+def mark_active_dose_running(last_confirmed_wall_ts: float | None = None) -> None:
+    """Mark the active dose as readback-confirmed running. Tightens the crash estimate:
+    a verified start means min delivered > 0 (vs 0 when start was never confirmed)."""
+    state = _load()
+    ad = state.get("active_dose")
+    if not ad:
+        return
+    ad["start_verified"] = True
+    ad["last_confirmed_running_wall_ts"] = last_confirmed_wall_ts or time.time()
+    state["active_dose"] = ad
+    _save(state)
 
 
 def mark_active_dose_stopped(verified: bool, **extra) -> None:
@@ -197,21 +216,25 @@ def get_active_dose() -> dict | None:
     return _load().get("active_dose")
 
 
-def active_dose_window_port() -> int | None:
-    """If an active dose is genuinely still in its run window (planned stop + ramp
-    grace not yet passed), return its port so the watchdog leaves it alone. Otherwise
-    None -- any running doser is then an orphan. No timed dosing exists yet, so this
-    returns None today; it lights up automatically once #7 writes active_dose records."""
+def active_dose_window_ports() -> set:
+    """Ports the watchdog should leave alone because an active dose genuinely still
+    vouches for them (planned stop + ramp grace not yet passed). Returns a set so a
+    nutrient pair (ports 1+2) is covered. Empty when no dose is in-window -- then any
+    running doser is an orphan."""
     ad = get_active_dose()
     if not ad or ad.get("status") != "pump_running":
-        return None
+        return set()
     planned_stop = ad.get("planned_stop_wall_ts")
     if planned_stop is None:
         # Running with no planned stop recorded -> cannot vouch for it; treat as orphan.
-        return None
+        return set()
     if time.time() <= float(planned_stop) + _DOSE_WINDOW_GRACE_SEC:
-        return ad.get("port")
-    return None
+        ports = ad.get("ports")
+        if ports:
+            return set(ports)
+        p = ad.get("port")
+        return {p} if p is not None else set()
+    return set()
 
 
 # --------------------------------------------------------------------------- #

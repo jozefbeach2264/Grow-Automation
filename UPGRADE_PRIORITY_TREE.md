@@ -22,11 +22,13 @@ Status: draft master roadmap
 - Bug fixes: `labels.env` slug `RDWC_CONTROL`->`HYDROPONICS_CONTROL` (had disabled the chem
   gate); `set_outlet` missing dev_type; CO2 pulse reopening valve during burst; burst KeyError.
 
-**Layer 1 -- REMAINING:**
-- #7 Timed dosing with forced stop (`TIMED_DOSING_PLAN.md`). Read-after-write stop
-  verification is now available to build on, and `runtime_state.begin_active_dose()` /
-  `active_dose_window_port()` are wired so timed dosing only needs to populate the
-  active-dose record. Needs HDS3 + `RESERVOIR_VOLUME_GAL` for real dosing.
+**Layer 1 -- #7 timed dosing: CORE DONE (`dosing.py`, 34/34 tests).**
+`calculate_timed_dose` (ramp/hold math, below-resolution rejection), `timed_dose`
+(verify-at-0 -> active-dose record -> hold -> always-stop-in-finally -> verify ->
+freeze on failure), `timed_dose_pair` (nutrient V1+V2 together), strength-factor ->
+full-strength-equiv, and a playbook registry (AI picks a name; code owns speed + mL).
+REMAINING: wire `dosing` into `execute_actions`; per-pump flow calibration; pH-direction
+check; LIVE validation (needs HDS3 + `RESERVOIR_VOLUME_GAL`) -- ready for the bucket test.
 
 **Layer 1 -- #8 watchdog/crash recovery: foundation DONE (`runtime_state.py`).**
 What is wired now (no hardware needed):

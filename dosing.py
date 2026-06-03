@@ -81,14 +81,18 @@ def _ramp_rate() -> float:
 
 
 def strength_factor(device: str, port: int) -> float:
-    """Dilution of the stock on this port. 1.0 = full strength, 0.25 = quarter.
-    Clamped to (0, 1]. Set STRENGTH_FACTOR_<SLUG>_<port> in .env for diluted tests."""
+    """Concentration of the stock on this port relative to full feeding strength.
+    1.0 = full strength, 0.25 = quarter (diluted), 4.0 = 4x (concentrated). Used only
+    to convert ACTUAL mL delivered -> full-strength-equivalent mL for calibration, so a
+    concentrated OR diluted stock is recorded correctly and later doses don't over/under
+    shoot. Clamped to (0.01, 100] to catch fat-finger typos. Set
+    STRENGTH_FACTOR_<SLUG>_<port> in .env."""
     v = os.getenv(f"STRENGTH_FACTOR_{name_slug(device)}_{port}", "").strip()
     try:
         f = float(v) if v else 1.0
     except ValueError:
         f = 1.0
-    return min(max(f, 0.01), 1.0)
+    return min(max(f, 0.01), 100.0)
 
 
 def dose_ml(env_key: str) -> float:

@@ -44,6 +44,31 @@ def _outcome_wait_sec() -> int:
             * int(os.getenv("POLL_INTERVAL_ACTIVE", "60")))
 
 
+def _is_doser_action(action: dict) -> bool:
+    """True if the action targets a doser or pH port (DOSER_PORTS_* / PH_PORTS_*)."""
+    from utils import name_slug
+    port = action.get("port")
+    if port is None:
+        return False
+    slug = name_slug(action.get("device", ""))
+    for key in (f"DOSER_PORTS_{slug}", f"PH_PORTS_{slug}"):
+        ports = os.getenv(key, "")
+        if ports and str(port) in [x.strip() for x in ports.split(",")]:
+            return True
+    return False
+
+
+def _wait_for(action: dict) -> float:
+    """Outcome-read wait for one action. Doser/pH doses get a HARD 5-min minimum settle
+    (chemistry, esp. pH, keeps drifting past the apparent quick-settle); everything else
+    uses the normal ACTIVE-interval window."""
+    base = _outcome_wait_sec()
+    if _is_doser_action(action):
+        from dosing import dose_settle_seconds
+        return max(base, dose_settle_seconds())
+    return base
+
+
 # --- Persistent pending-outcome queue (survives restarts) ---
 
 def _load_pending() -> list[dict]:
@@ -182,12 +207,11 @@ def record_outcomes(current_snapshot: dict):
 
     now    = time.time()
     after  = _extract_sensors(current_snapshot)
-    wait   = _outcome_wait_sec()
     settle = []
     keep   = []
 
     for p in _pending:
-        if now - p["fired_at"] >= wait:
+        if now - p["fired_at"] >= _wait_for(p["action"]):
             settle.append(p)
         else:
             keep.append(p)

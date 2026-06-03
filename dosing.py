@@ -41,6 +41,22 @@ DEFAULT_RAMP_SPEED_PER_SEC = 1.0    # measured, symmetric
 # stays start-unverified (which only makes the crash estimate more conservative).
 START_CONFIRM_MIN_MS = 3000
 
+# Hard minimum settle after ANY doser/pH dose before the reservoir reading is trusted.
+# pH especially keeps drifting ~5 min past the apparent quick-settle (observed 2026-06-02:
+# pH-down read -0.81 at 15s but settled at -0.74 only after 5 min; pH-up the same). This is
+# a HARD wait for every doser dose -- never read an outcome or recalibrate sooner. Both the
+# test harness and the autonomous outcome-readback (profile_manager) honor it.
+DOSE_SETTLE_SEC = 300
+
+
+def dose_settle_seconds() -> float:
+    """Canonical doser settle (seconds). Default 300 (5 min); override DOSE_SETTLE_MINUTES."""
+    v = os.getenv("DOSE_SETTLE_MINUTES", "").strip()
+    try:
+        return max(0.0, float(v) * 60.0) if v else float(DOSE_SETTLE_SEC)
+    except ValueError:
+        return float(DOSE_SETTLE_SEC)
+
 # Code-owned dose sizes (mL). The AI selects a playbook name; code maps it to a dose.
 _DOSE_DEFAULTS = {
     "PH_MICRODOSE_ML":       0.5,

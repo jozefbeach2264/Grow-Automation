@@ -51,11 +51,9 @@ PORTS = {
     4: ("PH DOWN",      "ph",   1),
 }
 
-# Stabilization: poll the probe until consecutive readings settle, or give up.
+# Display cadence during the HARD settle wait (the wait length itself is the canonical
+# doser settle in dosing.dose_settle_seconds(), default 5 min -- no early exit).
 STABLE_POLL_SEC = 15
-STABLE_MAX_POLLS = 12          # 12 * 15s = 3 min ceiling
-STABLE_EC_THRESH = 3.0         # uS/cm change between polls considered "settled"
-STABLE_PH_THRESH = 0.02
 
 
 def read_hydro(token, dev_id):
@@ -84,27 +82,19 @@ def probe_sane(r):
 
 
 def wait_for_stable(token, dev_id):
-    """Poll until two consecutive reads settle (or the ceiling). Returns last reading."""
-    print(f"  Letting the reservoir mix/stabilize (poll every {STABLE_POLL_SEC}s, "
-          f"max {STABLE_MAX_POLLS * STABLE_POLL_SEC // 60} min)...")
-    prev = read_hydro(token, dev_id)
-    settled = 0
-    for i in range(STABLE_MAX_POLLS):
-        time.sleep(STABLE_POLL_SEC)
+    """HARD settle: wait the full doser settle window (dosing.dose_settle_seconds, default
+    5 min) before trusting the reading -- NO early exit. Chemistry, especially pH, keeps
+    drifting well past the apparent quick-settle (a 15s 'settled' read drifted for 5 min in
+    testing). Interim reads are shown only for visibility."""
+    total = int(dosing.dose_settle_seconds())
+    print(f"  HARD settle {total // 60}m{total % 60:02d}s (no early exit -- doser doses lag)...")
+    elapsed = 0
+    while elapsed < total:
+        step = min(STABLE_POLL_SEC, total - elapsed)
+        time.sleep(step); elapsed += step
         cur = read_hydro(token, dev_id)
-        dph = abs((cur["ph"] or 0) - (prev["ph"] or 0))
-        dec = abs((cur["ec_us"] or 0) - (prev["ec_us"] or 0))
-        print(f"    t+{(i+1)*STABLE_POLL_SEC:>3}s  {fmt(cur)}   (dpH {dph:.2f}, dEC {dec:.1f})")
-        if dph <= STABLE_PH_THRESH and dec <= STABLE_EC_THRESH:
-            settled += 1
-            if settled >= 2:
-                print("  Reading settled.")
-                return cur
-        else:
-            settled = 0
-        prev = cur
-    print("  Stabilization ceiling reached -- using last reading.")
-    return prev
+        print(f"    t+{elapsed:>4}s  {fmt(cur)}")
+    return read_hydro(token, dev_id)
 
 
 def log_result(rec):

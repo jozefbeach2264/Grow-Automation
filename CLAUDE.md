@@ -288,6 +288,12 @@ nutrient V1+V2 together: both start, both stop, freeze if either start/stop fail
   speed + dose size. AI never chooses raw pump duration.
 - pH is always speed 1 (strictest path). Reservoir-gate / lockout / schema enforcement
   stays in `filter_actions`/`validate_actions` -- callers gate before dosing.
+- **Hard doser settle:** `DOSE_SETTLE_SEC=300` / `dose_settle_seconds()` (env
+  `DOSE_SETTLE_MINUTES`, default 5) is the canonical minimum wait after ANY doser/pH dose
+  before the reservoir reading is trusted -- pH keeps drifting ~5 min past the apparent
+  quick-settle (observed 2026-06-02). Enforced in BOTH the test harness (`bucket_dose_test.py`,
+  no early exit) and the autonomous outcome-readback (`profile_manager._wait_for` -> doser/pH
+  actions wait `max(OUTCOME_WAIT_CYCLES window, DOSE_SETTLE_SEC)`).
 - Tests: `dosing_test.py` (34 cases). Live validation pending HDS3 + `RESERVOIR_VOLUME_GAL`.
 
 ## Watchdog & crash recovery (`runtime_state.py`)

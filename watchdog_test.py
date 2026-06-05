@@ -37,8 +37,10 @@ os.environ["VERIFY_WRITES"] = "true"
 os.environ["DOSER_PORTS_RDWC_CONTROL"] = "1,2,3,4"
 os.environ["PH_PORTS_RDWC_CONTROL"] = "3,4"
 os.environ["HIGH_ALERT_DURATION_MINUTES"] = "30"
+os.environ["DOSER_WATCHDOG_DEBOUNCE"] = "1"   # default for existing tests: freeze on first stopped orphan
 
 import poller
+import ac_infinity_client
 
 _PASS = 0
 _FAIL = 0
@@ -80,6 +82,8 @@ def _make_verify(ok=True):
 
 
 poller.set_port_speed = fake_set_port_speed
+# Stops route through ac_infinity_client.stop_and_verify -> patch the primitives there.
+ac_infinity_client.set_port_speed = fake_set_port_speed
 
 
 def dev_with_doser(speed_port1=0, speed_port3=0):
@@ -184,18 +188,18 @@ check("state cleared after expiry", runtime_state.read_state()["high_alert"] is 
 print("\n== poller.doser_watchdog: orphan detection + actuation ==")
 reset_state()
 _writes.clear()
-poller.verify_port_state = _make_verify(ok=True)
+ac_infinity_client.verify_port_state = _make_verify(ok=True)
 poller.ADVISORY_MODE = False
 
 # Nothing running -> no action.
-fired = poller.doser_watchdog([dev_with_doser(0, 0)], "SIM")
+fired = poller.doser_watchdog([dev_with_doser(0, 0)], "TEST")
 check("clean state -> watchdog fires nothing", fired == [])
 check("clean state -> dosing not frozen", safety_state.is_dosing_disabled() is False)
 
 # A doser running at speed 3 with no active dose -> orphan, stopped + frozen.
 reset_state()
 _writes.clear()
-fired = poller.doser_watchdog([dev_with_doser(3, 0)], "SIM")
+fired = poller.doser_watchdog([dev_with_doser(3, 0)], "TEST")
 check("orphan pump detected + stopped (1 action)", len(fired) == 1 and fired[0]["port"] == 1)
 check("stop command sent to port 1 at speed 0", (("d-rdwc", 1, 0) in _writes))
 check("orphan triggers dosing freeze", safety_state.is_dosing_disabled() is True)
@@ -212,7 +216,7 @@ runtime_state.begin_active_dose({
 # Port 4 (the vouched-for dose port) is the one actually running here.
 dev_dosing = dev_with_doser(0, 0)
 dev_dosing["ports"][3]["speed_actual"] = 5  # port 4 running, in its dose window
-fired = poller.doser_watchdog([dev_dosing], "SIM")
+fired = poller.doser_watchdog([dev_dosing], "TEST")
 check("in-window dose on port 4 is left alone", fired == [])
 check("in-window dose -> no freeze", safety_state.is_dosing_disabled() is False)
 
@@ -220,7 +224,7 @@ check("in-window dose -> no freeze", safety_state.is_dosing_disabled() is False)
 reset_state()
 _writes.clear()
 poller.ADVISORY_MODE = True
-fired = poller.doser_watchdog([dev_with_doser(3, 0)], "SIM")
+fired = poller.doser_watchdog([dev_with_doser(3, 0)], "TEST")
 check("advisory mode -> no actuation", fired == [] and _writes == [])
 check("advisory mode -> no freeze", safety_state.is_dosing_disabled() is False)
 poller.ADVISORY_MODE = False
@@ -228,10 +232,41 @@ poller.ADVISORY_MODE = False
 # Stop that will not verify -> still frozen (the whole point).
 reset_state()
 _writes.clear()
-poller.verify_port_state = _make_verify(ok=False)
-fired = poller.doser_watchdog([dev_with_doser(4, 0)], "SIM")
+ac_infinity_client.verify_port_state = _make_verify(ok=False)
+fired = poller.doser_watchdog([dev_with_doser(4, 0)], "TEST")
 check("unverifiable stop still recorded as fired", len(fired) == 1)
 check("unverifiable stop freezes dosing", safety_state.is_dosing_disabled() is True)
+
+
+# --- Debounce: a successfully-stopped orphan must persist DOSER_WATCHDOG_DEBOUNCE
+#     cycles before the PERSISTENT freeze; a startup orphan or a failed stop freezes now.
+print("\n== poller.doser_watchdog: persistent-orphan debounce ==")
+reset_state()
+_writes.clear()
+ac_infinity_client.verify_port_state = _make_verify(ok=True)
+poller.ADVISORY_MODE = False
+os.environ["DOSER_WATCHDOG_DEBOUNCE"] = "2"
+
+fired = poller.doser_watchdog([dev_with_doser(3, 0)], "TEST")
+check("debounce: 1st stopped orphan stops but does NOT freeze",
+      len(fired) == 1 and safety_state.is_dosing_disabled() is False)
+fired = poller.doser_watchdog([dev_with_doser(3, 0)], "TEST")
+check("debounce: 2nd consecutive orphan freezes", safety_state.is_dosing_disabled() is True)
+
+# A stopped orphan that does NOT recur clears its streak (no freeze).
+reset_state()
+_writes.clear()
+poller.doser_watchdog([dev_with_doser(3, 0)], "TEST")       # streak 1, no freeze
+poller.doser_watchdog([dev_with_doser(0, 0)], "TEST")       # port clear -> streak reset
+fired = poller.doser_watchdog([dev_with_doser(3, 0)], "TEST")  # streak back to 1, still no freeze
+check("debounce: a non-recurring orphan never freezes", safety_state.is_dosing_disabled() is False)
+
+# Startup recovery freezes immediately regardless of debounce (crash orphan unknowable).
+reset_state()
+_writes.clear()
+fired = poller.doser_watchdog([dev_with_doser(3, 0)], "TEST", startup=True)
+check("startup orphan freezes immediately despite debounce", safety_state.is_dosing_disabled() is True)
+os.environ["DOSER_WATCHDOG_DEBOUNCE"] = "1"
 
 
 # =========================================================================== #

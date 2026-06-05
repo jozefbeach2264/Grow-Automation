@@ -71,9 +71,14 @@ def fake_verify(token, dev_id, port, expected, timeout_sec=0):
             "elapsed_sec": 1, "attempts": 1}
 
 
-dosing.set_port_speed = fake_set_port_speed
-dosing.read_port_state = fake_read_port_state
-dosing.verify_port_state = fake_verify
+import ac_infinity_client
+dosing.set_port_speed = fake_set_port_speed              # start writes (dosing's own ref)
+dosing.read_port_state = fake_read_port_state            # pre-check / start-confirm
+# Stops route through ac_infinity_client.stop_and_verify, which resolves set_port_speed /
+# verify_port_state in the ac_infinity_client namespace -- patch them THERE so the shared
+# stop primitive is mocked too.
+ac_infinity_client.set_port_speed = fake_set_port_speed
+ac_infinity_client.verify_port_state = fake_verify
 dosing._sleep_ms = lambda ms: None          # don't actually sleep
 
 DEV = {"name": "RDWC Control", "dev_id": "d-rdwc", "type": 20}
@@ -177,6 +182,21 @@ r = dosing.timed_dose_pair("TEST", DEV, [1, 2], 2, 5.0)
 check("pair reports failure", r["ok"] is False and r["start_failed"] == 2)
 check("both ports still got a stop", len(stops_for(1)) >= 1 and len(stops_for(2)) >= 1)
 _start_raise_on.clear()
+
+
+print("\n== timed_dose_pair: per-port flow -> per-port on_ms (accuracy) ==")
+reset(); _writes.clear()
+_verify_ok = True; _precheck_speed = 0; _start_raise_on.clear()
+os.environ["FLOW_ML_MIN_RDWC_CONTROL_1"] = "21"
+os.environ["FLOW_ML_MIN_RDWC_CONTROL_2"] = "42"   # V2 twice as fast -> half the run time
+r = dosing.timed_dose_pair("TEST", DEV, [1, 2], 2, 5.0, solution="nutrient")
+check("pair ok with unequal flow", r["ok"] is True)
+check("faster pump (p2) gets shorter on_ms", r["plans"][2]["on_ms"] < r["plans"][1]["on_ms"])
+check("both ports stopped under unequal flow", len(stops_for(1)) >= 1 and len(stops_for(2)) >= 1)
+check("equal target -> equal estimated mL each",
+      abs(r["estimated_actual_ml_each"][1] - r["estimated_actual_ml_each"][2]) < 1e-6)
+os.environ.pop("FLOW_ML_MIN_RDWC_CONTROL_1", None)
+os.environ.pop("FLOW_ML_MIN_RDWC_CONTROL_2", None)
 
 
 # =========================================================================== #

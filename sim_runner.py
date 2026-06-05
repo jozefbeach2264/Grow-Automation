@@ -89,12 +89,12 @@ def _reset():
 def make_devices(sensors: dict) -> list[dict]:
     """
     Build a minimal device list in parse_device() output format from a flat
-    sensor dict.  Matches the real hardware layout: "4 x 4", "RDWC Control",
+    sensor dict.  Matches the real hardware layout: "4 x 4", "Hydroponics Control",
     "Auxiliary Outputs".  Only include keys the snapshot builder actually reads.
     """
     return [
         # Controller 1 -- Climate ("4 x 4")
-        # HIDE_AIR_RDWC_CONTROL / HIDE_AIR_AUXILIARY_OUTPUTS are true in labels.env,
+        # HIDE_AIR_EXT_HYDROPONICS_CONTROL / HIDE_AIR_AUXILIARY_OUTPUTS are true in labels.env,
         # so air readings on those two devices are suppressed automatically.
         # AIR_LABEL_4_X_4 = Outside, AIR2_LABEL_4_X_4 = Tent (from labels.env)
         {
@@ -131,10 +131,10 @@ def make_devices(sensors: dict) -> list[dict]:
             "ec_ms":        None, "water_temp_f": None, "water_temp_c": None,
             "temp_c": None, "temp_c_ext": None,
         },
-        # Controller 2 -- Reservoir ("RDWC Control")
+        # Controller 2 -- Reservoir ("Hydroponics Control")
         {
             "dev_id":     "SIM-CTRL2",
-            "name":       "RDWC Control",
+            "name":       "Hydroponics Control",
             "type":       20,
             "type_label": "Controller AI+ (CTR89Q)",
             "online":     True,
@@ -150,7 +150,7 @@ def make_devices(sensors: dict) -> list[dict]:
                 {"port": 4, "name": "PH DOWN",      "online": True, "mode": 1,
                  "speed_actual": 0, "speed_target": 0, "is_outlet": False},
             ],
-            # Air readings suppressed via HIDE_AIR_RDWC_CONTROL=true in labels.env
+            # Air readings suppressed via HIDE_AIR_EXT_HYDROPONICS_CONTROL=true in labels.env
             "temp_f": None, "humidity_pct": None, "vpd_kpa": None,
             "temp_f_ext": None, "humidity_ext": None, "vpd_ext": None,
             "co2_ppm": None, "light": None,

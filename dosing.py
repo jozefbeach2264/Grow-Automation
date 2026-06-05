@@ -27,10 +27,7 @@ import os
 import time
 
 from utils import name_slug
-from ac_infinity_client import (
-    set_port_speed, read_port_state, verify_port_state, ramp_seconds,
-    ACInfinityAuthError,
-)
+from ac_infinity_client import set_port_speed, read_port_state, stop_and_verify
 import runtime_state
 import safety_state
 
@@ -167,32 +164,18 @@ def calculate_timed_dose(speed: int, target_ml: float,
 # stop helper (command 0 -> verify -> one retry). Freeze policy is the caller's.
 # --------------------------------------------------------------------------- #
 def _force_stop(token: str, dev: dict, port: int) -> bool:
-    device, dev_id, dev_type = dev["name"], dev["dev_id"], dev["type"]
-    try:
-        set_port_speed(token, dev_id, port, 0, dev_type)
-    except Exception as e:
-        print(f"  [DOSE] stop write FAILED {device} p{port}: {e}")
-        return False
-    if os.getenv("VERIFY_WRITES", "true").strip().lower() == "false" or token == "SIM":
-        return True
-    for attempt in (1, 2):
-        try:
-            res = verify_port_state(token, dev_id, port, {"speed_actual": 0, "tolerance": 0},
-                                    timeout_sec=ramp_seconds(0, 10) + 10)
-        except ACInfinityAuthError:
-            print(f"  [DOSE] auth failure verifying stop {device} p{port}")
-            return False
-        if res["ok"]:
+    """Stop the pump and confirm it via the shared stop primitive. Returns True only
+    when the port is confirmed at 0. Freeze policy stays with the caller -- timed_dose
+    freezes dosing + raises high-alert on a False return."""
+    device = dev["name"]
+    verify = os.getenv("VERIFY_WRITES", "true").strip().lower() != "false"
+    res = stop_and_verify(token, dev, port, retries=1, verify=verify)
+    if res["ok"]:
+        if res["reason"] != "verify skipped":
             print(f"  [DOSE] verified stop {device} p{port} ({res['elapsed_sec']}s)")
-            return True
-        if attempt == 1:
-            obs = (res.get("observed") or {}).get("speed_actual")
-            print(f"  [DOSE] stop UNVERIFIED {device} p{port} (observed {obs}) -- retrying")
-            try:
-                set_port_speed(token, dev_id, port, 0, dev_type)
-            except Exception as e:
-                print(f"  [DOSE] retry stop write failed: {e}")
-                return False
+        return True
+    obs = (res.get("observed") or {}).get("speed_actual")
+    print(f"  [DOSE] stop UNVERIFIED {device} p{port} (observed {obs}) -- {res['reason']}")
     return False
 
 
@@ -258,17 +241,22 @@ def timed_dose(token: str, dev: dict, port: int, speed: int, target_ml: float, *
         "planned_on_ms": plan["on_ms"],
     })
 
-    start_mono = time.monotonic()
     start_verified = False
     try:
         set_port_speed(token, dev_id, port, speed, dev_type)
-        # Best-effort start confirm (long doses only).
+        # Time the hold from HERE -- the pump only begins ramping once the start write's
+        # GET+PUT round-trip completes, so the clock must start AFTER set_port_speed
+        # returns. Charging that round-trip against on_ms would truncate the dose (worst
+        # for sub-second pH pulses, where the settings GET can eat most of the hold).
+        pump_start_mono = time.monotonic()
+        # Best-effort start confirm (long doses only). This readback happens while the
+        # pump is already running, so its latency legitimately counts toward on_ms.
         if plan["on_ms"] >= START_CONFIRM_MIN_MS and token != "SIM":
             chk = read_port_state(token, dev_id, port)
             if chk and (chk.get("speed_actual") or 0) > 0:
                 start_verified = True
                 runtime_state.mark_active_dose_running()
-        elapsed_ms = (time.monotonic() - start_mono) * 1000.0
+        elapsed_ms = (time.monotonic() - pump_start_mono) * 1000.0
         _sleep_ms(plan["on_ms"] - elapsed_ms)
     finally:
         stop_ok = _force_stop(token, dev, port)
@@ -300,9 +288,12 @@ def timed_dose_pair(token: str, dev: dict, ports: list, speed: int, target_ml_ea
     """Dose two ports together (FloraFlex V1+V2). Both start, both stop. If either
     fails to start or stop, BOTH are stopped immediately and dosing freezes."""
     device, dev_id, dev_type = dev["name"], dev["dev_id"], dev["type"]
+    # target_ml_each may be a scalar (both ports equal) or a {port: mL} map (a V1/V2 split).
+    ml_for = (lambda p: float(target_ml_each[p])) if isinstance(target_ml_each, dict) \
+        else (lambda p: float(target_ml_each))
     plans = {}
     for p in ports:
-        pl = calculate_timed_dose(speed, target_ml_each,
+        pl = calculate_timed_dose(speed, ml_for(p),
                                   flow_ml_min=_flow_ml_min(device, p), ramp_rate=_ramp_rate())
         if not pl["deliverable"]:
             print(f"  [DOSE] PAIR abort: p{p} {pl['reason']} -- not dosing")
@@ -310,8 +301,8 @@ def timed_dose_pair(token: str, dev: dict, ports: list, speed: int, target_ml_ea
         plans[p] = pl
 
     on_ms = max(pl["on_ms"] for pl in plans.values())
-    print(f"  [DOSE] PAIR {device} ports {ports}: {target_ml_each} mL each @ spd {speed} "
-          f"-> on {on_ms}ms")
+    ml_desc = "/".join(f"p{p}:{ml_for(p):.1f}" for p in ports)
+    print(f"  [DOSE] PAIR {device} ports {ports}: {ml_desc} mL @ spd {speed} -> on {on_ms}ms")
     if advisory:
         return {"ok": True, "advisory": True, "plans": plans, "on_ms": on_ms}
 
@@ -333,23 +324,36 @@ def timed_dose_pair(token: str, dev: dict, ports: list, speed: int, target_ml_ea
         "planned_on_ms": on_ms,
     })
 
-    start_mono = time.monotonic()
+    start_mono = {}            # port -> monotonic clock at its own start
     started = []
     start_failed = None
+    stop_results = {}
     try:
         for p in ports:
             try:
                 set_port_speed(token, dev_id, p, speed, dev_type)
+                start_mono[p] = time.monotonic()   # this port is now ramping
                 started.append(p)
             except Exception as e:
                 start_failed = (p, e)
                 print(f"  [DOSE] PAIR start FAILED p{p}: {e} -- stopping both")
                 break
         if start_failed is None:
-            elapsed_ms = (time.monotonic() - start_mono) * 1000.0
-            _sleep_ms(on_ms - elapsed_ms)
+            # Stop EACH port at its own on_ms (soonest deadline first). Per-port flow can
+            # differ (e.g. V2 ~16% faster), so equal target_ml means unequal run time --
+            # stopping both together would over-dose the faster pump. Each port's clock
+            # starts after its own start write (same reasoning as timed_dose's hold clock).
+            for p in sorted(started,
+                            key=lambda q: start_mono[q] + plans[q]["on_ms"] / 1000.0):
+                deadline = start_mono[p] + plans[p]["on_ms"] / 1000.0
+                _sleep_ms((deadline - time.monotonic()) * 1000.0)
+                stop_results[p] = _force_stop(token, dev, p)
     finally:
-        stop_results = {p: _force_stop(token, dev, p) for p in ports}
+        # Safety net: force-stop any port not already stopped above (start failure or an
+        # interruption). Idempotent -- a second stop on a stopped port is harmless.
+        for p in ports:
+            if p not in stop_results:
+                stop_results[p] = _force_stop(token, dev, p)
 
     all_stopped = all(stop_results.values())
     runtime_state.mark_active_dose_stopped(verified=all_stopped)
@@ -364,8 +368,11 @@ def timed_dose_pair(token: str, dev: dict, ports: list, speed: int, target_ml_ea
         _freeze_after_failed_stop(device, ports)
 
     per_port = {p: round(plans[p]["estimated_actual_ml"], 4) for p in ports}
+    fse_each = {p: round(plans[p]["estimated_actual_ml"] * strength_factor(device, p), 4)
+                for p in ports}
     return {"ok": ok, "stop_results": stop_results, "started": started,
             "estimated_actual_ml_each": per_port,
+            "full_strength_equivalent_ml_each": fse_each,
             "start_failed": start_failed[0] if start_failed else None, "plans": plans}
 
 

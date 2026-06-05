@@ -16,11 +16,11 @@ issues automated control commands across all devices.
 | Device | Model | API Type | Name in app | Role |
 |--------|-------|----------|-------------|------|
 | Controller 1 | CTR89Q | type 20 | "4 x 4" | Climate / lighting / air management |
-| Controller 2 | CTR89Q | type 20 | "RDWC Control" | Reservoir — dosing, pH, hydro sensors |
+| Controller 2 | CTR89Q | type 20 | "Hydroponics Control" | Reservoir — dosing, pH, hydro sensors |
 | Power Strip | ADA4 | type 21 | "Auxiliary Outputs" | Hard on/off switching for high-draw devices |
 
 **Sensors connected:**
-- HDS3 hydro probe on RDWC Control — pH, EC (uS/cm and mS/cm), TDS ppm, water temp F
+- HDS3 hydro probe on Hydroponics Control — pH, EC (uS/cm and mS/cm), TDS ppm, water temp F
 - Built-in temp/humidity/VPD on both CTR89Qs
 - CO2 sensor, light sensor (on respective controllers)
 - Water level sensor — pending; ultrasonic planned. Manual override active in the meantime.
@@ -30,8 +30,8 @@ issues automated control commands across all devices.
 - "4 x 4" external probe = Tent (source of truth for tent air). Built-in is suppressed
   via `HIDE_AIR_BUILTIN_4_X_4=true` because it heat-soaks during tests.
   Labels: `AIR_LABEL_4_X_4=Tent_Intake`, `AIR2_LABEL_4_X_4=Tent`.
-- "RDWC Control" built-in = Outside reference (stable, far from tent). Its external probe
-  is suppressed via `HIDE_AIR_EXT_RDWC_CONTROL=true`. Label: `AIR_LABEL_RDWC_CONTROL=Outside`.
+- "Hydroponics Control" built-in = Outside reference (stable, far from tent). Its external probe
+  is suppressed via `HIDE_AIR_EXT_HYDROPONICS_CONTROL=true`. Label: `AIR_LABEL_HYDROPONICS_CONTROL=Outside`.
 - "Auxiliary Outputs" air sensors fully suppressed via `HIDE_AIR_AUXILIARY_OUTPUTS=true`.
 - Per-side flags: `HIDE_AIR_<SLUG>` hides everything, `HIDE_AIR_BUILTIN_<SLUG>` hides only the
   built-in sensor hub, `HIDE_AIR_EXT_<SLUG>` hides only the external probe.
@@ -39,7 +39,7 @@ issues automated control commands across all devices.
 
 **Device display order** (controlled by `DISPLAY_ORDER_<SLUG>` in `labels.env`):
 1. "4 x 4" — tent climate/lighting
-2. "RDWC Control" — reservoir
+2. "Hydroponics Control" — reservoir
 3. "Auxiliary Outputs" — outlets
 
 **Laptop running everything:** ThinkPad P1 Gen 3, NVIDIA Quadro T2000 Max-Q (4GB VRAM).
@@ -50,10 +50,10 @@ When local Ollama throughput matters again, re-enable with `sudo systemctl enabl
 
 ---
 
-## Doser pumps (RDWC Control ports 1–4)
+## Doser pumps (Hydroponics Control ports 1–4)
 
 AC Infinity peristaltic pump spec: **21 mL/min per speed level** (linear, speed 1–10).
-All four ports are designated dosers via `DOSER_PORTS_RDWC_CONTROL=1,2,3,4` in `labels.env`.
+All four ports are designated dosers via `DOSER_PORTS_HYDROPONICS_CONTROL=1,2,3,4` in `labels.env`.
 
 | Port | Label | Purpose |
 |------|-------|---------|
@@ -63,7 +63,7 @@ All four ports are designated dosers via `DOSER_PORTS_RDWC_CONTROL=1,2,3,4` in `
 | 4 | PH DOWN | pH adjustment down |
 
 Ports 1+2 are ALWAYS dosed together at equal speed — never one without the other.
-Ports 3+4 are pH ports via `PH_PORTS_RDWC_CONTROL=3,4` — safety gate applies longer lockout.
+Ports 3+4 are pH ports via `PH_PORTS_HYDROPONICS_CONTROL=3,4` — safety gate applies longer lockout.
 
 ---
 
@@ -78,6 +78,10 @@ Ports 3+4 are pH ports via `PH_PORTS_RDWC_CONTROL=3,4` — safety gate applies l
 | `grow_state.py` | Auto-compute current week + stage from `GROW_START_DATE` and `VEG_DAYS` |
 | `runtime_state.py` | Heartbeat, active-dose record, high-alert window, event log -- crash recovery |
 | `dosing.py` | Timed dosing with forced stop (#7) -- bounded doses, ramp math, playbooks |
+| `bucket_ai_dose_test.py` | Supervised closed-loop bucket calibration harness (feedforward + creep; reworked 2026-06-04) |
+| `bucket_dose_test.py` | Manual single-pump dose-response characterization |
+| `ac_infinity_history.py` | Loader for the app's CSV "Device Data" export (1-min trend history; no cloud history API) |
+| `dose_align.py` | Aligns logged doses with the CSV trend to recover real dose-response + refine K |
 | `utils.py` | Shared text utils (currently just `name_slug`) |
 | `ramp_probe.py` | Standalone CTR89Q port ramp-rate measurement tool |
 | `labels.env` | Port labels, doser ports, pH ports, per-port speed caps, HIDE_AIR flags |
@@ -87,6 +91,40 @@ Ports 3+4 are pH ports via `PH_PORTS_RDWC_CONTROL=3,4` — safety gate applies l
 | `nvidia-perf.service` | Systemd service locking GPU clocks at 2100MHz on boot |
 | `Floraflex1.webp` | FloraFlex Full Tilt schedule reference image |
 | `dwc res rules.jpeg` | DWC water/EC/pH trend diagnostic table reference image |
+
+---
+
+## Bucket calibration harness, dosing rework & trend data
+
+**Supervised bucket calibration** (`bucket_ai_dose_test.py`; companion `bucket_dose_test.py`):
+set target pH/TDS, the code calculates the dose, you confirm each, it hard-settles, re-reads,
+online-updates K, logs to `profiles/bucket_test_log.jsonl`. **Reworked 2026-06-04:**
+
+- **Nutrients (calculable):** one calculated **85% fast shot at high speed** (`FAST_DOSE_SPEED=8`)
+  then **low-speed creeps** (`CREEP_DOSE_SPEED=2`). The dose is sized BEFORE any deadband check --
+  it converges until the *calculated* dose drops below the pump's minimum deliverable pulse, never
+  a ppm band. Bucket cap `BUCKET_MAX_DOSE_ML=250` replaces the 50 mL grow cap so the shot fires
+  whole. Pair K ~3.5 ppm·gal/mL is stable across the run -> trustworthy. `load_calibration` now
+  folds in the `axis=="pair"` records, so nutrient K self-updates from V1+V2 doses.
+- **pH (NOT yet calculable):** the EC-normalized buffer constant is non-stationary (pH-down K
+  ranged **112 -> 218** across EC 518 -> 878) and overshoots transiently (a 17 mL pH-down crashed
+  pH to **4.60** then re-buffered to 5.4). So the feedforward is pulled: pH creeps a **fixed
+  `PH_CREEP_ML=4` mL** per dose (`PH_DONE_TOL=0.05`), logging each `K_obs` to build the buffer map
+  across pH bins. Calculate pH later once the map is dense.
+- **V1/V2 ratio:** `NUTE_RATIO_<SLUG>` (e.g. `55/45`), default 50/50, clamped to 45-55% per part --
+  a manual *volume* knob, never potency-driven. Implemented via per-port `{port: mL}` volumes in
+  `timed_dose_pair` (each pump still stops on its own clock).
+
+**Trend / history data -- CSV export, NOT the API.** The cloud API has **no history endpoint**
+(confirmed against the reverse-engineered API + 24 probed names; only `appUserLogin`,
+`devInfoListAll`, `getdevModeSettingList`, `addDevMode` exist; `devInfoListAll` returns current
+values + a 1-bit trend *direction* only). Export **"Device Data" to CSV** from the AC Infinity app
+(saved to `~/Downloads`, e.g. `AC INFINITY Data (N).csv`; 1-min resolution pH / TDS / water-temp /
+leak / outside-air -- **TDS only, no EC**). Read it via **`ac_infinity_history.py`** (`parse_export`,
+`latest_export`, `Export.window` / `.around`). **`dose_align.py`** aligns logged doses with these
+1-min curves to recover the real dose-response -- the dense data caught the 4.60 pH transient and
+the +57 -> +45 nutrient settle that the single before/after reads miss. When the HDS3 EC channel
+glitches (reads ~1/10 scale), rebuild EC from TDS: **`EC ~= 1.41 * TDS`** (steady ratio).
 
 ---
 
@@ -158,7 +196,7 @@ to be enabled manually after NM brings the hotspot up.
 - Reasoning models (R1 family) wrap output in `<think>...</think>` tags — stripped
   before JSON parse. Harmless for non-reasoning models like Qwen.
 - `warmup()` pre-loads model into VRAM on startup before first real call
-- Context: `num_ctx=4096`, `num_predict=768`, `temperature=0.2`, timeout 240s
+- Context: `num_ctx=4096`, `num_predict=1200`, `temperature=0.2`, timeout 240s
 
 **Every AI prompt contains (in order):**
 1. System prompt — res health gates, DWC rules, FloraFlex schedule, Bugbee CO2 profile,
@@ -201,12 +239,16 @@ The res is the anchor. Nothing advances until the plant confirms it's ready.
 All AI-proposed actions pass through `filter_actions()` in `ai_advisor.py` before any
 API call. Rules (all thresholds configurable in `.env`):
 
+0. **Chemical dosing interlock** — chemicals move ONLY via the `dose` playbook verb
+   (routes to `dosing.timed_dose`). A raw `set_speed`>0 on a doser/pH port is rejected
+   outright; the `dose` verb carries the chem gating (freeze, res-health gate, lockout,
+   one-pH-per-cycle, mL ceiling). Stops (speed 0) are always allowed.
 1. **Per-port dose lockout** — after a port fires, blocked for `DOSE_LOCKOUT_MINUTES`
 2. **pH lockout** — pH ports blocked for `PH_LOCKOUT_MINUTES` after any pH action
 3. **One pH action per cycle** — pH UP and pH DOWN cannot both fire in the same cycle
-4. **Per-port speed cap** — `MAX_SPEED_RDWC_CONTROL_<N>` in `labels.env` overrides
-   global `MAX_DOSER_SPEED`; effective cap = `min(per_port, global, mL_ceiling)`
-5. **mL/min ceiling** — `MAX_DOSE_ML_CYCLE` ÷ 21 = max speed
+4. **Per-port speed cap** — `MAX_SPEED_HYDROPONICS_CONTROL_<N>` in `labels.env` overrides
+   global `MAX_DOSER_SPEED` (climate speed ports only; chemicals are dose-verb only)
+5. **mL/min ceiling** — `MAX_DOSE_ML_CYCLE` also caps a dose playbook's `target_ml`
 
 ---
 
@@ -286,6 +328,18 @@ nutrient V1+V2 together: both start, both stop, freeze if either start/stop fail
 - **Playbooks** (`PLAYBOOKS` / `resolve_playbook`): the only chemical actions the AI may
   pick (e.g. `timed_ph_down_microdose`, `timed_nutrient_microdose`); code maps name ->
   speed + dose size. AI never chooses raw pump duration.
+- **Wired into the live path (autonomous dosing):** the AI emits a `dose` action
+  (`{device, action:"dose", playbook}`); `ai_advisor.execute_actions` resolves the
+  port(s) and routes it to `timed_dose` / `timed_dose_pair`. Raw `set_speed` on a
+  doser/pH port is rejected by `filter_actions` (the interlock). pH UP/DOWN resolve from
+  `PH_PORTS` order (override `PH_UP_PORT_<SLUG>` / `PH_DOWN_PORT_<SLUG>`); the nutrient
+  pair is the non-pH doser ports.
+- **Gated by `AUTONOMOUS_DOSING`** (default false): dose actions are validated, gated, and
+  logged as "would dose" but NOT actuated until it is set true after live validation.
+- `timed_dose_pair` stops each pump at its OWN computed time (not `max(on_ms)`), so
+  per-pump flow differences (`FLOW_ML_MIN_<SLUG>_<port>`, e.g. V2 ~16% faster) still
+  deliver equal volume. The hold clock starts AFTER the start write (pre-start GET not
+  charged against the dose).
 - pH is always speed 1 (strictest path). Reservoir-gate / lockout / schema enforcement
   stays in `filter_actions`/`validate_actions` -- callers gate before dosing.
 - **Hard doser settle:** `DOSE_SETTLE_SEC=300` / `dose_settle_seconds()` (env
@@ -591,6 +645,8 @@ MAX_DOSER_SPEED=2               # global speed cap for doser ports (per-port ove
 MAX_DOSE_ML_CYCLE=50
 OUTCOME_WAIT_CYCLES=2           # cycles (× POLL_INTERVAL_ACTIVE) before reading outcome
 VERIFY_WRITES=true              # read-after-write verify; failed doser/pH stop -> retry then freeze dosing
+AUTONOMOUS_DOSING=false         # master gate: actuate AI chemical doses (off = validate + log only, even in LIVE)
+DOSER_WATCHDOG_DEBOUNCE=2       # consecutive stopped-orphan reads before the persistent dosing freeze
 
 # Reservoir
 RESERVOIR_VOLUME_GAL=60         # active filled volume; anchors mL->ppm/pH dose math. Default 60, <=0 falls back to 60. Surfaced in AI snapshot as reservoir_volume_gal.
@@ -669,7 +725,7 @@ DISPLAY_ORDER_<DEVICE_SLUG>=1
 ```
 
 Device name slugs: uppercase, non-alphanumeric → underscore.
-`"RDWC Control"` → `RDWC_CONTROL`, `"4 x 4"` → `4_X_4`, `"Auxiliary Outputs"` → `AUXILIARY_OUTPUTS`.
+`"Hydroponics Control"` → `HYDROPONICS_CONTROL`, `"4 x 4"` → `4_X_4`, `"Auxiliary Outputs"` → `AUXILIARY_OUTPUTS`.
 
 `HIDE_AIR` is checked in both `print_device()` (poller.py) and `build_snapshot()` (ai_advisor.py).
 The air sensor loop in `build_snapshot()` is gated by this flag; CO2 and light are always included.

@@ -38,9 +38,11 @@ _EVENT_LOG  = Path(__file__).parent / "profiles" / "events.jsonl"
 _DOSE_WINDOW_GRACE_SEC = 10.0
 
 _DEFAULT = {
-    "heartbeat": None,      # see write_heartbeat()
-    "active_dose": None,    # see begin_active_dose()
-    "high_alert": None,     # see start_high_alert()
+    "heartbeat": None,         # see write_heartbeat()
+    "active_dose": None,       # see begin_active_dose()
+    "high_alert": None,        # see start_high_alert()
+    "watchdog_streaks": {},    # {"device:port": consecutive out-of-window nonzero reads}
+    "leak_streak": 0,          # consecutive wet reads of the boolean leak sensor
 }
 
 
@@ -353,6 +355,53 @@ def clear_high_alert() -> None:
         state["high_alert"] = None
         _save(state)
         record_event("high_alert_ended", reason=reason, cleared="manual")
+
+
+# --------------------------------------------------------------------------- #
+# debounce streaks (persisted so a restart does NOT reset a leak / orphan count)
+# --------------------------------------------------------------------------- #
+def leak_streak_get() -> int:
+    """Consecutive wet reads of the boolean leak sensor (persisted across restarts)."""
+    return int(_load().get("leak_streak", 0) or 0)
+
+
+def leak_streak_bump() -> int:
+    """Increment + persist the leak wet-streak; return the new value."""
+    state = _load()
+    val = int(state.get("leak_streak", 0) or 0) + 1
+    state["leak_streak"] = val
+    _save(state)
+    return val
+
+
+def leak_streak_reset() -> None:
+    """Reset the leak wet-streak to 0 (writes only if it was nonzero)."""
+    state = _load()
+    if int(state.get("leak_streak", 0) or 0):
+        state["leak_streak"] = 0
+        _save(state)
+
+
+def watchdog_streak_bump(key: str) -> int:
+    """Increment + persist the out-of-window nonzero-read streak for one doser/pH port
+    (key 'device:port'); return the new value. Survives a restart so the PERSISTENT
+    dosing freeze waits for real confirmation rather than one stale readback."""
+    state = _load()
+    streaks = dict(state.get("watchdog_streaks") or {})
+    streaks[key] = int(streaks.get(key, 0)) + 1
+    state["watchdog_streaks"] = streaks
+    _save(state)
+    return streaks[key]
+
+
+def watchdog_streak_reset(key: str) -> None:
+    """Clear one port's watchdog streak (writes only if it was set)."""
+    state = _load()
+    streaks = dict(state.get("watchdog_streaks") or {})
+    if key in streaks:
+        del streaks[key]
+        state["watchdog_streaks"] = streaks
+        _save(state)
 
 
 # --------------------------------------------------------------------------- #

@@ -149,6 +149,68 @@ def _is_co2_valve(device: str, port: int) -> bool:
         return False
 
 
+# --- Chemical dosing: autonomous gate + playbook->port resolution --------------- #
+
+def _autonomous_dosing() -> bool:
+    """Gate for ACTUATING chemical doses. Default OFF -- when off, the AI's `dose`
+    actions are validated, gated, and logged as 'would dose' but never run, even in
+    LIVE. Flip true only after supervised live validation (see TIMED_DOSING_PLAN.md)."""
+    return os.getenv("AUTONOMOUS_DOSING", "false").strip().lower() == "true"
+
+
+def _doser_ports(device: str) -> list[int]:
+    raw = os.getenv(f"DOSER_PORTS_{name_slug(device)}", "")
+    return [int(x) for x in raw.split(",") if x.strip().isdigit()]
+
+
+def _ph_port_list(device: str) -> list[int]:
+    raw = os.getenv(f"PH_PORTS_{name_slug(device)}", "")
+    return [int(x) for x in raw.split(",") if x.strip().isdigit()]
+
+
+def _ph_up_port(device: str) -> int | None:
+    """PH UP port: PH_UP_PORT_<slug> if set, else the first PH_PORTS entry (convention)."""
+    v = os.getenv(f"PH_UP_PORT_{name_slug(device)}", "").strip()
+    if v.isdigit():
+        return int(v)
+    ph = _ph_port_list(device)
+    return ph[0] if ph else None
+
+
+def _ph_down_port(device: str) -> int | None:
+    """PH DOWN port: PH_DOWN_PORT_<slug> if set, else the second PH_PORTS entry."""
+    v = os.getenv(f"PH_DOWN_PORT_{name_slug(device)}", "").strip()
+    if v.isdigit():
+        return int(v)
+    ph = _ph_port_list(device)
+    return ph[1] if len(ph) > 1 else None
+
+
+def _nutrient_ports(device: str) -> list[int]:
+    """Doser ports that are NOT pH ports (the nutrient pair, e.g. 1+2)."""
+    ph = set(_ph_port_list(device))
+    return [p for p in _doser_ports(device) if p not in ph]
+
+
+def _resolve_dose_ports(device: str, playbook: str) -> dict | None:
+    """Map a playbook on a device to {kind, speed, target_ml, playbook, ports}, or None
+    if unresolvable. pH -> the single up/down port; nutrient -> the nutrient pair."""
+    from dosing import resolve_playbook
+    spec = resolve_playbook(playbook)
+    if not spec:
+        return None
+    if spec["kind"] == "ph":
+        if "_up_" in playbook:
+            port = _ph_up_port(device)
+        elif "_down_" in playbook:
+            port = _ph_down_port(device)
+        else:
+            return None
+        return {**spec, "ports": [port]} if port is not None else None
+    pair = _nutrient_ports(device)
+    return {**spec, "ports": pair[:2]} if len(pair) >= 2 else None
+
+
 def _port_max_speed(device: str, port: int) -> int:
     """Per-port speed cap from labels.env, falling back to global MAX_DOSER_SPEED.
     RES_CHANGE_MODE=true uncaps nutrient ports to 10; pH ports always keep their cap."""
@@ -163,6 +225,39 @@ def _port_max_speed(device: str, port: int) -> int:
 
 
 _VALID_ACTIONS = {"set_speed", "set_outlet"}
+
+
+def _validate_dose_action(a: dict, dev_map: dict) -> dict | None:
+    """Validate a `dose` action and attach resolved port/speed/volume under `_resolved`.
+    Returns the enriched action, or None on rejection (logged). The AI only supplies a
+    device + playbook name; code owns port, speed, and mL (see dosing.PLAYBOOKS)."""
+    from dosing import PLAYBOOKS
+    device   = a.get("device")
+    playbook = a.get("playbook")
+    if not isinstance(device, str) or not device:
+        print(f"  [VALIDATE] reject dose: missing/invalid device ({device!r})")
+        return None
+    if playbook not in PLAYBOOKS:
+        print(f"  [VALIDATE] reject dose on {device}: unknown playbook {playbook!r} "
+              f"(allowed: {sorted(PLAYBOOKS)})")
+        return None
+    resolved = _resolve_dose_ports(device, playbook)
+    if not resolved:
+        print(f"  [VALIDATE] reject dose {playbook} on {device}: cannot resolve target "
+              f"port(s) -- check DOSER_PORTS/PH_PORTS/PH_UP_PORT/PH_DOWN_PORT")
+        return None
+    if dev_map:
+        if device not in dev_map:
+            print(f"  [VALIDATE] reject dose: unknown device {device!r} "
+                  f"(known: {sorted(dev_map)})")
+            return None
+        ports = dev_map[device]
+        for p in resolved["ports"]:
+            if p not in ports:
+                print(f"  [VALIDATE] reject dose {playbook} on {device}: resolved port "
+                      f"{p} not present/online in snapshot (have {sorted(ports)})")
+                return None
+    return {**a, "_resolved": resolved}
 
 
 def validate_actions(actions: list, snapshot: dict | None = None) -> list:
@@ -211,6 +306,14 @@ def validate_actions(actions: list, snapshot: dict | None = None) -> list:
         # 1. Structural
         if not isinstance(a, dict):
             print(f"  [VALIDATE] reject action #{i}: not a dict ({type(a).__name__})")
+            continue
+
+        # Chemical doses use the `dose` verb (device + playbook only -- code owns the
+        # port, speed, and volume). Validated + resolved separately from set_speed/outlet.
+        if a.get("action") == "dose":
+            dv = _validate_dose_action(a, dev_map)
+            if dv is not None:
+                valid.append(dv)
             continue
 
         missing = [k for k in ("device", "port", "action", "value") if k not in a]
@@ -283,6 +386,49 @@ def validate_actions(actions: list, snapshot: dict | None = None) -> list:
     return valid
 
 
+def _dose_gate(a: dict, dose_gate: str, ph_gate: str, dosing_off: bool,
+               sensors: dict, ph_used: bool, now: float) -> tuple[bool, bool, str]:
+    """Safety gate for a `dose` action. Returns (allowed, is_ph_dose, reason). Mirrors
+    the per-port chem checks (freeze, res-health gate, no-blind-pH, lockout, one-pH-per-
+    cycle, mL ceiling) but for a code-resolved playbook spanning one or two ports."""
+    device   = a["device"]
+    resolved = a.get("_resolved") or _resolve_dose_ports(device, a.get("playbook", ""))
+    if not resolved:
+        return False, False, "unresolvable playbook"
+    is_ph = resolved["kind"] == "ph"
+    ports = resolved["ports"]
+
+    if dosing_off:
+        return False, is_ph, "dosing disabled (chemical freeze)"
+    if is_ph:
+        if "ph" not in sensors:
+            return False, True, "no pH sensor reading -- cannot dose blind"
+        if ph_gate == "HOLD":
+            return False, True, "res_health.ph_gate=HOLD (resolve water/EC first)"
+        remaining = _ph_lockout_sec() - (now - _last_ph_time)
+        if remaining > 0:
+            m, s = divmod(int(remaining), 60)
+            return False, True, f"pH lockout {m}m{s:02}s remaining"
+        if ph_used:
+            return False, True, "only one pH adjustment per cycle"
+    elif dose_gate in ("HOLD", "NONE"):
+        return False, False, f"res_health.dose_gate={dose_gate}"
+
+    for p in ports:
+        k = f"{device}:{p}"
+        if k in _last_dose_time:
+            remaining = _dose_lockout_sec() - (now - _last_dose_time[k])
+            if remaining > 0:
+                m, s = divmod(int(remaining), 60)
+                return False, is_ph, f"port {p} lockout {m}m{s:02}s remaining"
+
+    target_ml = resolved.get("target_ml", 0) or 0
+    if target_ml > _max_dose_ml_cycle():
+        return False, is_ph, (f"target {target_ml} mL exceeds MAX_DOSE_ML_CYCLE "
+                              f"{_max_dose_ml_cycle()}")
+    return True, is_ph, "ok"
+
+
 def filter_actions(actions: list, snapshot: dict | None = None) -> list:
     """Apply safety rules to AI-proposed actions before they touch the API."""
     global _last_ph_time
@@ -310,6 +456,22 @@ def filter_actions(actions: list, snapshot: dict | None = None) -> list:
     dosing_off, dosing_reason = dosing_disable_status()
 
     for a in actions:
+        # Chemical doses use the `dose` verb and are gated as a unit (a playbook spans
+        # one or two ports; code owns speed/volume). Handled before the per-port logic
+        # below, which assumes a single `port` key that dose actions do not carry.
+        if a.get("action") == "dose":
+            allowed, is_ph_dose, why = _dose_gate(
+                a, dose_gate, ph_gate, dosing_off, _snapshot_sensors,
+                ph_used_this_cycle, now)
+            if not allowed:
+                print(f"  [SAFETY] Blocked dose {a.get('playbook')} on "
+                      f"{a.get('device')}: {why}")
+                continue
+            if is_ph_dose:
+                ph_used_this_cycle = True
+            safe.append(a)
+            continue
+
         key      = f"{a['device']}:{a['port']}"
         is_ph    = _is_ph_port(a["device"], a["port"])
         is_doser = _is_doser_port(a["device"], a["port"])
@@ -322,6 +484,17 @@ def filter_actions(actions: list, snapshot: dict | None = None) -> list:
         is_stop_speed = (action_type == "set_speed"  and int(value or 0) == 0)
         is_outlet_off = (action_type == "set_outlet" and not bool(value))
         is_safety_dir = is_stop_speed or is_outlet_off
+
+        # INTERLOCK: chemicals move ONLY via the `dose` verb (dosing.timed_dose, which
+        # bypasses this gate by design). A raw set_speed>0 reaching here on a doser/pH
+        # port would run the pump open-ended -- then the orphan-pump watchdog would stop
+        # it and freeze dosing on the next cycle. Permanent invariant: the AI requests
+        # chem changes via `dose`, never raw doser speeds. Stops (value 0) fall through
+        # via is_safety_dir and remain allowed.
+        if (is_doser or is_ph) and not is_safety_dir:
+            print(f"  [SAFETY] Blocked {key}: raw chemical set_speed not permitted -- "
+                  "use a dose playbook (timed_dose owns chem pumps). Stops are allowed.")
+            continue
 
         # 0-. Chemical freeze: block any dosing-direction action on doser/pH ports.
         #     Climate ports are unaffected. Stops fall through (is_safety_dir).
@@ -392,91 +565,34 @@ def filter_actions(actions: list, snapshot: dict | None = None) -> list:
 
         safe.append(a)
 
-    return _apply_nutrient_ratio(safe)
-
-
-def _apply_nutrient_ratio(actions: list) -> list:
-    """
-    Scale port 1 and port 2 set_speed actions to reflect NUTRIENT_RATIO_1/NUTRIENT_RATIO_2.
-
-    The AI always requests equal speeds for both ports.  This step adjusts those speeds
-    to hit the configured ratio after the safety gate has already applied caps.
-
-    Hard limits: neither side can be less than 45 or more than 55 (out of 100).
-    At low speeds (1-2) integer rounding keeps both ports equal -- the ratio is only
-    meaningfully visible at speed 5+, which happens during res changes.
-    """
-    r1_cfg = int(os.getenv("NUTRIENT_RATIO_1", "50"))
-    r2_cfg = int(os.getenv("NUTRIENT_RATIO_2", "50"))
-
-    # Clamp each side to 45-55, then re-normalise so they sum to 100
-    r1 = max(45, min(55, r1_cfg))
-    r2 = max(45, min(55, r2_cfg))
-    total = r1 + r2
-    r1 = round(r1 * 100 / total)
-    r2 = 100 - r1
-
-    if r1 != r1_cfg or r2 != r2_cfg:
-        print(f"  [RATIO] Clamped {r1_cfg}/{r2_cfg} -> {r1}/{r2} (hard limit 45-55 per side)")
-
-    if r1 == 50 and r2 == 50:
-        return actions  # fast path -- no adjustment needed
-
-    result = list(actions)
-    seen_devices = dict.fromkeys(
-        a["device"] for a in result if a.get("action") == "set_speed"
-    )
-
-    for dev in seen_devices:
-        # Only apply nutrient ratio to devices where ports 1 AND 2 are both dosers.
-        # Prevents distorting fan/light writes on non-doser devices (e.g. "4 x 4").
-        if not (_is_doser_port(dev, 1) and _is_doser_port(dev, 2)):
-            continue
-
-        idx1 = next((i for i, a in enumerate(result)
-                     if a["device"] == dev and a.get("port") == 1
-                     and a.get("action") == "set_speed"), None)
-        idx2 = next((i for i, a in enumerate(result)
-                     if a["device"] == dev and a.get("port") == 2
-                     and a.get("action") == "set_speed"), None)
-
-        if idx1 is None or idx2 is None:
-            continue  # only apply when both nutrient ports are being set together
-
-        base = max(int(result[idx1]["value"]), int(result[idx2]["value"]))
-        if base == 0:
-            continue
-
-        s1 = max(1, round(base * r1 / 50))
-        s2 = max(1, round(base * r2 / 50))
-        s1 = min(s1, _port_max_speed(dev, 1))
-        s2 = min(s2, _port_max_speed(dev, 2))
-
-        if s1 != int(result[idx1]["value"]) or s2 != int(result[idx2]["value"]):
-            print(f"  [RATIO] {dev} ports 1+2  {r1}/{r2}  "
-                  f"speed {base}/{base} -> {s1}/{s2}")
-
-        result[idx1] = {**result[idx1], "value": s1}
-        result[idx2] = {**result[idx2], "value": s2}
-
-    return result
+    # Note: nutrients now dose via dosing.timed_dose_pair (equal target_ml each), so the
+    # old speed-tweak nutrient ratio is gone -- per-pump V1/V2 asymmetry (e.g. V2 ~16%
+    # faster) is expressed via FLOW_ML_MIN_<slug>_<port> calibration instead.
+    return safe
 
 
 def record_actions(actions: list):
-    """Mark executed actions in lockout state. Only doser ports get a lockout --
-    fans, lights, and outlets are free to be re-issued at any cadence.
-    Persists state to disk so a restart preserves cooldown clocks."""
+    """Mark executed actions in lockout state. Only doser/pH ports get a lockout --
+    fans, lights, and outlets are free to be re-issued at any cadence. `dose` actions
+    carry resolved `ports`; set_speed/set_outlet carry a single `port`. Persists state
+    so a restart preserves cooldown clocks."""
     global _last_ph_time
     now = time.time()
     mutated = False
     for a in actions:
-        if not _is_doser_port(a["device"], a["port"]):
-            continue
-        key = f"{a['device']}:{a['port']}"
-        _last_dose_time[key] = now
-        mutated = True
-        if _is_ph_port(a["device"], a["port"]):
-            _last_ph_time = now
+        if a.get("action") == "dose":
+            device = a.get("device")
+            ports  = a.get("ports") or (a.get("_resolved") or {}).get("ports", [])
+        else:
+            device = a.get("device")
+            ports  = [a.get("port")]
+        for p in ports:
+            if p is None or not _is_doser_port(device, p):
+                continue
+            _last_dose_time[f"{device}:{p}"] = now
+            mutated = True
+            if _is_ph_port(device, p):
+                _last_ph_time = now
     if mutated:
         _save_lockouts()
 
@@ -526,19 +642,30 @@ def _effective_week_stage() -> tuple[int, str]:
     return week, stage
 
 
+def _clamp_week(week: int, table: dict, stage: str) -> int:
+    """Clamp a default-table lookup week to the max week defined for this stage. A grow
+    that runs past the table (e.g. bloom wk9 of a 63-day flower) then HOLDS the last
+    defined week -- notably the wk8 flush -- instead of silently reverting to a generic
+    default that would resume feeding/enrichment during harvest. Explicit per-week .env
+    overrides still use the real week (handled by the callers)."""
+    keys = table.get(stage) or table.get("veg") or {}
+    return min(week, max(keys)) if keys else week
+
+
 def _get_ppm_target() -> int:
     """
     Return PPM target for the current grow week and stage.
 
     Lookup order:
-      1. PPM_<STAGE>_WK<N> explicit override in .env
-      2. FloraFlex EC default * PPM_SCALE
+      1. PPM_<STAGE>_WK<N> explicit override in .env (real week)
+      2. FloraFlex EC default * PPM_SCALE (week clamped to the table's last week)
     """
     week, stage = _effective_week_stage()
     override = os.getenv(f"PPM_{stage.upper()}_WK{week}")
     if override is not None:
         return int(float(override))
-    ec = _FLORAFLEX_EC.get(stage, _FLORAFLEX_EC["veg"]).get(week, 1.2)
+    lw = _clamp_week(week, _FLORAFLEX_EC, stage)
+    ec = _FLORAFLEX_EC.get(stage, _FLORAFLEX_EC["veg"]).get(lw, 1.2)
     return int(ec * _ppm_scale())
 
 
@@ -551,7 +678,8 @@ def _get_co2_target() -> int:
     override = os.getenv(f"CO2_{stage.upper()}_WK{week}")
     if override is not None:
         return int(float(override))
-    return _BUGBEE_CO2.get(stage, _BUGBEE_CO2["veg"]).get(week, 1200)
+    lw = _clamp_week(week, _BUGBEE_CO2, stage)
+    return _BUGBEE_CO2.get(stage, _BUGBEE_CO2["veg"]).get(lw, 1200)
 
 
 def _get_ph_range() -> tuple[float, float]:
@@ -564,7 +692,8 @@ def _get_ph_range() -> tuple[float, float]:
       3. _PH_DEFAULTS[stage][week] stage-driven default
     """
     week, stage = _effective_week_stage()
-    d_min, d_max = _PH_DEFAULTS.get(stage, _PH_DEFAULTS["veg"]).get(week, (5.5, 6.5))
+    lw = _clamp_week(week, _PH_DEFAULTS, stage)
+    d_min, d_max = _PH_DEFAULTS.get(stage, _PH_DEFAULTS["veg"]).get(lw, (5.5, 6.5))
 
     def _resolve(side: str, default: float) -> float:
         wk_key = os.getenv(f"PH_{side}_{stage.upper()}_WK{week}", "").strip()
@@ -605,6 +734,12 @@ You must respond ONLY with a valid JSON object in this exact format:
       "port": <port number as integer>,
       "action": "set_speed" or "set_outlet",
       "value": <0-10 for set_speed, true/false for set_outlet>,
+      "reason": "why"
+    }},
+    {{
+      "device": "reservoir device name as shown in snapshot",
+      "action": "dose",
+      "playbook": "<one playbook name -- see CHEMICAL DOSING below>",
       "reason": "why"
     }}
   ],
@@ -717,33 +852,47 @@ Target ranges (keep all readings within these):
               If HOLD: maintain current CO2 reading.
               If REDUCE: target current reading minus 10-15%.
 
-Nutrient system: FloraFlex Full Tilt (RDWC).
-Doser ports: 1=nutrient A (V1/B1), 2=nutrient B (V2/B2), 3=pH UP, 4=pH DOWN.
-ALWAYS request ports 1 and 2 at the same speed -- the system applies the configured
-strain ratio automatically. Never request one without the other.
+Nutrient system: FloraFlex Full Tilt (RDWC). Doser ports: 1=nutrient A (V1/B1),
+2=nutrient B (V2/B2), 3=pH UP, 4=pH DOWN.
+
+CHEMICAL DOSING -- use the `dose` verb with a PLAYBOOK name. NEVER use set_speed on a
+doser/pH port; raw chemical speeds are rejected by the safety gate. You choose only
+WHICH playbook (or none); the system owns the port, pump speed, exact mL, run time, and
+forced stop. Available playbooks:
+  timed_ph_up_microdose     -- small pH UP nudge      (prefer this first)
+  timed_ph_up_small         -- larger pH UP step      (only if far below range)
+  timed_ph_down_microdose   -- small pH DOWN nudge    (prefer this first)
+  timed_ph_down_small       -- larger pH DOWN step    (only if far above range)
+  timed_nutrient_microdose  -- small feed, doses V1+V2 together (prefer this)
+  timed_nutrient_small      -- larger feed, doses V1+V2 together
+A dose action is exactly: {{"device": "<reservoir device name>", "action": "dose",
+"playbook": "<name>", "reason": "..."}}  -- no port, no value.
+Dose SMALL, then WAIT and re-measure next cycle before dosing again (a hard settle and
+lockout are enforced). Prefer the microdose; size up to _small only when the observed
+calibration delta is clearly too small for the gap. At most ONE dose per cycle, and
+never a pH dose and a nutrient dose in the same cycle.
 
 PPM scale in use: {_ppm_scale()} (500=Hanna/Eutech, 700=Truncheon/Bluelab)
 Target PPM for grow week {week} {stage}: {_get_ppm_target()} PPM
 PPM tolerance: +/-{int(float(_r("EC_TOLERANCE","0.1")) * _ppm_scale())} PPM
 
 Use tds_ppm from the snapshot as the primary nutrient concentration reading.
-TDS dosing rules:
-- tds_ppm below (target - tolerance): dose ports 1 and 2 together at equal speed 1-2.
-  Prefer speed 1 -- small adjustments prevent overshoot. Speed 2 only if well below target.
-- tds_ppm above (target + tolerance): do NOT dose -- wait for plant uptake
-- Bloom week 8: FLUSH only, do not dose nutrients under any circumstances
-- Never dose nutrients and pH in the same cycle
-- If TDS is within tolerance but pH is off, address pH only
+Nutrient (TDS) rules:
+- tds_ppm below (target - tolerance): dose timed_nutrient_microdose (V1+V2 together).
+  Use timed_nutrient_small only if tds_ppm is well below target.
+- tds_ppm above (target + tolerance): do NOT dose -- wait for plant uptake.
+- Bloom week 8 (flush): do NOT dose nutrients under any circumstances.
+- Only dose nutrients when res_health.dose_gate == NORMAL.
 
-pH correction rules -- pH takes priority over nutrients when outside hard limits:
-- pH below {ph_min}: REQUIRED action -- dose port 3 (pH UP) at speed 1 only.
-  Do not overshoot. One small dose per cycle; the lockout enforces the wait.
-- pH above {ph_max}: REQUIRED action -- dose port 4 (pH DOWN) at speed 1 only.
-  Do not overshoot. One small dose per cycle; the lockout enforces the wait.
-- pH within {ph_min}-{ph_max} and drifting: do NOT dose -- let it swing naturally.
-- Never recommend a pH action in the same cycle as a nutrient action.
-- Only valid action types are "set_speed" (ports, speed 0-10) and "set_outlet" (outlets, true/false).
-  Do not invent other action types.
+pH rules -- pH takes priority over nutrients when outside the range:
+- pH below {ph_min}: dose timed_ph_up_microdose (timed_ph_up_small only if far below).
+- pH above {ph_max}: dose timed_ph_down_microdose (timed_ph_down_small only if far above).
+- pH within {ph_min}-{ph_max}: do NOT dose -- let it swing naturally.
+- Only adjust pH when res_health.ph_gate == ALLOW.
+
+Action verbs: use "set_speed"/"set_outlet" for CLIMATE outputs (fans, light, CO2 valve)
+only, and "dose" (with a playbook) for CHEMICALS. Do not invent other action types, and
+never use set_speed on a doser/pH port.
 """
 
 
@@ -764,8 +913,13 @@ def warmup():
 
 # Last-cycle sensor readings for trend detection (keyed by sensor label)
 _prev_sensors: dict[str, float] = {}
+# Monotonic time the previous readings were captured -- lets _trend normalize a delta to
+# a rate so adaptive polling (60s..900s between cycles) doesn't change what counts as
+# RISING/FALLING. None until the first snapshot completes.
+_prev_trend_mono: float | None = None
 
-# Minimum delta to call a reading RISING or FALLING rather than STATIC
+# Minimum delta to call a reading RISING or FALLING rather than STATIC, measured over one
+# NOMINAL cycle (POLL_INTERVAL_ACTIVE). Longer real gaps are scaled down toward this.
 _TREND_THRESHOLDS = {
     "ph":          0.05,
     "ec_ms":       0.05,
@@ -774,12 +928,28 @@ _TREND_THRESHOLDS = {
     "water_level": 1.0,
 }
 
-def _trend(label: str, current: float) -> str:
+
+def _nominal_interval() -> float:
+    try:
+        return max(1.0, float(os.getenv("POLL_INTERVAL_ACTIVE", "60")))
+    except ValueError:
+        return 60.0
+
+
+def _trend(label: str, current: float, dt: float | None = None) -> str:
+    """Classify a reading vs the previous cycle. When `dt` (seconds since the previous
+    reading) is given, the delta is normalized to one nominal cycle so a slow drift over
+    a long STABLE gap isn't mistaken for the same movement seen over a fast ACTIVE gap.
+    Normalization only ever REDUCES sensitivity for long gaps (scale capped at 1.0), so a
+    short high-alert gap can't amplify noise into a false RISING/FALLING."""
     prev = _prev_sensors.get(label)
     if prev is None:
         return "UNKNOWN"
     thresh = _TREND_THRESHOLDS.get(label, 0.0)
     delta  = current - prev
+    if dt and dt > 0:
+        nominal = _nominal_interval()
+        delta *= nominal / min(max(dt, nominal), nominal * 30.0)
     if delta > thresh:
         return "RISING"
     if delta < -thresh:
@@ -869,9 +1039,6 @@ def res_health_check(trends: dict) -> dict:
     }
 
 
-_leak_wet_streak = 0  # consecutive cycles the boolean leak sensor has read wet
-
-
 def _res_burst_enabled() -> bool:
     return os.getenv("RES_BURST_ENABLED", "").strip().lower() == "true"
 
@@ -886,19 +1053,20 @@ def _res_burst_debounce() -> int:
 
 
 def _assess_leak(all_sensors: dict) -> dict:
-    """Debounced boolean leak assessment from `water_leak` (0=dry, nonzero=wet).
-    Manages the cross-cycle wet streak in ONE place so every consumer (res-burst,
-    evac pump) shares the same confirmed state. Returns {raw, wet, confirmed, streak}.
-    Must be called exactly once per cycle -- build_snapshot does this."""
-    global _leak_wet_streak
+    """Debounced boolean leak assessment from `water_leak` (0=dry, nonzero=wet). Manages
+    the cross-cycle wet streak in ONE place -- PERSISTED in runtime_state so a restart
+    mid-leak doesn't reset the debounce (which would re-arm res-burst and flap the evac
+    pump off for a cycle). Every consumer (res-burst, evac pump) shares this confirmed
+    state. Returns {raw, wet, confirmed, streak}. Call exactly once per cycle."""
+    import runtime_state
     raw = all_sensors.get("water_leak")
     if raw is None or float(raw) == 0.0:
-        _leak_wet_streak = 0
+        runtime_state.leak_streak_reset()
         return {"raw": raw, "wet": False, "confirmed": False, "streak": 0}
-    _leak_wet_streak += 1
+    streak = runtime_state.leak_streak_bump()
     return {"raw": raw, "wet": True,
-            "confirmed": _leak_wet_streak >= _res_burst_debounce(),
-            "streak": _leak_wet_streak}
+            "confirmed": streak >= _res_burst_debounce(),
+            "streak": streak}
 
 
 def compute_res_burst(snapshot: dict) -> dict | None:
@@ -980,6 +1148,7 @@ def compute_evac_pump(snapshot: dict) -> dict | None:
 
 def build_snapshot(devices: list[dict]) -> dict:
     """Build a clean sensor + state snapshot to send to the model."""
+    global _prev_trend_mono
     week, stage = current_grow_week_and_stage()
     snapshot = {
         "timestamp":  time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1059,10 +1228,14 @@ def build_snapshot(devices: list[dict]) -> dict:
     if evac:
         snapshot["evac_pump"] = evac
 
+    # Seconds since the previous snapshot -- lets _trend normalize to a rate across the
+    # adaptive poll interval (see _trend). None on the first cycle.
+    trend_dt = (time.monotonic() - _prev_trend_mono) if _prev_trend_mono is not None else None
+
     trends = {}
     for label in ("ph", "ec_ms", "ec_us", "tds_ppm"):
         if label in all_sensors:
-            trends[label] = _trend(label, all_sensors[label])
+            trends[label] = _trend(label, all_sensors[label], dt=trend_dt)
 
     # Water-level trend. Source priority:
     #   1. Boolean magnetic float (WATER_LEVEL_FLOAT=true) -- a real sensor, manually
@@ -1081,7 +1254,7 @@ def build_snapshot(devices: list[dict]) -> dict:
         trends["water_level"] = manual_wl
         snapshot["water_level_source"] = "MANUAL"
     elif "water_level" in all_sensors:
-        trends["water_level"] = _trend("water_level", all_sensors["water_level"])
+        trends["water_level"] = _trend("water_level", all_sensors["water_level"], dt=trend_dt)
         snapshot["water_level_source"] = "SENSOR"
     else:
         # No sensor and no manual override -- gate will see UNKNOWN and hold
@@ -1130,8 +1303,9 @@ def build_snapshot(devices: list[dict]) -> dict:
         if pulse_delta:
             snapshot["schedule_deltas"].append(pulse_delta)
 
-    # Update previous readings for next cycle
+    # Update previous readings + timestamp for next cycle's trend computation
     _prev_sensors.update(all_sensors)
+    _prev_trend_mono = time.monotonic()
 
     return snapshot
 
@@ -1210,8 +1384,12 @@ def print_advice(result: dict):
         return
     mode = "ADVISORY" if _advisory_mode() else "LIVE"
     for a in actions:
-        print(f"  [{mode}] {a['device']} port {a['port']} -> "
-              f"{a['action']}={a['value']}  ({a['reason']})")
+        if a.get("action") == "dose":
+            print(f"  [{mode}] {a.get('device')} dose -> {a.get('playbook')}  "
+                  f"({a.get('reason', '')})")
+        else:
+            print(f"  [{mode}] {a.get('device')} port {a.get('port')} -> "
+                  f"{a.get('action')}={a.get('value')}  ({a.get('reason', '')})")
 
 
 def _verify_writes_enabled(token) -> bool:
@@ -1228,7 +1406,7 @@ def _verify_executed_action(token, dev: dict, a: dict) -> dict:
     won't confirm -- FREEZE dosing: a pump that won't stop is a critical chemical
     hazard. Climate is untouched. Returns the verification result dict."""
     from ac_infinity_client import (verify_port_state, ramp_seconds,
-                                     set_port_speed, ACInfinityAuthError)
+                                     stop_and_verify, ACInfinityAuthError)
     device, port, act, val = a["device"], a["port"], a["action"], a.get("value")
     is_chem = _is_doser_port(device, port) or _is_ph_port(device, port)
 
@@ -1252,16 +1430,7 @@ def _verify_executed_action(token, dev: dict, a: dict) -> dict:
     is_stop = (act == "set_speed" and int(val or 0) == 0) or (act == "set_outlet" and not bool(val))
     if is_chem and is_stop:
         print(f"  [VERIFY] CRITICAL: doser/pH stop unverified on {device} port {port} -- retrying stop")
-        try:
-            set_port_speed(token, dev["dev_id"], port, 0, dev["type"])
-        except Exception as e:
-            print(f"  [VERIFY] retry stop write failed: {e}")
-        try:
-            res2 = verify_port_state(token, dev["dev_id"], port,
-                                     {"speed_actual": 0, "tolerance": 0},
-                                     timeout_sec=ramp_seconds(0, 10) + 10.0)
-        except ACInfinityAuthError:
-            res2 = {"ok": False, "reason": "auth_failed", "observed": None}
+        res2 = stop_and_verify(token, dev, port, retries=1)
         if res2["ok"]:
             print(f"  [VERIFY] retry stop verified ({res2['elapsed_sec']}s)")
             return res2
@@ -1273,9 +1442,43 @@ def _verify_executed_action(token, dev: dict, a: dict) -> dict:
     return res
 
 
-def execute_actions(result: dict, devices: list[dict], token: str, snapshot: dict | None = None):
+def _execute_dose(a: dict, dev: dict, token: str) -> dict | None:
+    """Run a validated + gated `dose` via timed_dose / timed_dose_pair, honoring the
+    AUTONOMOUS_DOSING gate. Returns an executed-action dict (for outcome tracking +
+    lockout) when a dose actually ran cleanly, else None (advisory / failure)."""
+    import dosing
+    device   = a["device"]
+    resolved = a.get("_resolved") or _resolve_dose_ports(device, a.get("playbook", ""))
+    if not resolved:
+        print(f"  [EXEC] dose {a.get('playbook')} on {device}: unresolvable -- skipped")
+        return None
+    playbook, kind = resolved["playbook"], resolved["kind"]
+    ports, speed, target_ml = resolved["ports"], resolved["speed"], resolved["target_ml"]
+
+    if not _autonomous_dosing():
+        print(f"  [EXEC] dose {playbook} on {device} ports {ports} ({target_ml} mL @ spd "
+              f"{speed}) -- AUTONOMOUS_DOSING off: NOT dosing (advisory)")
+        return None
+
+    if kind == "ph":
+        r = dosing.timed_dose(token, dev, ports[0], speed, target_ml, solution=playbook)
+    else:
+        r = dosing.timed_dose_pair(token, dev, ports, speed, target_ml, solution=playbook)
+    if not r.get("ok"):
+        print(f"  [EXEC] dose {playbook} on {device}: did NOT complete cleanly "
+              f"({r.get('reason') or 'see [DOSE] log'}) -- not tracked")
+        return None
+    print(f"  [EXEC] dose {playbook} on {device} ports {ports} -- done")
+    return {"device": device, "action": "dose", "playbook": playbook,
+            "kind": kind, "ports": ports, "speed": speed, "target_ml": target_ml}
+
+
+def execute_actions(result: dict, devices: list[dict], token: str,
+                    snapshot: dict | None = None) -> list[dict]:
     """Validate -> safety-gate -> execute approved actions via the AC Infinity API.
-    Each successful write is read-after-write verified (unless disabled / SIM)."""
+    Climate writes are read-after-write verified; chemical `dose` actions run through
+    dosing.timed_dose (which verifies + force-stops internally) and are gated by
+    AUTONOMOUS_DOSING. Returns the actions that actually executed (for tracking)."""
     from ac_infinity_client import set_port_speed, set_outlet
 
     proposed  = result.get("actions", [])
@@ -1297,6 +1500,14 @@ def execute_actions(result: dict, devices: list[dict], token: str, snapshot: dic
         if not dev:
             print(f"  [EXEC] Unknown device '{a['device']}' -- skipping")
             continue
+
+        # Chemical doses route through the bounded timed-dose path (own verify + stop).
+        if a.get("action") == "dose":
+            done = _execute_dose(a, dev, token)
+            if done is not None:
+                executed.append(done)
+            continue
+
         try:
             if a["action"] == "set_outlet":
                 set_outlet(token, dev["dev_id"], a["port"], bool(a["value"]), dev["type"])
@@ -1317,3 +1528,4 @@ def execute_actions(result: dict, devices: list[dict], token: str, snapshot: dic
 
     if executed:
         record_actions(executed)
+    return executed

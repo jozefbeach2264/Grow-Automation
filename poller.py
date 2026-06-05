@@ -23,8 +23,7 @@ from ac_infinity_client import (
     parse_device,
     set_outlet,
     set_port_speed,
-    verify_port_state,
-    ramp_seconds,
+    stop_and_verify,
 )
 from utils import name_slug
 import runtime_state
@@ -239,30 +238,17 @@ def enforce_res_burst(snapshot: dict, devices: list, token: str) -> list:
         except Exception as e:
             print(f"  [RES-BURST] FAILED {a['device']} port {a['port']}: {e}")
 
-    # Read-after-write: confirm each doser actually reached 0; retry any that didn't.
-    # These are the most critical stops (active leak), so verification is mandatory.
-    if os.getenv("VERIFY_WRITES", "true").strip().lower() != "false":
+    # Read-after-write: re-confirm each doser actually reached 0 via the shared stop
+    # primitive (re-issues the stop + verifies + retries). These are the most critical
+    # stops in the system (active leak), so the extra confirmation is deliberate.
+    if VERIFY_WRITES:
         for a in fired:
             if a["action"] != "set_speed" or int(a.get("value") or 0) != 0:
                 continue
             dev = dev_map.get(a["device"])
-            try:
-                res = verify_port_state(token, dev["dev_id"], a["port"],
-                                        {"speed_actual": 0, "tolerance": 0},
-                                        timeout_sec=ramp_seconds(0, 10) + 10)
-            except ACInfinityAuthError:
-                print(f"  [RES-BURST] auth failure verifying {a['device']} port {a['port']}")
-                continue
-            if res["ok"]:
-                print(f"  [RES-BURST] verified stop {a['device']} port {a['port']} ({res['elapsed_sec']}s)")
-            else:
-                obs = (res.get("observed") or {}).get("speed_actual")
-                print(f"  [!!! RES-BURST !!!] stop UNVERIFIED {a['device']} port {a['port']} "
-                      f"(observed speed {obs}) -- retrying")
-                try:
-                    set_port_speed(token, dev["dev_id"], a["port"], 0, dev["type"])
-                except Exception as e:
-                    print(f"  [RES-BURST] retry stop failed: {e}")
+            if dev and not _verified_doser_stop(token, dev, a["port"], "RES-BURST"):
+                print(f"  [!!! RES-BURST !!!] {a['device']} port {a['port']} could not be "
+                      f"confirmed stopped -- dosing freeze (below) stays in force")
 
     # Persist a chemical freeze so dosing stays off across cycles/restarts until the
     # user inspects and clears it. Climate is unaffected.
@@ -275,37 +261,28 @@ def enforce_res_burst(snapshot: dict, devices: list, token: str) -> list:
 
 
 def _verified_doser_stop(token: str, dev: dict, port: int, tag: str) -> bool:
-    """Command a doser/pH port to speed 0 and confirm via readback; one retry if the
-    first stop will not verify. Returns True only when the port is confirmed at 0.
+    """Stop a doser/pH port and confirm it via the shared stop primitive; one retry if
+    the first stop will not verify. Returns True only when the port is confirmed at 0.
     Caller owns the freeze/alert policy on a False return."""
-    try:
-        set_port_speed(token, dev["dev_id"], port, 0, dev["type"])
-    except Exception as e:
-        print(f"  [{tag}] stop write FAILED {dev['name']} port {port}: {e}")
-        return False
-    if not VERIFY_WRITES:
-        return True
-    for attempt in (1, 2):
-        try:
-            res = verify_port_state(token, dev["dev_id"], port,
-                                    {"speed_actual": 0, "tolerance": 0},
-                                    timeout_sec=ramp_seconds(0, 10) + 10)
-        except ACInfinityAuthError:
-            print(f"  [{tag}] auth failure verifying {dev['name']} port {port}")
-            return False
-        if res["ok"]:
+    res = stop_and_verify(token, dev, port, retries=1, verify=VERIFY_WRITES)
+    if res["ok"]:
+        if res["reason"] != "verify skipped":
             print(f"  [{tag}] verified stop {dev['name']} port {port} ({res['elapsed_sec']}s)")
-            return True
-        obs = (res.get("observed") or {}).get("speed_actual")
-        if attempt == 1:
-            print(f"  [{tag}] stop UNVERIFIED {dev['name']} port {port} "
-                  f"(observed speed {obs}) -- retrying")
-            try:
-                set_port_speed(token, dev["dev_id"], port, 0, dev["type"])
-            except Exception as e:
-                print(f"  [{tag}] retry stop write failed: {e}")
-                return False
+        return True
+    obs = (res.get("observed") or {}).get("speed_actual")
+    print(f"  [{tag}] stop UNVERIFIED {dev['name']} port {port} "
+          f"(observed speed {obs}) -- {res['reason']}")
     return False
+
+
+def _doser_watchdog_debounce() -> int:
+    """Consecutive out-of-window nonzero reads (that we successfully stop) before the
+    PERSISTENT dosing freeze. A failed stop, or a startup orphan, still freezes
+    immediately. Min 1 (=freeze on the first stopped orphan, the pre-debounce behavior)."""
+    try:
+        return max(1, int(os.getenv("DOSER_WATCHDOG_DEBOUNCE", "2")))
+    except ValueError:
+        return 2
 
 
 def doser_watchdog(devices: list, token: str, startup: bool = False) -> list:
@@ -330,19 +307,22 @@ def doser_watchdog(devices: list, token: str, startup: bool = False) -> list:
             port = p["port"]
             if not is_chem_port(dev["name"], port):
                 continue
+            key = f"{dev['name']}:{port}"
             spd = p.get("speed_actual") or 0
-            if spd <= 0:
-                continue
-            if port in allowed_ports:
-                continue  # legitimate in-window dose
-            orphans.append((dev, port, spd))
+            if spd > 0 and port not in allowed_ports:
+                orphans.append((dev, port, spd, key))
+            else:
+                # At 0 or legitimately in an active-dose window -> clear any prior streak.
+                runtime_state.watchdog_streak_reset(key)
 
     if not orphans:
         return []
 
+    debounce = _doser_watchdog_debounce()
     tag = "STARTUP-RECOVERY" if startup else "DOSER-WATCHDOG"
     fired = []
-    for dev, port, spd in orphans:
+    freeze_reason = None
+    for dev, port, spd, key in orphans:
         label = get_port_label(dev["name"], port, "")
         print(f"  [!!! {tag} !!!] {dev['name']} port {port} ({label}) running at speed "
               f"{spd} outside any dose window -- orphan chemical pump")
@@ -358,14 +338,28 @@ def doser_watchdog(devices: list, token: str, startup: bool = False) -> list:
         fired.append({"device": dev["name"], "port": port,
                       "action": "set_speed", "value": 0,
                       "reason": f"{tag.lower()} orphan pump"})
+        streak = runtime_state.watchdog_streak_bump(key)
+        # When to FREEZE (persistent, manual-clear): immediately if the stop would not
+        # verify (a pump that won't stop is the critical case) or on startup recovery (a
+        # crash orphan is unknowable); otherwise only once the orphan persists across
+        # DOSER_WATCHDOG_DEBOUNCE cycles, so one stale readback we successfully stop does
+        # not freeze all dosing. The immediate STOP + high-alert fire every cycle regardless.
+        if not ok:
+            freeze_reason = f"{tag.lower()}: orphan pump {key} would not stop"
+        elif startup:
+            freeze_reason = f"{tag.lower()}: orphan chemical pump at startup ({key})"
+        elif streak >= debounce:
+            freeze_reason = (f"{tag.lower()}: orphan chemical pump {key} persisted "
+                             f"{streak}/{debounce} cycles")
 
-    if fired:  # LIVE only -- we actuated, so lock chemicals down and watch the res
-        try:
-            from safety_state import disable_dosing
-            disable_dosing(f"{tag.lower()}: orphan chemical pump found running")
-        except Exception as e:
-            print(f"  [{tag}] could not persist dosing freeze: {e}")
+    if fired:  # LIVE only -- we actuated, so watch the res; freeze if warranted (above)
         runtime_state.start_high_alert(f"{tag.lower()} stopped an orphan chemical pump")
+        if freeze_reason:
+            try:
+                from safety_state import disable_dosing
+                disable_dosing(freeze_reason)
+            except Exception as e:
+                print(f"  [{tag}] could not persist dosing freeze: {e}")
     return fired
 
 
@@ -432,8 +426,10 @@ def enforce_schedule_fallback(snapshot: dict, executed_actions: list,
     if not deltas:
         return []
 
-    # Index what the AI already executed, keyed by (device, port, action)
-    done = {(a["device"], a["port"], a.get("action")): a.get("value")
+    # Index what the AI already executed, keyed by (device, port, action). Use .get so
+    # chemical `dose` actions (no single port/value) don't raise here -- they never
+    # match a schedule delta anyway (those are set_speed/set_outlet on a specific port).
+    done = {(a.get("device"), a.get("port"), a.get("action")): a.get("value")
             for a in executed_actions}
 
     dev_map = {d["name"]: d for d in devices}
@@ -648,11 +644,14 @@ def main():
                         print(f"  [AI] Response in {elapsed(ai_start)}")
                         print_advice(ai_result)
                         if not ADVISORY_MODE and ai_result.get("actions"):
-                            execute_actions(ai_result, devices, token, snapshot=snapshot)
-                            ai_actions = ai_result.get("actions", [])
-                            if ai_actions:
-                                track_actions(ai_actions, snapshot)
-                                executed_actions.extend(ai_actions)
+                            # execute_actions returns ONLY what actually executed (dose
+                            # actions are enriched with playbook + resolved ports); track
+                            # those, not the raw proposals.
+                            executed = execute_actions(ai_result, devices, token,
+                                                       snapshot=snapshot)
+                            if executed:
+                                track_actions(executed, snapshot)
+                                executed_actions.extend(executed)
                                 active = True
                         ai_next = ai_result.get("next_check_seconds")
                     else:

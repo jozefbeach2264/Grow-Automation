@@ -401,3 +401,66 @@ def verify_port_state(token: str, dev_id: str, port: int, expected: dict,
     return {"ok": False, "reason": f"timeout: {last_reason}", "expected": expected,
             "observed": observed, "attempts": attempts,
             "elapsed_sec": round(time.monotonic() - start, 1)}
+
+
+def stop_and_verify(token: str, dev: dict, port: int, *,
+                    retries: int = 1, verify: bool = True) -> dict:
+    """Command a port to speed 0 and confirm it via readback, re-issuing the stop up
+    to `retries` times if it will not verify. This is the ONE shared stop primitive --
+    a doser/pH pump that will not stop is the most critical fault in the system, and
+    every path that stops one (timed dosing, the orphan-pump watchdog, reservoir-burst,
+    the executor's read-after-write) routes its stop through here so the command +
+    verify + retry logic lives in exactly one place.
+
+    Freeze / high-alert policy is deliberately NOT handled here -- the caller decides
+    what to do with a False result (some freeze dosing, some only log). Auth failures
+    are caught and reported as a non-ok result (a stop we could not confirm), so callers
+    uniformly treat them as "did not stop" rather than having to catch separately.
+
+    `dev` is the parsed device dict ({"dev_id", "type", "name"}). `verify=False` or the
+    SIM token commands the stop and returns ok without reading back.
+
+    Returns {ok, observed, attempts, elapsed_sec, reason}.
+    """
+    dev_id, dev_type = dev["dev_id"], dev["type"]
+
+    def _issue_stop() -> str | None:
+        """Return None on success, or an error string."""
+        try:
+            set_port_speed(token, dev_id, port, 0, dev_type)
+            return None
+        except ACInfinityAuthError:
+            return "auth failure on stop write"
+        except Exception as e:  # noqa: BLE001 -- any write failure is a failed stop
+            return f"stop write failed: {e}"
+
+    err = _issue_stop()
+    if err is not None:
+        return {"ok": False, "observed": None, "attempts": 0, "elapsed_sec": 0.0,
+                "reason": err}
+    if not verify or token == "SIM":
+        return {"ok": True, "observed": None, "attempts": 0, "elapsed_sec": 0.0,
+                "reason": "verify skipped"}
+
+    timeout = ramp_seconds(0, 10) + 10
+    last = {"ok": False, "observed": None, "attempts": 0, "elapsed_sec": 0.0,
+            "reason": "no readback"}
+    for attempt in range(retries + 1):
+        try:
+            res = verify_port_state(token, dev_id, port,
+                                    {"speed_actual": 0, "tolerance": 0},
+                                    timeout_sec=timeout)
+        except ACInfinityAuthError:
+            return {"ok": False, "observed": None, "attempts": attempt + 1,
+                    "elapsed_sec": 0.0, "reason": "auth failure verifying stop"}
+        last = {"ok": res["ok"], "observed": res.get("observed"),
+                "attempts": attempt + 1, "elapsed_sec": res.get("elapsed_sec"),
+                "reason": res.get("reason", "")}
+        if res["ok"]:
+            return last
+        if attempt < retries:
+            err = _issue_stop()
+            if err is not None:
+                last["reason"] = err
+                return last
+    return last

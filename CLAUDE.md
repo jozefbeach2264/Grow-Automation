@@ -27,15 +27,26 @@ issues automated control commands across all devices.
 - External air probes (additional temp/humidity zones)
 
 **Air sensor display and AI visibility** (current config in `labels.env`):
-- "4 x 4" external probe = Tent (source of truth for tent air). Built-in is suppressed
-  via `HIDE_AIR_BUILTIN_4_X_4=true` because it heat-soaks during tests.
-  Labels: `AIR_LABEL_4_X_4=Tent_Intake`, `AIR2_LABEL_4_X_4=Tent`.
+- "4 x 4" **external probe (sensorType 0 / `temp_f_ext`) = Tent** = the in-canopy INSIDE TEMP and
+  source of truth for tent air. *This* probe is the one that heat-soaks under the X6 (~93F at light
+  setting 7, no exhaust). Verified 2026-06-05 by a body-heat probe test: cupped in-hand it climbed
+  73->90F in 60s while the built-in sat flat at 75 -- so the in-canopy sensor is type0/external, NOT
+  the built-in. The **built-in (sensorType 4 / `temp_f`) is the cooler secondary** (~80F under the
+  same load), labeled `Tent_Intake` and suppressed via `HIDE_AIR_BUILTIN_4_X_4=true`.
+  Labels: `AIR_LABEL_4_X_4=Tent_Intake` (built-in), `AIR2_LABEL_4_X_4=Tent` (external = the canopy/INSIDE).
 - "Hydroponics Control" built-in = Outside reference (stable, far from tent). Its external probe
   is suppressed via `HIDE_AIR_EXT_HYDROPONICS_CONTROL=true`. Label: `AIR_LABEL_HYDROPONICS_CONTROL=Outside`.
 - "Auxiliary Outputs" air sensors fully suppressed via `HIDE_AIR_AUXILIARY_OUTPUTS=true`.
 - Per-side flags: `HIDE_AIR_<SLUG>` hides everything, `HIDE_AIR_BUILTIN_<SLUG>` hides only the
   built-in sensor hub, `HIDE_AIR_EXT_<SLUG>` hides only the external probe.
   Water temp, CO2, light, and hydro sensors are unaffected — only temp/humidity/VPD filter.
+
+**X6 heat curve + planned 95F guardrail (2026-06-05).** Light setting 7, exhaust OFF: Tent (external)
+ramps ~73 -> 93F over ~90 min and plateaus. Exhaust ON pulls it to a ~81.5F hold at full light
+(-2.2F/min initial bite); light OFF returns it to room. Room (Hydroponics "Outside") held 73-77F
+throughout. **TODO (not yet built):** deterministic high-temp guardrail mirroring the CO2 dump in
+`schedule.py` -- Tent (external/type0 sensor) >= 95F -> force `ROLE_EXHAUST` to max, hold until
+< ~88F (hysteresis), fired pre-AI. AIR_TEMP_MAX=85 is just a target band, not a hard cutoff.
 
 **Device display order** (controlled by `DISPLAY_ORDER_<SLUG>` in `labels.env`):
 1. "4 x 4" — tent climate/lighting

@@ -31,7 +31,7 @@ sys.path.insert(0, r"C:\Users\Ziggs\aci-ble-lab\.venv\Lib\site-packages")
 import numpy as np
 from sklearn.linear_model import Ridge
 
-from aci_ble_lab.db import _conn
+from aci_ble_lab.db import _conn, build_unified_snapshot
 
 logging.basicConfig(
     level=logging.INFO,
@@ -109,14 +109,40 @@ def current_avg(sensor: str, window_s: int = 120) -> float | None:
     return sum(vals) / len(vals) if vals else None
 
 
+def current_from_snapshot(snapshot: dict, sensor: str) -> float | None:
+    """Pull a named sensor's value from a unified snapshot dict."""
+    sensor_id = SENSOR[sensor]["port"]
+    entry = snapshot.get(sensor_id)
+    return entry["value"] if entry else None
+
+
 def summary_30min() -> dict:
+    """Build a 30-min stats summary using BLE time-series + current unified snapshot."""
     out = {}
+    # BLE time-series stats (high-frequency)
     for name in SENSOR:
         _, vals = fetch_series(name, 1800)
         if vals:
-            out[name] = {"avg": round(sum(vals)/len(vals), 2),
-                         "min": round(min(vals), 2),
-                         "max": round(max(vals), 2)}
+            out[name] = {
+                "avg": round(sum(vals) / len(vals), 2),
+                "min": round(min(vals), 2),
+                "max": round(max(vals), 2),
+                "source": "ble",
+                "n": len(vals),
+            }
+    # Cloud-only sensors (anything in unified snapshot not covered by BLE above)
+    snap = build_unified_snapshot(ble_max_age=60, cloud_max_age=300)
+    for sensor_id, entry in snap.items():
+        if entry["source"] == "cloud":
+            # Find a human name if we have one
+            label = next(
+                (n for n, cfg in SENSOR.items() if cfg["port"] == sensor_id), f"sensor_{sensor_id}"
+            )
+            if label not in out:
+                out[label] = {
+                    "avg": entry["value"], "min": entry["value"], "max": entry["value"],
+                    "source": "cloud", "n": 1, "dev": entry.get("dev_name"),
+                }
     return out
 
 
@@ -248,7 +274,12 @@ def layer_llm():
         "Sensor 30-min stats (avg / min / max):",
     ]
     for name, s in stats.items():
-        context_lines.append(f"  {name:12}: {s['avg']:.2f}  [{s['min']:.2f} – {s['max']:.2f}]")
+        src = s.get("source", "")
+        dev = f" ({s['dev']})" if s.get("dev") else ""
+        context_lines.append(
+            f"  {name:14}: {s['avg']:.2f}  [{s['min']:.2f} – {s['max']:.2f}]"
+            f"  [{src}{dev}]"
+        )
     context = "\n".join(context_lines)
 
     try:
@@ -299,18 +330,27 @@ def main():
     while True:
         now = time.time()
 
-        temp = current_avg("temp")
-        hum  = current_avg("humidity")
-        vpd  = current_avg("vpd")
+        # Unified snapshot: BLE preferred, cloud fills gaps
+        snap = build_unified_snapshot(ble_max_age=90, cloud_max_age=300)
+
+        temp = current_from_snapshot(snap, "temp")
+        hum  = current_from_snapshot(snap, "humidity")
+        vpd  = current_from_snapshot(snap, "vpd")
+
+        # Show source tags on readings line
+        def _src(sensor):
+            e = snap.get(SENSOR[sensor]["port"])
+            return e["source"][0].upper() if e else "?"   # B=ble, C=cloud
 
         if temp is not None:
-            log.info("Readings  : temp=%.1f°F  hum=%.1f%%  vpd=%.2f kPa",
-                     temp, hum or 0.0, vpd or 0.0)
+            log.info("Readings  : temp=%.1f°F[%s]  hum=%.1f%%[%s]  vpd=%.2f[%s]",
+                     temp, _src("temp"), hum or 0.0, _src("humidity"),
+                     vpd or 0.0, _src("vpd"))
         else:
-            log.warning("No recent readings — logger may not have BLE connection yet")
+            log.warning("No recent readings — logger and cloud_ingest may both be down")
 
         layer_rules(temp, hum)
-        layer_ml()
+        layer_ml()   # ML still uses BLE time-series (fetch_series) — needs dense history
 
         if (now - t_last_llm) >= LLM_INTERVAL:
             t_last_llm = now

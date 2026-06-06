@@ -149,6 +149,20 @@ def init_schema() -> None:
             level_on    INTEGER
         );
         CREATE INDEX IF NOT EXISTS port_readings_ts ON port_readings(ts);
+
+        -- Cloud API sensor readings (polled by cloud_ingest.py)
+        -- sensor_id matches BLE port_id and cloud API sensorType — same numbering.
+        -- Values stored in same /100 units as sensor_readings for direct comparison.
+        CREATE TABLE IF NOT EXISTS cloud_readings (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts          REAL NOT NULL,
+            dev_id      TEXT NOT NULL,
+            dev_name    TEXT,
+            sensor_id   INTEGER NOT NULL,
+            value       REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS cloud_readings_ts        ON cloud_readings(ts);
+        CREATE INDEX IF NOT EXISTS cloud_readings_sensor_id ON cloud_readings(sensor_id);
         """)
 
 
@@ -231,6 +245,66 @@ def add_command(char_uuid: str, hex_data: str, description: str,
         """, (char_uuid, hex_data, description, setting_changed, response_hex,
               source, int(confirmed), now(), notes))
         return r.lastrowid
+
+
+def add_cloud_readings(ts: float, dev_id: str, dev_name: str, readings: dict) -> None:
+    """
+    Write cloud API sensor readings to cloud_readings table.
+    readings: {sensor_id: value} — values already scaled to /100 units (same as BLE).
+    CO2 (sensor_id 11) and light (12) arrive as raw units from cloud; caller must divide
+    by 100 before passing here so both sources stay in the same unit space.
+    """
+    with _conn() as c:
+        c.executemany(
+            "INSERT INTO cloud_readings(ts,dev_id,dev_name,sensor_id,value) VALUES(?,?,?,?,?)",
+            [(ts, dev_id, dev_name, sid, val) for sid, val in readings.items()]
+        )
+
+
+def build_unified_snapshot(ble_max_age: int = 60, cloud_max_age: int = 300) -> dict:
+    """
+    Merge BLE and cloud sensor readings into one snapshot.
+
+    Returns {sensor_id: {"value": float, "source": "ble"|"cloud", "ts": float, "dev_name": str|None}}
+
+    BLE is preferred when a reading exists within ble_max_age seconds (higher frequency,
+    local, no cloud dependency). Cloud fills in any sensor_id not covered by BLE within
+    cloud_max_age seconds — this includes sensors on controllers without BLE, doser port
+    states, and sensors from multi-controller setups.
+    """
+    import time as _time
+    now = _time.time()
+    snapshot: dict = {}
+
+    with _conn() as c:
+        for row in c.execute("""
+            SELECT port AS sensor_id, AVG(value) AS value, MAX(ts) AS ts
+            FROM sensor_readings
+            WHERE ts > ?
+            GROUP BY port
+        """, (now - ble_max_age,)).fetchall():
+            snapshot[row["sensor_id"]] = {
+                "value": round(row["value"], 3),
+                "source": "ble",
+                "ts": row["ts"],
+                "dev_name": None,
+            }
+
+        for row in c.execute("""
+            SELECT sensor_id, AVG(value) AS value, MAX(ts) AS ts, dev_name
+            FROM cloud_readings
+            WHERE ts > ?
+            GROUP BY sensor_id
+        """, (now - cloud_max_age,)).fetchall():
+            if row["sensor_id"] not in snapshot:
+                snapshot[row["sensor_id"]] = {
+                    "value": round(row["value"], 3),
+                    "source": "cloud",
+                    "ts": row["ts"],
+                    "dev_name": row["dev_name"],
+                }
+
+    return snapshot
 
 
 def add_sensor_readings(ts: float, sensors: list[dict]) -> None:

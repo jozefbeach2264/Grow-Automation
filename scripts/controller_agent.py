@@ -2,7 +2,8 @@
 """
 controller_agent.py — Hybrid rules/ML/LLM grow tent climate controller.
 
-Three-layer control stack:
+Control stack (evaluated in order each tick):
+  Safety (every tick):          Cooldowns, conflict lock, sensor validation, setpoint bounds.
   Layer 1 (Rules, every 30s):   Hysteresis on current readings — immediate response.
   Layer 2 (ML, every 30s):      Ridge regression trained on last 30min, predicts 5min
                                  ahead — pre-empts threshold crossings before they happen.
@@ -71,9 +72,28 @@ FAN_SPEED   = 4   # speed for humidifier / dehumidifier
 
 CMD_FILE = Path(__file__).resolve().parent.parent / "aci_control.json"
 
-# ── Device state (tracks last commanded state) ────────────────────────────────
+# ── Safety limits ─────────────────────────────────────────────────────────────
 
-_state = {"ac": False, "humidifier": False, "dehumidifier": False}
+SAFETY = {
+    "ac_min_off_s":    180,   # compressor rest — 3 min minimum between AC cycles
+    "ac_min_on_s":     60,    # 1 min minimum run before AC can turn off (short-cycle guard)
+    "hum_min_off_s":   30,    # 30s minimum off-time between humidifier cycles
+    "dehum_min_off_s": 30,    # 30s minimum off-time between dehumidifier cycles
+    "sensor_max_age":  300,   # skip control if newest reading is older than 5 min
+}
+
+SETPOINT_LIMITS = {           # absolute bounds — LLM cannot exceed these regardless of reasoning
+    "temp_lo": (60.0, 80.0),
+    "temp_hi": (62.0, 85.0),
+    "hum_lo":  (30.0, 70.0),
+    "hum_hi":  (35.0, 80.0),
+}
+
+# ── Device state (tracks last commanded state and transition times) ────────────
+
+_state    = {"ac": False, "humidifier": False, "dehumidifier": False}
+_last_on  = {"ac": 0.0,   "humidifier": 0.0,   "dehumidifier": 0.0}
+_last_off = {"ac": 0.0,   "humidifier": 0.0,   "dehumidifier": 0.0}
 
 # ── Sensor port / type mapping ────────────────────────────────────────────────
 # All T+H-style sensors use type codes 0x60-0x7F (rotate +8 as sensors are added).
@@ -146,6 +166,79 @@ def summary_30min() -> dict:
     return out
 
 
+# ── Safety layer ─────────────────────────────────────────────────────────────
+
+def safety_check(device: str, on: bool) -> str | None:
+    """Return a block-reason string if the action is not allowed, else None."""
+    now = time.time()
+
+    # Conflict: humidifier and dehumidifier cannot both run simultaneously
+    if on:
+        if device == "humidifier" and _state["dehumidifier"]:
+            return "conflict: dehumidifier is on"
+        if device == "dehumidifier" and _state["humidifier"]:
+            return "conflict: humidifier is on"
+
+    # Cooldown: minimum time off before device can turn back on
+    min_off = SAFETY.get(f"{device}_min_off_s", 0)
+    if on and min_off:
+        elapsed = now - _last_off[device]
+        if elapsed < min_off:
+            return f"cooldown: {device} off for {elapsed:.0f}s, need {min_off}s"
+
+    # Short-cycle guard: minimum run time before device can turn off
+    min_on = SAFETY.get(f"{device}_min_on_s", 0)
+    if not on and min_on and _state[device]:
+        elapsed = now - _last_on[device]
+        if elapsed < min_on:
+            return f"min-run: {device} on for {elapsed:.0f}s, need {min_on}s"
+
+    return None
+
+
+def safety_clamp_setpoints(suggestion: dict) -> dict:
+    """Clamp LLM setpoint suggestions to SETPOINT_LIMITS. Mutates and returns dict."""
+    for key, (lo, hi) in SETPOINT_LIMITS.items():
+        if key not in suggestion:
+            continue
+        clamped = max(lo, min(hi, float(suggestion[key])))
+        if clamped != suggestion[key]:
+            log.warning("Safety clamp: %s %.1f → %.1f", key, suggestion[key], clamped)
+        suggestion[key] = clamped
+
+    # Reject inversion — revert both sides rather than guess which one is wrong
+    if suggestion.get("temp_lo", 0) >= suggestion.get("temp_hi", 999):
+        log.warning("Safety clamp: temp_lo >= temp_hi after clamp — reverting")
+        suggestion["temp_lo"] = TARGETS["temp_lo"]
+        suggestion["temp_hi"] = TARGETS["temp_hi"]
+    if suggestion.get("hum_lo", 0) >= suggestion.get("hum_hi", 999):
+        log.warning("Safety clamp: hum_lo >= hum_hi after clamp — reverting")
+        suggestion["hum_lo"] = TARGETS["hum_lo"]
+        suggestion["hum_hi"] = TARGETS["hum_hi"]
+
+    return suggestion
+
+
+def safety_check_readings(temp: float | None, hum: float | None,
+                           snap_ts: float | None) -> list[str]:
+    """Return warning strings for any bad or stale readings. Empty list means safe to act."""
+    issues = []
+    now = time.time()
+
+    age = (now - snap_ts) if snap_ts is not None else None
+    if age is None or age > SAFETY["sensor_max_age"]:
+        label = f"{age:.0f}s ago" if age is not None else "never"
+        issues.append(f"stale readings: last update {label} (limit {SAFETY['sensor_max_age']}s)")
+
+    if temp is not None and not (40.0 <= temp <= 120.0):
+        issues.append(f"temp out of plausible range: {temp:.1f}F (expected 40-120)")
+
+    if hum is not None and not (1.0 <= hum <= 99.0):
+        issues.append(f"humidity out of plausible range: {hum:.1f}% (expected 1-99)")
+
+    return issues
+
+
 # ── Actuator control ──────────────────────────────────────────────────────────
 
 def _send(device: str, on: bool, speed: int) -> bool:
@@ -168,12 +261,20 @@ def _send(device: str, on: bool, speed: int) -> bool:
         time.sleep(0.1)
 
     _state[device] = on
+    if on:
+        _last_on[device] = time.time()
+    else:
+        _last_off[device] = time.time()
     log.info("%-13s → %-3s  port=%d  speed=%d", device, "ON" if on else "OFF", port, speed if on else 0)
     return True
 
 
 def set_device(device: str, on: bool, speed: int = FAN_SPEED):
     if _state[device] != on:
+        reason = safety_check(device, on)
+        if reason:
+            log.warning("Safety BLOCK  %-13s → %-3s  (%s)", device, "ON" if on else "OFF", reason)
+            return
         _send(device, on, speed)
 
 
@@ -301,6 +402,7 @@ def layer_llm():
         )
 
         suggestion = json.loads(resp.content[0].text.strip())
+        suggestion = safety_clamp_setpoints(suggestion)
         old = {k: TARGETS[k] for k in ("temp_lo", "temp_hi", "hum_lo", "hum_hi")}
         for k in old:
             if k in suggestion:
@@ -349,8 +451,16 @@ def main():
         else:
             log.warning("No recent readings — logger and cloud_ingest may both be down")
 
-        layer_rules(temp, hum)
-        layer_ml()   # ML still uses BLE time-series (fetch_series) — needs dense history
+        snap_ts = max((e["ts"] for e in snap.values()), default=None)
+        read_issues = safety_check_readings(temp, hum, snap_ts)
+        for issue in read_issues:
+            log.warning("Safety: %s", issue)
+
+        if read_issues:
+            log.warning("Control layers skipped — resolve sensor issues before acting")
+        else:
+            layer_rules(temp, hum)
+            layer_ml()   # ML still uses BLE time-series (fetch_series) — needs dense history
 
         if (now - t_last_llm) >= LLM_INTERVAL:
             t_last_llm = now

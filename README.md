@@ -1,5 +1,18 @@
 # Grow-Automation
 
+Two complementary systems for a fully automated AC Infinity RDWC cannabis grow.
+
+| System | Transport | What it does |
+|---|---|---|
+| **RDWC AI Advisor** | Cloud API | Polls all devices, doses nutrients, controls CO₂/lights/fans via Ollama LLM |
+| **BLE Logger + Controller** | Bluetooth | Logs sensors at 1 Hz locally, controls devices, hybrid rules/ML/LLM climate control |
+
+The cloud system is the main controller. The BLE system is the local-first layer — no internet required, sub-second polling, and it unlocks sensor data that the cloud API doesn't expose yet.
+
+---
+
+## RDWC AI Advisor (cloud)
+
 Custom controller and AI advisor for a Recirculating Deep Water Culture (RDWC)
 cannabis grow built around AC Infinity UIS controllers and a local LLM running
 on Ollama.
@@ -17,245 +30,193 @@ are enforced by code regardless of AI behavior.
 > until the HDS3 hydro probe is wired and several Layer-1 safety items
 > are complete. See [`UPGRADE_PRIORITY_TREE.md`](UPGRADE_PRIORITY_TREE.md).
 
----
-
-## Hardware
+### Hardware
 
 | Device | Model | Role |
 |--------|-------|------|
 | Controller 1 ("4 x 4") | AC Infinity CTR89Q | Climate, light, airflow |
 | Controller 2 ("Hydroponics Control") | AC Infinity CTR89Q | Reservoir — dosers + pH UP/DOWN |
-| Outlet strip ("Auxiliary Outputs") | AC Infinity ADA4 | Mains outlets + UIS for CO2/light/water-level sensors |
-| Hydro probe | AC Infinity HDS3 | pH, EC/TDS, water temp (UIS) |
-| Light | Growcraft X6 (0-10V dim) | Photoperiod |
-| Nutrients | FloraFlex Full Tilt (V1+V2 veg / B1+B2 bloom) | Two-part nutrient line |
-| Compute | ThinkPad P1 Gen 3, NVIDIA T2000 (4 GB) | Poller + local LLM |
+| Power Strip | ADA4 | Hard on/off switching for high-draw devices |
 
----
-
-## AI layer
-
-- **Default model:** `qwen2.5:3b-instruct` — chosen via head-to-head benchmark
-  (`model_benchmark.py`), 100 % schema-valid on 32/32 hardware-command prompts at
-  ~1.9 s median latency, fits in 4 GB VRAM.
-- **Backup:** `phi4-mini` — also 100 % valid, slower (~3 s).
-- **Reasoning models** (DeepSeek-R1 family) were tested and rejected — small
-  math-tuned bases hallucinate schema-incompatible actions; ~35 % pass rate.
-
-The AI's job is reasoning about sensor state. It does **not** directly control
-hardware. Every action proposal flows through `validate_actions()` →
-`filter_actions()` → `execute_actions()`. Scheduled outputs and CO2 pulses are
-fired deterministically; the AI only sees the resulting state.
-
----
-
-## Quick start (Linux / macOS)
+### Quick start (cloud system)
 
 ```bash
-# 1. Clone
-git clone https://github.com/jozefbeach2264/Grow-Automation.git
-cd Grow-Automation
-
-# 2. Install Python dependencies
-pip install requests python-dotenv
-
-# 3. (Optional) Install Ollama and pull a model -- skip if running AI-less
-#    https://ollama.com/download
-ollama pull qwen2.5:3b-instruct
-
-# 4. Configure your environment
-cp .env.example .env
-# Edit .env with your AC Infinity credentials, grow calendar, role mappings.
-# Keep ADVISORY_MODE=true until you have confirmed the cycle output looks sane.
-
-# 5. Run
-python poller.py
+pip install -r requirements.txt
+cp .env.example .env   # fill in credentials
+ollama serve           # in a separate terminal
+python3 poller.py
 ```
 
-## Quick start (Windows)
+See [`CLAUDE.md`](CLAUDE.md) for full protocol details, AI decision chain, safety gates, nutrient schedule, and config reference.
 
-The system is pure Python with no Linux-specific dependencies, so it runs
-unchanged on Windows.
+---
 
-```powershell
-# 1. Install Python 3.11+ from python.org (tick "Add to PATH")
-# 2. (Optional) Install Ollama for Windows from https://ollama.com/download/windows
-# 3. In Windows Terminal or PowerShell:
+## BLE Logger + Controller (local)
 
-git clone https://github.com/jozefbeach2264/Grow-Automation.git
-cd Grow-Automation
+Local-first BLE data logger, sensor decoder, and AI climate controller for AC Infinity
+grow tent controllers (ACI_V3.5_CTRLER and compatible). No cloud. No Wi-Fi. Pure Bluetooth.
 
-python -m venv venv
-.\venv\Scripts\Activate.ps1            # PowerShell
-# (use venv\Scripts\activate.bat in cmd, source venv/Scripts/activate in Git Bash)
+This is the Phase 2 local layer — eliminates cloud dependency for the BLE-capable controllers,
+gives 1 Hz sensor resolution instead of the cloud API's polling interval, and exposes
+sensor slots the cloud API doesn't surface yet.
 
-pip install requests python-dotenv
+### What it does
 
-ollama pull qwen2.5:3b-instruct        # only if running with AI
+- **Logs** all sensor data at ~1 Hz into a local SQLite database
+- **Decodes** T+H combos, CO₂, light, and hydro (water temp / pH / EC) sensors
+- **Controls** fans and plugged-in devices over the existing BLE connection — no reconnect needed
+- **Graphs** any time range with auto-classified panels per sensor type
+- **AI controller** — hybrid rules / ML / LLM loop that reacts to live readings and tunes its own setpoints
 
-copy .env.example .env
-notepad .env                            # fill in credentials, calendar, role mappings
+### Hardware tested
 
-python poller.py
-```
-
-For long-running deployment on Windows, three options ranked best to simplest:
-
-1. **NSSM** ([nssm.cc](https://nssm.cc/)) — wraps `python poller.py` as a real
-   Windows service with auto-restart. Closest equivalent to systemd. Recommended
-   once you have plants in the loop.
-2. **Task Scheduler** — set "Trigger: at log on" with action
-   `python.exe poller.py` and a working directory. Set-and-forget for personal use.
-3. **Leave Windows Terminal open** — fine for development.
-
-Command syntax that differs from Linux/macOS:
-
-| Linux/macOS | Windows |
+| Device | Value |
 |---|---|
-| `python3 poller.py` | `python poller.py` (or `py poller.py`) |
-| `source venv/bin/activate` | `venv\Scripts\Activate.ps1` (PowerShell) |
-| `cp .env.example .env` | `copy .env.example .env` |
-| `kill 1234` | `taskkill /F /PID 1234` |
+| Controller | AC Infinity ACI_V3.5_CTRLER |
+| Chip | ESP32 (AC Infinity BLE stack) |
+| Sensors | T+H combo, CO₂+light, hydro (water temp/pH/EC) |
 
-`nvidia-perf.service` in the repo is a systemd unit — Linux only. It locks GPU
-clocks on laptops where the driver throttles aggressively. Windows users don't
-need it; NVIDIA's Windows driver handles clocks differently.
+Update the MAC address in `scripts/logger.py` to match your controller.
 
----
+### Prerequisites
 
-## Run modes
+- Python 3.11+
+- Windows 10 1709 / 11, macOS 10.15+, or Linux with BlueZ ≥ 5.43
+- Bluetooth adapter
+- Controller with BLE mode enabled (the AC Infinity app must be closed — only one BLE central at a time)
 
-The poller picks behavior from two `.env` flags:
+### Installation
 
-| `AI_ENABLED` | `ADVISORY_MODE` | What happens |
+```bash
+git clone <repo-url>
+cd Grow-Automation
+python -m venv .venv
+
+# Windows
+.venv\Scripts\activate
+
+# macOS / Linux
+source .venv/bin/activate
+
+pip install -r requirements.txt
+```
+
+### Quick start (BLE system)
+
+**1. Log sensor data**
+```bash
+python scripts/logger.py
+python scripts/logger.py --address AA:BB:CC:DD:EE:FF   # different controller
+python scripts/logger.py --poll-interval 60             # slower port polling
+```
+
+Connects, subscribes to 1 Hz notifications, polls port states every 30 s, writes to `controller.db`. Auto-reconnects on disconnect.
+
+**2. Graph the data**
+```bash
+python scripts/daily_graph.py               # today
+python scripts/daily_graph.py --hours 2     # last 2 hours
+python scripts/daily_graph.py --all         # everything in the DB
+```
+Auto-generates panels for: Air Temp, Humidity, VPD, CO₂, Light, Water Temp, pH, EC, Fan Speed.
+
+**3. Control a device manually**
+```bash
+# Logger must be running (holds the BLE connection)
+python scripts/ctl.py --port 1 --speed 7
+python scripts/ctl.py --port 1 --off
+```
+
+**4. Run the AI climate controller**
+```bash
+# Logger must be running in a separate terminal
+python scripts/controller_agent.py
+
+# With LLM setpoint advisor (optional):
+ANTHROPIC_API_KEY=sk-... python scripts/controller_agent.py
+```
+
+Configure ports and targets at the top of `scripts/controller_agent.py`:
+```python
+PORTS = {
+    "ac":           1,    # controller port number (None = not plugged in yet)
+    "humidifier":   2,
+    "dehumidifier": 3,
+}
+TARGETS = {
+    "temp_lo": 70.0,   # °F
+    "temp_hi": 74.0,
+    "hum_lo":  58.0,   # %RH
+    "hum_hi":  65.0,
+}
+```
+
+### AI controller — three layers
+
+| Layer | Runs every | What it does |
 |---|---|---|
-| `true` | `true` | AI runs, logs proposals + deterministic enforcement plan, **no hardware writes** |
-| `true` | `false` | **Default live mode.** AI proposes, deterministic chain validates and executes, schedule + CO2 enforcement fire on top |
-| `false` | `false` | **Deterministic-only.** No LLM ever called. Schedule (lights/fans), CO2 pulse modulator, CO2 emergency dump, reservoir gates all still active. Sensor monitoring + trends tracked. Manual control via the AC Infinity app for anything chemistry-related |
-| `false` | `true` | Polling display only. No AI, no enforcement. Pure sensor read-out |
+| **Rules** | 30 s | Hysteresis on current readings — immediate response |
+| **ML** | 30 s | Ridge regression on last 30 min → predicts 5 min ahead → pre-empts crossings |
+| **LLM** | 30 min | Claude reviews trends → adjusts setpoints ±2°F / ±3%RH → logs reasoning |
 
-**The deterministic-only mode (`AI_ENABLED=false ADVISORY_MODE=false`) is the
-right pick if:**
+LLM layer is optional — if `ANTHROPIC_API_KEY` is not set, rules + ML run normally.
 
-- You don't want to run a local LLM
-- Your hardware can't run Ollama (e.g. Raspberry Pi)
-- You want a smart-thermostat + safety supervisor and prefer manual control of
-  nutrient and pH dosing
+### BLE protocol
 
-In this mode the system becomes: schedule-driven lights and fans, hysteresis-
-band CO2 pulse around your per-week target, deterministic CO2 emergency dump
-on threshold breach, and live sensor + trend display. No LLM dependency.
+The controller broadcasts a `0x1EFF` notification packet at ~1 Hz with a sensor tail of 4-byte groups:
 
----
+```
+[port_id, sensor_type, value_hi, value_lo]
+value = ((value_hi << 8) | value_lo) / 100.0
+```
 
-## Configuration
+BLE `port_id` values match the cloud API `sensorType` numbers exactly:
 
-All operational config is in `.env` and reloaded on every cycle (so edits take
-effect without restart, except for a few startup-time settings). Highlights:
+| port_id | Cloud sensorType | Measurement | Notes |
+|---|---|---|---|
+| 0 | 0 | External temp (°F) | |
+| 2 | 2 | External humidity (%RH) | |
+| 3 | 3 | External VPD (kPa) | |
+| 4 | 4 | Built-in temp (°F) | |
+| 6 | 6 | Built-in humidity (%RH) | |
+| 7 | 7 | Built-in VPD (kPa) | |
+| 11 | 11 | CO₂ (ppm) | BLE value × 100 = ppm |
+| 12 | 12 | Light | BLE value × 100 |
+| 13 | 13 | pH | |
+| 14 | 14 | EC (µS/cm) | |
+| 16 | 16 | TDS (ppm) | |
+| 18 | 18 | Water temp (°F) | |
 
-- **Grow calendar** — `GROW_START_DATE` + `VEG_DAYS` auto-computes the current
-  grow week and stage. pH / PPM / CO2 targets are stage-driven by default
-  (FloraFlex for nutrients, Bugbee for CO2).
-- **Schedule-driven outputs** — `LIGHT_HOURS_ON` / `LIGHT_HOURS_OFF` /
-  `LIGHT_CYCLE_START` / `LIGHT_INTENSITY`, plus role mappings `ROLE_LIGHT`,
-  `ROLE_OSC_FANS`, `ROLE_EXHAUST`. Hardware roles are env-driven, not hardcoded.
-- **CO2 control** — `CO2_VALVE`, `CO2_PULSE_BAND_PPM` (deadband around target),
-  `CO2_EMERGENCY_PPM` (hard cap), `CO2_DUMP_CLEAR_PPM` (hysteresis clear).
-- **Safety bounds** — `MAX_DOSER_SPEED`, `DOSE_LOCKOUT_MINUTES`,
-  `PH_LOCKOUT_MINUTES`, `MAX_DOSE_ML_CYCLE`.
+Sensor type codes in the packet rotate +8 each time a new sensor is added to the controller. The decoder handles this automatically with a byte-by-byte scan.
 
-Port labels and device-specific config live in `labels.env`.
+Commands are sent to characteristic `70d51001-2c7f-4e75-ae8a-d758951ce4e0`. Responses on `70d51002-2c7f-4e75-ae8a-d758951ce4e0`.
 
----
+### BLE file map
 
-## Safety model
+```
+aci_ble_lab/
+  db.py              — SQLite schema + helpers
+  common.py          — shared BLE utilities
+  scan.py / inspect.py / listen.py / proxy.py — GATT tools
+scripts/
+  logger.py          — main 1 Hz data logger (start here)
+  ctl.py             — manual device control via drop-file
+  daily_graph.py     — graph generator
+  controller_agent.py — hybrid rules/ML/LLM climate controller
+  query_sensors.py   — DB query tool (avg/min/max by port)
+  type_timeline.py   — when each sensor type first appeared
+  [probe_*.py]       — BLE protocol reverse-engineering scripts (reference)
+```
 
-The system is built around the principle that the AI proposes and deterministic
-code disposes. Layers in order of precedence:
+### Windows note
 
-1. **CO2 emergency dump** — if `co2_ppm` exceeds `CO2_EMERGENCY_PPM`, code
-   forces the valve OFF and ramps exhaust to max with hysteresis. Highest
-   priority — runs before the AI cycle.
-2. **Action schema validation** — every AI action is checked against a strict
-   schema (verb whitelist, value type, port type, device existence) before any
-   safety gate runs. Malformed actions are rejected with a specific reason
-   logged, not silently dropped.
-3. **Reservoir gate enforcement** — `dose_gate`, `ph_gate`, `co2_gate` from
-   `res_health_check()` are enforced deterministically in `filter_actions()`.
-   The AI cannot override them by ignoring them in its response.
-4. **CO2 pulse modulator** — hysteresis-band on/off control around the
-   per-week target. Sits underneath the gate; gate=HOLD/REDUCE forces OFF.
-5. **Persistent lockouts** — dose/pH cooldown clocks are written to
-   `profiles/.lockouts.json` after every action, so a process restart does not
-   reset the clock and let the AI re-dose immediately.
-6. **Schedule enforcement fallback** — after the AI cycle, any schedule deltas
-   the AI didn't issue corrections for are fired deterministically.
-7. **Hard blocks** — pH dosing requires a live pH sensor reading; nutrient
-   dosing requires `dose_gate == NORMAL`; chemical dosing requires the HDS3
-   to be reading.
-
-Cycles in advisory mode log everything the AI proposed and what the safety
-chain did with it. The forensic trail is the first thing to consult when
-something looks off.
+Only one BLE central connection is allowed at a time. If another process is holding it, the logger retries every 15 s. Find competing processes:
+```powershell
+tasklist /FI "IMAGENAME eq python.exe"
+```
 
 ---
 
-## Hands-on utilities
+## Sensor type cross-reference
 
-| Script | Purpose |
-|--------|---------|
-| `poller.py` | Main poller and AI-driven controller. |
-| `demo_cycle.py` | Deterministic demo — turn all aux outlets on, then sequentially ramp every variable-speed port 0 → 10 → hold → 0. |
-| `ai_cycle_test.py` | AI-driven cycle test. Walks every port through 0 → 10 → 0 using the configured model. Useful for validating AI + hardware end-to-end. |
-| `model_benchmark.py` | Head-to-head LLM benchmark. Edit `MODELS_UNDER_TEST` and run to compare schema validity and latency. |
-| `ramp_probe.py` | Measure the linear ramp rate of a single port (used to establish the 1 unit/sec model). |
-
----
-
-## Documentation
-
-- [`CLAUDE.md`](CLAUDE.md) — project context for AI agents and contributors.
-- [`UPGRADE_PRIORITY_TREE.md`](UPGRADE_PRIORITY_TREE.md) — the full roadmap from
-  current state to plant-ready, ordered by safety layer.
-- Per-layer design docs:
-  - [`AWAY_MODE_AI_TRIAGE_PLAN.md`](AWAY_MODE_AI_TRIAGE_PLAN.md)
-  - [`TIMED_DOSING_PLAN.md`](TIMED_DOSING_PLAN.md)
-  - [`READBACK_VERIFICATION_PLAN.md`](READBACK_VERIFICATION_PLAN.md)
-  - [`EXECUTION_RECORDS_AND_PREFLIGHT_PLAN.md`](EXECUTION_RECORDS_AND_PREFLIGHT_PLAN.md)
-  - [`WATCHDOG_HEARTBEAT_PLAN.md`](WATCHDOG_HEARTBEAT_PLAN.md)
-  - [`EVENT_LOGGING_PLAN.md`](EVENT_LOGGING_PLAN.md)
-  - [`STRAIN_PHENO_LEARNING_PLAN.md`](STRAIN_PHENO_LEARNING_PLAN.md)
-
----
-
-## Reference
-
-The AC Infinity write protocol used by this project was reverse-engineered by
-capturing the official mobile app's traffic over a WiFi hotspot. The findings
-are documented in `CLAUDE.md` under "AC Infinity API" and "Control writes". The
-key field that took a while to identify: `onSelfSpead` is the new target speed,
-**not** `onSpead` (which is the readback from the controller).
-
-Reference materials in repo:
-
-- `dwc res rules.jpeg` — DWC reservoir diagnostic rules (water level × EC × pH
-  trend matrix). Lives in the AI prompt.
-- `Floraflex1.webp` — FloraFlex Full Tilt schedule used for default PPM targets.
-
----
-
-## Disclaimer
-
-This is hobbyist software controlling real hardware that pumps real chemicals
-into a real reservoir holding real plants. It is provided as-is with no
-warranty. Read the safety design before flipping `ADVISORY_MODE=false`. Do not
-enable chemical dosing without first completing the Layer-1 items in
-`UPGRADE_PRIORITY_TREE.md`. The author is not responsible for crop loss,
-equipment damage, root rot, or runaway CO2 enrichment.
-
----
-
-## License
-
-MIT — see `LICENSE` if present, otherwise treat as "do what you want, no
-warranty".
+The cloud API `sensorType` integers and the BLE `port_id` bytes are the same numbering system. Data from both layers can be merged by matching on this common ID.

@@ -16,6 +16,7 @@ Last updated: 2026-06-06. Both layers verified against live hardware.
 7. [Known Constraints and Gotchas](#7-known-constraints-and-gotchas)
 8. [Discovery Notes](#8-discovery-notes)
 9. [Data Merge Layer](#9-data-merge-layer)
+10. [Safety Layer](#10-safety-layer)
 
 ---
 
@@ -760,3 +761,125 @@ python scripts/controller_agent.py
 
 All three write to / read from the same `controller.db` via WAL mode, which allows
 concurrent readers and one writer without locking conflicts.
+
+---
+
+## 10. Safety Layer
+
+The safety layer in `scripts/controller_agent.py` runs before any actuator command is
+issued. It cannot be bypassed by Layer 1 (rules), Layer 2 (ML), or Layer 3 (LLM). All
+three layers route through `set_device()`, which gates on `safety_check()`.
+
+### Cooldown and run-time constants
+
+```python
+SAFETY = {
+    "ac_min_off_s":    180,   # compressor rest — 3 min minimum between AC cycles
+    "ac_min_on_s":     60,    # 1 min minimum run before AC can turn off (short-cycle guard)
+    "hum_min_off_s":   30,    # 30s minimum off-time between humidifier cycles
+    "dehum_min_off_s": 30,    # 30s minimum off-time between dehumidifier cycles
+    "sensor_max_age":  300,   # skip control if newest reading is older than 5 min
+}
+```
+
+**Why 180s AC cooldown:** AC compressors require a minimum off-time (typically 3–5 min)
+between cycles to allow refrigerant pressure to equalise. Starting the compressor before
+pressure equalises causes mechanical stress and premature failure.
+
+**Why 60s AC minimum run:** Running the compressor for less than a minute before turning
+it off is ineffective (the refrigerant cycle hasn't completed) and stresses the motor.
+
+### Absolute setpoint bounds
+
+```python
+SETPOINT_LIMITS = {
+    "temp_lo": (60.0, 80.0),
+    "temp_hi": (62.0, 85.0),
+    "hum_lo":  (30.0, 70.0),
+    "hum_hi":  (35.0, 80.0),
+}
+```
+
+These are hard bounds applied to every LLM setpoint suggestion before the values are
+written to `TARGETS`. The LLM prompt also asks for ±2°F / ±3%RH increments, but
+`SETPOINT_LIMITS` is the backstop — it enforces correctness even if the model ignores
+the prompt constraint or returns a hallucinated value.
+
+If clamping creates an inversion (temp_lo ≥ temp_hi after clamping), both sides are
+reverted to the current live values rather than guessing which end was wrong.
+
+### State tracking
+
+```python
+_state    = {"ac": False, "humidifier": False, "dehumidifier": False}
+_last_on  = {"ac": 0.0,   "humidifier": 0.0,   "dehumidifier": 0.0}
+_last_off = {"ac": 0.0,   "humidifier": 0.0,   "dehumidifier": 0.0}
+```
+
+`_last_on` and `_last_off` are updated inside `_send()` immediately after the drop-file
+command is confirmed. They survive across control layers within a single process run but
+reset to 0.0 on restart — so cooldowns are not enforced across process restarts. On a
+fresh start the 180s AC cooldown starts counting from epoch 0, meaning it will be
+considered expired and the AC can fire immediately. This is intentional: the safe
+assumption after a restart is that the compressor has had sufficient rest.
+
+### safety_check() — per-command gate
+
+Called by `set_device()` before every actuator command. Returns a reason string if
+blocked, `None` if allowed.
+
+| Check | Condition | Block reason |
+|---|---|---|
+| Conflict | Turning humidifier ON while dehumidifier is ON (or vice versa) | `"conflict: dehumidifier is on"` |
+| Cooldown | Turning device ON before `min_off_s` has elapsed since last OFF | `"cooldown: ac off for 45s, need 180s"` |
+| Min-run | Turning device OFF before `min_on_s` has elapsed since last ON | `"min-run: ac on for 12s, need 60s"` |
+
+Blocked commands log at WARNING level:
+```
+2026-06-06 14:32:17  WARN   Safety BLOCK  ac            → ON   (cooldown: ac off for 45s, need 180s)
+```
+
+### safety_clamp_setpoints() — LLM output sanitisation
+
+Called inside `layer_llm()` immediately after `json.loads()` parses the model response,
+before any value is written to `TARGETS`.
+
+1. Each key in `SETPOINT_LIMITS` is clamped to its `(lo, hi)` range.
+2. Clamped values are logged at WARNING so operator can see when the model went out of bounds.
+3. After clamping, inversion check: if `temp_lo >= temp_hi` or `hum_lo >= hum_hi`, revert
+   both sides of the affected pair to the current live `TARGETS` values.
+
+### safety_check_readings() — sensor validation
+
+Called in the main loop every tick, before Layer 1 and Layer 2 execute. Returns a list
+of issue strings. If the list is non-empty, control layers are skipped for that tick.
+
+| Check | Condition | Issue string |
+|---|---|---|
+| Stale | Newest snapshot entry older than `sensor_max_age` (300s), or snapshot empty | `"stale readings: last update 320s ago (limit 300s)"` |
+| Temp range | `temp` outside 40–120°F | `"temp out of plausible range: 138.4F (expected 40-120)"` |
+| Humidity range | `hum` outside 1–99% | `"humidity out of plausible range: 0.0% (expected 1-99)"` |
+
+The LLM review (`layer_llm`) is **not** blocked by sensor issues — it still fires on
+schedule because it is diagnostic and may want to respond to the degraded state.
+
+### Log output reference
+
+```
+# Normal operation
+2026-06-06 14:30:00  INFO   Readings  : temp=73.9°F[B]  hum=64.5%[B]  vpd=1.01[B]
+2026-06-06 14:30:00  INFO   ac            → ON   port=1  speed=7
+
+# Safety block — cooldown
+2026-06-06 14:31:00  WARN   Safety BLOCK  ac            → ON   (cooldown: ac off for 45s, need 180s)
+
+# Safety block — conflict
+2026-06-06 14:31:00  WARN   Safety BLOCK  humidifier    → ON   (conflict: dehumidifier is on)
+
+# Stale sensor guard
+2026-06-06 14:35:00  WARN   Safety: stale readings: last update 320s ago (limit 300s)
+2026-06-06 14:35:00  WARN   Control layers skipped — resolve sensor issues before acting
+
+# LLM setpoint clamp
+2026-06-06 15:00:00  WARN   Safety clamp: temp_hi 87.0 → 85.0
+```

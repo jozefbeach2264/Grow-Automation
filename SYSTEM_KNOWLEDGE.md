@@ -15,6 +15,7 @@ Last updated: 2026-06-06. Both layers verified against live hardware.
 6. [Database Schema](#6-database-schema)
 7. [Known Constraints and Gotchas](#7-known-constraints-and-gotchas)
 8. [Discovery Notes](#8-discovery-notes)
+9. [Data Merge Layer](#9-data-merge-layer)
 
 ---
 
@@ -477,6 +478,25 @@ CREATE TABLE port_readings (
 CREATE INDEX port_readings_ts ON port_readings(ts);
 ```
 
+### cloud_readings — cloud API sensor log
+
+```sql
+CREATE TABLE cloud_readings (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          REAL NOT NULL,       -- Unix timestamp (float)
+    dev_id      TEXT NOT NULL,       -- device ID string from cloud API
+    dev_name    TEXT,                -- human-readable device name (e.g. "RDWC Control")
+    sensor_id   INTEGER NOT NULL,    -- same integer as BLE port_id and cloud sensorType
+    value       REAL NOT NULL        -- already scaled to /100 units (same space as sensor_readings)
+);
+CREATE INDEX cloud_readings_ts        ON cloud_readings(ts);
+CREATE INDEX cloud_readings_sensor_id ON cloud_readings(sensor_id);
+```
+
+CO2 (sensor_id 11), light (12), and water level (20) arrive from the cloud in raw units.
+`cloud_ingest.py` divides these by 100 before writing so they land in the same unit space
+as `sensor_readings`. All other sensor_ids are already ÷100 from the cloud API.
+
 ### readings — legacy fixed-column log (historical, pre-sensor_readings)
 
 ```sql
@@ -622,3 +642,121 @@ Initially believed unsupported over BLE ("I've heard I can't add another sensor"
 plugging in the HDS3 probe and restarting the BLE logger, four new ports appeared:
 13 (pH), 14 (EC µS/cm), 16 (TDS), 18 (water temp). All use type code `0x61` with the
 same +8 rotation pattern. Values match expected ranges for tap water.
+
+---
+
+## 9. Data Merge Layer
+
+BLE and cloud are complementary, not redundant. BLE is high-frequency (≈1 Hz) and local,
+but only covers the single controller the logger is connected to. The cloud API covers all
+controllers (including "RDWC Control" and "Auxiliary Outputs") and doser port states, but
+polls at most once per minute and adds network latency. The merge layer unifies them into
+one snapshot that the controller agent and AI layer see as a single dict.
+
+### Architecture
+
+```
+logger.py          → sensor_readings table   (BLE, ~1 Hz, single controller)
+cloud_ingest.py    → cloud_readings table    (cloud API, every 60s, all controllers)
+                          ↓
+                  build_unified_snapshot()
+                          ↓
+             controller_agent.py / ai layer
+```
+
+### cloud_ingest.py
+
+Script: `scripts/cloud_ingest.py`
+
+Polls `fetch_all_devices()` every `--interval` seconds (default 60). For each online device:
+1. Calls `parse_device(raw)` to get a dict of named sensor fields.
+2. Maps field names back to `sensor_id` integers using the `SENSOR_TYPE` reverse map from
+   `ac_infinity_client.py`.
+3. Divides CO2 (11), light (12), and water level (20) by 100 to normalise to BLE unit space.
+4. Calls `add_cloud_readings(ts, dev_id, dev_name, {sensor_id: value})`.
+
+Error handling:
+- `ACInfinityAuthError` → clears `AC_INFINITY_TOKEN` from env and re-authenticates.
+- Other exceptions → exponential backoff: `min(30 × consecutive_errors, 600)` seconds.
+
+Loads both `.env` (credentials, token) and `labels.env` (port labels, hide flags) on startup.
+
+### add_cloud_readings()
+
+```python
+def add_cloud_readings(ts: float, dev_id: str, dev_name: str, readings: dict) -> None:
+    """readings = {sensor_id: value} — values already in /100 units."""
+```
+
+Bulk-inserts one row per sensor_id into `cloud_readings`. Values must already be normalised
+to the same ÷100 unit space as `sensor_readings` before calling this function.
+
+### build_unified_snapshot()
+
+```python
+def build_unified_snapshot(ble_max_age: int = 60, cloud_max_age: int = 300) -> dict:
+    """Returns {sensor_id: {"value": float, "source": "ble"|"cloud", "ts": float, "dev_name": str|None}}"""
+```
+
+Merge logic (in Python — SQLite has no FULL OUTER JOIN):
+
+1. **BLE pass**: query `sensor_readings` for all ports with readings within `ble_max_age`
+   seconds. Average multiple readings per port (handles type code rotation — multiple type
+   codes at the same port_id are averaged together). Inserts into snapshot with `source="ble"`.
+
+2. **Cloud pass**: query `cloud_readings` for all sensor_ids with readings within
+   `cloud_max_age` seconds. For each sensor_id **not already in the snapshot**, insert with
+   `source="cloud"` and the device name attached.
+
+BLE wins any conflict — cloud only fills sensor_ids with no fresh BLE data. This means if
+the BLE logger is up, tent sensors come from BLE (high resolution). If the logger is down,
+cloud readings fill in. Sensors on other controllers (RDWC Control, Auxiliary Outputs) that
+have no BLE logger always come from cloud.
+
+### Typical age windows used at runtime
+
+| Caller | ble_max_age | cloud_max_age | Reason |
+|---|---|---|---|
+| `controller_agent.py` main loop | 90s | 300s | Tolerates one missed BLE tick; cloud up to 5 min stale |
+| `summary_30min()` (LLM context) | 60s | 300s | Wants current snapshot for LLM review |
+| `test_merge.py` | 120s | 60s | Wider BLE window for testing; tight cloud to show injected data |
+
+### Source tagging
+
+Every entry in the snapshot carries `"source": "ble"` or `"source": "cloud"` and,
+for cloud entries, `"dev_name"`. The controller agent logs source tags in the readings line:
+
+```
+Readings  : temp=73.9°F[B]  hum=64.5%[B]  vpd=1.01[B]
+```
+
+`B` = BLE, `C` = cloud. The LLM context includes the source and device name per sensor so
+the model knows which readings are local vs. polled from a remote controller.
+
+### CO2 and light unit normalisation
+
+| Sensor | Cloud API value | Stored in cloud_readings | BLE sensor_readings |
+|---|---|---|---|
+| CO2 (id 11) | raw ppm (e.g. 750) | 7.50 (÷100) | 7.50 (same) |
+| Light (id 12) | raw (e.g. 130) | 1.30 (÷100) | 1.30 (same) |
+| Water level (id 20) | raw | ÷100 | not yet confirmed |
+| All others | already ÷100 | same | same |
+
+After normalisation both tables are in the same unit space and the snapshot can compare
+values directly across sources.
+
+### Running the merge stack
+
+```bash
+# Terminal 1 — BLE logger (1 Hz local readings)
+python scripts/logger.py
+
+# Terminal 2 — cloud ingest (60s cloud poll)
+python scripts/cloud_ingest.py
+
+# Terminal 3 — controller agent (reads unified snapshot every 30s)
+python scripts/controller_agent.py
+```
+
+All three write to / read from the same `controller.db` via WAL mode, which allows
+concurrent readers and one writer without locking conflicts.

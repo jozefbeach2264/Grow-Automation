@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-ctl.py — Send control commands to the running logger via drop-file.
+ctl.py — Send control commands to the running logger via the DB command queue.
 
-The logger checks for aci_control.json every second and executes it
-over the existing BLE connection — no reconnect needed.
+The logger pops one pending command per tick (~1s) and issues set_level over
+the existing BLE connection — no reconnect needed.
 
 Usage:
   python scripts/ctl.py --port 1 --speed 5       # turn port 1 ON at speed 5
@@ -14,27 +14,33 @@ work_type: 2 = ON (uses speed), 1 = OFF
 """
 
 import argparse
-import json
 import sys
 import time
 from pathlib import Path
 
-CMD_FILE = Path(__file__).resolve().parent.parent / "aci_control.json"
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, r"C:\Users\Ziggs\aci-ble-lab\.venv\Lib\site-packages")
+
+from aci_ble_lab.db import _conn, enqueue_command
 
 
 def send(port: int, work_type: int, speed: int):
-    payload = {"port": port, "work_type": work_type, "speed": speed}
-    CMD_FILE.write_text(json.dumps(payload))
-    print(f"Sent: port={port}  {'ON' if work_type == 2 else 'OFF'}  speed={speed}")
-    # Wait briefly for logger to pick it up
-    deadline = time.time() + 3.0
-    while CMD_FILE.exists() and time.time() < deadline:
+    cmd_id = enqueue_command(port, work_type, speed, source="ctl")
+    label = "ON" if work_type == 2 else "OFF"
+    print(f"Queued: port={port}  {label}  speed={speed}  (id={cmd_id})")
+
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        with _conn() as c:
+            row = c.execute(
+                "SELECT status FROM command_queue WHERE id=?", (cmd_id,)
+            ).fetchone()
+        if row and row["status"] != "pending":
+            print(f"Command {row['status']}.")
+            return
         time.sleep(0.1)
-    if CMD_FILE.exists():
-        CMD_FILE.unlink()
-        print("Warning: logger did not pick up command within 3s (is it running?)")
-    else:
-        print("Command delivered.")
+
+    print("Warning: logger did not pick up command within 5s (is it running?)")
 
 
 if __name__ == "__main__":

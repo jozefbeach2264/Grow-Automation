@@ -14,6 +14,9 @@ Device ports — update when plugged in:
   PORTS["humidifier"]   = None   → e.g. 2
   PORTS["dehumidifier"] = None   → e.g. 3
 
+Commands are queued in controller.db (command_queue table) and executed by
+logger.py over the existing BLE connection (~1s latency).
+
 Usage:
   python scripts/controller_agent.py
   ANTHROPIC_API_KEY=sk-... python scripts/controller_agent.py
@@ -32,7 +35,7 @@ sys.path.insert(0, r"C:\Users\Ziggs\aci-ble-lab\.venv\Lib\site-packages")
 import numpy as np
 from sklearn.linear_model import Ridge
 
-from aci_ble_lab.db import _conn, build_unified_snapshot
+from aci_ble_lab.db import _conn, build_unified_snapshot, enqueue_command
 
 logging.basicConfig(
     level=logging.INFO,
@@ -69,8 +72,6 @@ DEADBAND = {"temp": 0.5, "hum": 1.5}   # prevents rapid on/off cycling
 
 AC_SPEED    = 7   # fan speed when AC is on (1-10)
 FAN_SPEED   = 4   # speed for humidifier / dehumidifier
-
-CMD_FILE = Path(__file__).resolve().parent.parent / "aci_control.json"
 
 # ── Safety limits ─────────────────────────────────────────────────────────────
 
@@ -245,27 +246,16 @@ def _send(device: str, on: bool, speed: int) -> bool:
     port = PORTS.get(device)
     if port is None:
         return False
-
-    deadline = time.time() + 5.0
-    while CMD_FILE.exists() and time.time() < deadline:
-        time.sleep(0.1)
-    if CMD_FILE.exists():
-        log.warning("Drop-file busy, skipping %s command", device)
-        return False
-
-    payload = {"port": port, "work_type": 2 if on else 1, "speed": speed if on else 0}
-    CMD_FILE.write_text(json.dumps(payload))
-
-    deadline = time.time() + 3.0
-    while CMD_FILE.exists() and time.time() < deadline:
-        time.sleep(0.1)
-
+    work_type = 2 if on else 1
+    cmd_speed = speed if on else 0
+    enqueue_command(port, work_type, cmd_speed, source="controller_agent")
     _state[device] = on
     if on:
         _last_on[device] = time.time()
     else:
         _last_off[device] = time.time()
-    log.info("%-13s → %-3s  port=%d  speed=%d", device, "ON" if on else "OFF", port, speed if on else 0)
+    log.info("%-13s → %-3s  port=%d  speed=%d  [queued]",
+             device, "ON" if on else "OFF", port, cmd_speed)
     return True
 
 

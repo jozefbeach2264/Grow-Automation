@@ -14,6 +14,7 @@ capture_sessions    - Metadata about .jsonl capture files
 
 import json
 import sqlite3
+import time as _time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -163,6 +164,21 @@ def init_schema() -> None:
         );
         CREATE INDEX IF NOT EXISTS cloud_readings_ts        ON cloud_readings(ts);
         CREATE INDEX IF NOT EXISTS cloud_readings_sensor_id ON cloud_readings(sensor_id);
+
+        -- BLE control command queue (replaces aci_control.json drop-file)
+        -- Producer: controller_agent.py / ctl.py write pending rows.
+        -- Consumer: logger.py pops one row per tick and issues set_level over BLE.
+        CREATE TABLE IF NOT EXISTS command_queue (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts        REAL NOT NULL,
+            port      INTEGER NOT NULL,
+            work_type INTEGER NOT NULL,   -- 1=OFF, 2=ON
+            speed     INTEGER NOT NULL,   -- 0-10
+            status    TEXT NOT NULL DEFAULT 'pending',  -- pending / sent / failed
+            sent_at   REAL,
+            source    TEXT                -- 'controller_agent', 'ctl', etc.
+        );
+        CREATE INDEX IF NOT EXISTS command_queue_pending ON command_queue(status, id);
         """)
 
 
@@ -261,6 +277,36 @@ def add_cloud_readings(ts: float, dev_id: str, dev_name: str, readings: dict) ->
         )
 
 
+def enqueue_command(port: int, work_type: int, speed: int, source: str = "controller") -> int:
+    """Queue a BLE control command. Returns the new row id."""
+    with _conn() as c:
+        r = c.execute(
+            "INSERT INTO command_queue(ts, port, work_type, speed, source) VALUES(?,?,?,?,?)",
+            (_time.time(), port, work_type, speed, source),
+        )
+        return r.lastrowid
+
+
+def pop_next_command() -> dict | None:
+    """Atomically claim the oldest pending command. Returns a plain dict or None."""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT * FROM command_queue WHERE status='pending' ORDER BY id LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        c.execute(
+            "UPDATE command_queue SET status='sent', sent_at=? WHERE id=?",
+            (_time.time(), row["id"]),
+        )
+        return dict(row)
+
+
+def mark_command_failed(cmd_id: int) -> None:
+    with _conn() as c:
+        c.execute("UPDATE command_queue SET status='failed' WHERE id=?", (cmd_id,))
+
+
 def build_unified_snapshot(ble_max_age: int = 60, cloud_max_age: int = 300) -> dict:
     """
     Merge BLE and cloud sensor readings into one snapshot.
@@ -272,7 +318,6 @@ def build_unified_snapshot(ble_max_age: int = 60, cloud_max_age: int = 300) -> d
     cloud_max_age seconds — this includes sensors on controllers without BLE, doser port
     states, and sensors from multi-controller setups.
     """
-    import time as _time
     now = _time.time()
     snapshot: dict = {}
 

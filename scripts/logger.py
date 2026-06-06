@@ -14,6 +14,7 @@ Usage:
 Data lands in controller.db tables:
   readings       — 1Hz sensor readings (probe raw bytes)
   port_readings  — polled per-port state (work_type, speed)
+  command_queue  — picks up pending rows and issues set_level over BLE
 
 To graph, run:
   python scripts/daily_graph.py
@@ -22,7 +23,6 @@ To graph, run:
 
 import argparse
 import asyncio
-import json
 import logging
 import sys
 import time
@@ -37,7 +37,10 @@ sys.path.insert(0, r"C:\Users\Ziggs\aci-ble-lab\.venv\Lib\site-packages")
 from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
 from ac_infinity_ble.protocol import Protocol
-from aci_ble_lab.db import init_schema, add_reading, add_port_reading, add_sensor_readings
+from aci_ble_lab.db import (
+    init_schema, add_reading, add_port_reading, add_sensor_readings,
+    pop_next_command, mark_command_failed,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,7 +54,6 @@ CHAR_WRITE   = "70d51001-2c7f-4e75-ae8a-d758951ce4e0"
 CHAR_READ    = "70d51002-2c7f-4e75-ae8a-d758951ce4e0"
 POLL_INTERVAL = 30   # seconds between port state polls
 RECONNECT_DELAY = 15  # seconds before retry on disconnect
-CMD_FILE = Path(__file__).resolve().parent.parent / "aci_control.json"
 
 proto = Protocol()
 TYPE_MULTIPORT = 9
@@ -206,20 +208,21 @@ async def run_session(poll_ports: list[int]) -> None:
                     except (asyncio.TimeoutError, BleakError):
                         pass
 
-            # Control command drop-file: write aci_control.json to send a command
-            if CMD_FILE.exists():
+            # Control command queue: pop and execute one pending command per tick
+            pending = pop_next_command()
+            if pending is not None:
                 try:
-                    cmd_data = json.loads(CMD_FILE.read_text())
-                    CMD_FILE.unlink()
-                    port      = cmd_data.get("port", 1)
-                    work_type = cmd_data.get("work_type", 2)
-                    speed     = cmd_data.get("speed", 5)
                     seq += 1
-                    cmd = proto.set_level(TYPE_MULTIPORT, work_type, speed, port, seq)
-                    await client.write_gatt_char(CHAR_WRITE, cmd, response=False)
-                    log.info("Control: port=%d work_type=%d speed=%d", port, work_type, speed)
+                    ble_cmd = proto.set_level(
+                        TYPE_MULTIPORT, pending["work_type"], pending["speed"], pending["port"], seq
+                    )
+                    await client.write_gatt_char(CHAR_WRITE, ble_cmd, response=False)
+                    log.info("Control: port=%d work_type=%d speed=%d  [id=%d src=%s]",
+                             pending["port"], pending["work_type"], pending["speed"],
+                             pending["id"], pending.get("source", "?"))
                 except Exception as e:
-                    log.warning("Control command failed: %s", e)
+                    mark_command_failed(pending["id"])
+                    log.warning("Control command failed (id=%d): %s", pending["id"], e)
 
             # Periodic console status
             if (now - t_last_log) >= 60:

@@ -1,23 +1,24 @@
-# Virtual environment
-.venv/
+# Secrets -- never commit
+.env
+*.env.local
+labels.env
 
-# Database (contains personal sensor data, regenerated on first run)
+# Runtime data
+profiles/
+aci_control.json
+
+# Test artifacts
+benchmark_results.json
+
+# BLE logger -- database and generated output
 *.db
 *.db-shm
 *.db-wal
-
-# Generated graphs
 *.png
-
-# Runtime files
-aci_control.json
-logger_*.txt
-logger_*.txt
-
-# BLE capture files (large, device-specific)
 *.jsonl
 *.bin
 *.log
+logger_*.txt
 notifications.jsonl
 proxy-*.jsonl
 proxy-*.log
@@ -27,18 +28,27 @@ scan-active.json
 scan-passive.json
 scan-results.json
 
-# Scratch / one-off analysis scripts
+# Scratch scripts
 _*.py
 dryrun_controller.py
 
 # Python
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
 *.pyd
+*.egg-info/
 .Python
 
-# Editor
+# Virtual environment
+.venv/
+venv/
+
+# Editor / OS
 .vscode/
 .idea/
+.DS_Store
+Thumbs.db
 *.swp
+*~
+*.tmp

@@ -47,7 +47,7 @@ log = logging.getLogger("controller")
 # ── Ports (update when devices are plugged in) ────────────────────────────────
 
 PORTS = {
-    "ac":           4,      # controller port 1-8
+    "ac":           3,      # controller port 1-8
     "humidifier":   None,
     "dehumidifier": None,
 }

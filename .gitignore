@@ -1,0 +1,44 @@
+# Virtual environment
+.venv/
+
+# Database (contains personal sensor data, regenerated on first run)
+*.db
+*.db-shm
+*.db-wal
+
+# Generated graphs
+*.png
+
+# Runtime files
+aci_control.json
+logger_*.txt
+logger_*.txt
+
+# BLE capture files (large, device-specific)
+*.jsonl
+*.bin
+*.log
+notifications.jsonl
+proxy-*.jsonl
+proxy-*.log
+inspect-*.json
+scan-*.json
+scan-active.json
+scan-passive.json
+scan-results.json
+
+# Scratch / one-off analysis scripts
+_*.py
+dryrun_controller.py
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Editor
+.vscode/
+.idea/
+*.swp

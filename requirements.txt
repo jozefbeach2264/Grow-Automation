@@ -1,0 +1,6 @@
+bleak>=0.21.0
+ac-infinity-ble>=0.4.3
+numpy>=1.26.0
+scikit-learn>=1.4.0
+matplotlib>=3.8.0
+anthropic>=0.25.0

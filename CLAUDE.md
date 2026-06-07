@@ -54,10 +54,9 @@ throughout. **TODO (not yet built):** deterministic high-temp guardrail mirrorin
 3. "Auxiliary Outputs" — outlets
 
 **Laptop running everything:** ThinkPad P1 Gen 3, NVIDIA Quadro T2000 Max-Q (4GB VRAM).
-GPU clocks locked to 2100MHz via `nvidia-perf.service` for consistent Ollama performance.
-Power limit change is NOT supported on Max-Q — do not add `-pl` to the service file.
-2026-05-26: `nvidia-perf.service` was disabled so the laptop can return to normal driver-managed clocks for everyday use.
-When local Ollama throughput matters again, re-enable with `sudo systemctl enable --now nvidia-perf.service` after confirming `nvidia-smi` works post-boot.
+For consistent local-Ollama throughput the GPU clocks can be locked high; that's handled by an
+external helper outside this repo (the old `nvidia-perf.service` unit was removed). Note:
+power-limit changes (`-pl`) are NOT supported on Max-Q — clock-locking only.
 
 ---
 
@@ -99,7 +98,6 @@ Ports 3+4 are pH ports via `PH_PORTS_HYDROPONICS_CONTROL=3,4` — safety gate ap
 | `.env` | Credentials, AI settings, safety thresholds, calendar, strain config |
 | `profiles/` | Per-strain JSON files accumulating run history and calibration data |
 | `profiles/.pending_outcomes.json` | Persistent queue of actions awaiting outcome readback |
-| `nvidia-perf.service` | Systemd service locking GPU clocks at 2100MHz on boot |
 | `Floraflex1.webp` | FloraFlex Full Tilt schedule reference image |
 | `dwc res rules.jpeg` | DWC water/EC/pH trend diagnostic table reference image |
 
@@ -774,7 +772,7 @@ print(json.dumps(fetch_all_devices(token), indent=2))
   modules still need ASCII-safe strings to avoid codec errors.
 - Token expires occasionally — poller catches `ACInfinityAuthError` from the client
   (raised on HTTP 401, code 999999, or `appid` mentions in error body) and re-auths.
-- GPU power limit (`-pl`) NOT supported on Max-Q — `nvidia-perf.service` only locks clocks
+- GPU power limit (`-pl`) NOT supported on Max-Q — clock-locking only
 - First poll cycle shows UNKNOWN trends (no previous data) — gates conservatively HOLD.
   Normal from cycle 2 onward.
 - `HIDE_AIR` suppresses temp/humidity/VPD only. CO2, light, water temp, pH, TDS, EC are

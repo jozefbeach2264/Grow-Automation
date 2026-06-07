@@ -120,10 +120,6 @@ Command syntax that differs from Linux/macOS:
 | `cp .env.example .env` | `copy .env.example .env` |
 | `kill 1234` | `taskkill /F /PID 1234` |
 
-`nvidia-perf.service` in the repo is a systemd unit — Linux only. It locks GPU
-clocks on laptops where the driver throttles aggressively. Windows users don't
-need it; NVIDIA's Windows driver handles clocks differently.
-
 ---
 
 ## Run modes

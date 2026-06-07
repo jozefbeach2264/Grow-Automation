@@ -1,6 +1,17 @@
 # Strain And Pheno Learning Plan
 
-Status: draft for review
+Status: draft for review -- partial foundation exists (2026-06-02)
+
+## Implementation status (2026-06-02)
+
+Layer 5 work; gated behind Layers 1-2. A partial foundation already runs:
+- Per-strain dose-response calibration -- `profile_manager` observes before/after sensor
+  deltas per action and averages them into `profiles/<strain>.json`, injected into every
+  AI prompt (`MIN_CAL_OBSERVATIONS=2` before use).
+- Per-strain run history (`RUN_ID`) -- previous runs become the historical baseline.
+This is the seed for the learning layer, but it cannot be trusted for prediction until
+control is fully safe and bounded (timed dosing #7 + supervised live testing) and clean
+logged grow data exists (EVENT_LOGGING_PLAN). No predictive recommendation yet.
 
 ## Goal
 

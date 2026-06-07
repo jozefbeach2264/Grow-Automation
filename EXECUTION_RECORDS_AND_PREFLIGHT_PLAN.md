@@ -1,6 +1,24 @@
 # Execution Records And Device Preflight Plan
 
-Status: draft for review
+Status: PARTIAL -- validation + preflight done (#3/#4); records seeded (2026-06-02)
+
+## Implementation status (2026-06-02)
+
+DONE:
+- Schema validation (#3) -- `ai_advisor.validate_actions()` runs before `filter_actions()`:
+  catches bad verbs, wrong value types, out-of-range values, port-type/verb mismatches,
+  port name used as device name.
+- Device/port preflight (#4) -- folded into `validate_actions` (snapshot lookup confirms
+  device exists, port exists on device, port type matches verb).
+- Read-after-write verification (`hardware_verified` step) -- see READBACK_VERIFICATION_PLAN.
+- Execution-record seed -- `runtime_state.record_event()` appends to `profiles/events.jsonl`
+  (active_dose_*, stop_recovery_*, process_*, high_alert_*, estimated_overdose_window).
+
+REMAINING:
+- A single per-action lifecycle record that threads requested -> validated -> preflight ->
+  sent -> verified -> outcome through one stable action_id (today the lifecycle is split
+  across lockout state, pending-outcomes queue, and the event log). Lands with the Layer 2
+  action ledger (EVENT_LOGGING_PLAN v1).
 
 ## Goal
 

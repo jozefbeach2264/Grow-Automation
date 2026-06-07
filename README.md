@@ -12,10 +12,13 @@ reservoir gates, dose lockouts, and a CO2 pulse modulator — before any hardwar
 command fires. Schedule-driven outputs (lights, oscillating fans, CO2 valve)
 are enforced by code regardless of AI behavior.
 
-> **Status:** Advisory + supervised live control on lights / fans / CO2.
-> Chemical dosing (pH and nutrients) is hard-blocked at the safety layer
-> until the HDS3 hydro probe is wired and several Layer-1 safety items
-> are complete. See [`UPGRADE_PRIORITY_TREE.md`](UPGRADE_PRIORITY_TREE.md).
+> **Status:** Live supervised control on lights / fans / CO2, and **supervised
+> chemical dosing is validated on hardware** — the HDS3 hydro probe is wired and
+> the Layer-1 dosing safety is in (timed forced-stop doses, read-after-write
+> verify, crash-recovery watchdog, chemical interlock). Dosing runs through the
+> bounded `dosing` path and the supervised bucket-calibration harness; **fully
+> autonomous dosing stays gated behind `AUTONOMOUS_DOSING` (default off)** while
+> the calibration matures. See [`UPGRADE_PRIORITY_TREE.md`](UPGRADE_PRIORITY_TREE.md).
 
 ---
 
@@ -193,10 +196,42 @@ code disposes. Layers in order of precedence:
 7. **Hard blocks** — pH dosing requires a live pH sensor reading; nutrient
    dosing requires `dose_gate == NORMAL`; chemical dosing requires the HDS3
    to be reading.
+8. **Bounded doses + read-after-write** — chemicals only move via timed, bounded
+   doses (`dosing.py`) that always force-stop and *verify*; a stop that won't
+   confirm freezes dosing. A crash-recovery watchdog kills any orphaned pump and
+   freezes on an unclean restart.
 
 Cycles in advisory mode log everything the AI proposed and what the safety
 chain did with it. The forensic trail is the first thing to consult when
 something looks off.
+
+---
+
+## Chemical dosing & calibration
+
+Chemicals never use open-ended `set_speed`. Every dose is a **bounded, timed dose**
+(`dosing.py`): verify the port is at zero, record a crash-safe active-dose marker,
+run the pump on a monotonic clock, and **always force-stop + verify** in a
+`finally` — an unconfirmed stop freezes dosing. Nutrient V1+V2 fire together
+(`timed_dose_pair`), each pump stopping on its own clock so a per-port flow or a
+deliberate V1/V2 volume split still delivers the right amount.
+
+The system **learns each dose's response and feeds forward** instead of guessing:
+
+- **Nutrients (linear):** one calculated **85% fast shot at high speed**, then a
+  **low-speed creep** onto the EC/TDS target — converging to the pump's resolution,
+  not a coarse band. The pair constant `K = ΔTDS·gal/mL` self-updates per dose.
+- **pH (non-linear):** the EC-normalized buffer constant drifts, so pH uses
+  **cautious fixed creeps**, logging a buffer sample per pH bin to earn the right
+  to calculate it later.
+- **CO2:** `co2_pulse_test.py` calibrates valve-open time to a ppm shot — with a
+  long equalize and one settled shot at a time, because the tent has a ~4-min
+  mixing/sensor lag and an exponential decay back toward ambient.
+
+Calibration runs are supervised against a real reservoir and log to `profiles/`;
+the learned constants inject into every AI prompt so the model computes doses.
+There is no cloud history API, so dense 1-min trend curves come from the app's CSV
+export (`ac_infinity_history.py`), aligned to dose events by `dose_align.py`.
 
 ---
 
@@ -209,6 +244,12 @@ something looks off.
 | `ai_cycle_test.py` | AI-driven cycle test. Walks every port through 0 → 10 → 0 using the configured model. Useful for validating AI + hardware end-to-end. |
 | `model_benchmark.py` | Head-to-head LLM benchmark. Edit `MODELS_UNDER_TEST` and run to compare schema validity and latency. |
 | `ramp_probe.py` | Measure the linear ramp rate of a single port (used to establish the 1 unit/sec model). |
+| `dosing.py` | Timed, bounded doses with forced stop + verify, ramp math, and the V1+V2 pair path. |
+| `bucket_dose_test.py` | Manual single-pump dose-response characterization (mL → ΔpH / ΔTDS). |
+| `bucket_ai_dose_test.py` | Supervised closed-loop bucket calibration — 85% fast shot + creep, online K update. |
+| `co2_pulse_test.py` | Supervised CO2 shot calibration (valve-open time → ppm; long equalize for the mixing lag). |
+| `ac_infinity_history.py` | Loads the app's CSV "Device Data" exports — 1-min trend history. |
+| `dose_align.py` | Aligns logged dose events with the 1-min CSV curves to recover the true dose-response. |
 
 ---
 
@@ -235,6 +276,10 @@ capturing the official mobile app's traffic over a WiFi hotspot. The findings
 are documented in `CLAUDE.md` under "AC Infinity API" and "Control writes". The
 key field that took a while to identify: `onSelfSpead` is the new target speed,
 **not** `onSpead` (which is the readback from the controller).
+
+The cloud API exposes only *current* sensor values — there is **no history
+endpoint** (confirmed against the reverse-engineered API). Trend history comes
+from the app's "Device Data" CSV export, ingested by `ac_infinity_history.py`.
 
 Reference materials in repo:
 

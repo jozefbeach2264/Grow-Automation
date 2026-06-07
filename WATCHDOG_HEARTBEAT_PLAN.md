@@ -1,6 +1,34 @@
 # Watchdog And Heartbeat Plan
 
-Status: draft for review
+Status: FOUNDATION IMPLEMENTED -- Layer 1 #8 (2026-06-02)
+
+## Implementation status (2026-06-02)
+
+Implemented in `runtime_state.py` + `poller.py` (rollout steps 1-4, 6, 7); 34/34 tests
+in `watchdog_test.py`.
+
+DONE:
+- Heartbeat file `profiles/.runtime_state.json` (atomic, corrupt-tolerant): phase, pid,
+  `boot_id`, wall + monotonic clocks, last poll/api/readback ok. `HEARTBEAT_ENABLED`.
+  Clean exit writes phase `shutdown`; `diagnose_restart()` distinguishes clean / crash /
+  reboot (boot_id change) / mid-dose.
+- Active-dose record (`begin_active_dose` / `active_dose_window_port` / `clear_active_dose`)
+  and the interrupted-dose estimator (`estimate_interrupted_dose`) -- structures wired now;
+  planned fields populated by #7 timed dosing.
+- Startup recovery (`poller.recover_on_startup`): runs before AI/polling, stops any running
+  chemical pump, freezes dosing + opens high-alert.
+- Nonzero-doser watchdog (`poller.doser_watchdog`): orphan pump -> stop + verify + retry +
+  freeze + high-alert. Detect-always / actuate-in-LIVE. `DOSER_WATCHDOG_ENABLED`.
+- High-alert reservoir polling window (persisted, auto-expires): `HIGH_ALERT_POLL_INTERVAL`,
+  `HIGH_ALERT_DURATION_MINUTES`.
+- Event log `profiles/events.jsonl` (`record_event`) with the event types below.
+
+DEFERRED:
+- Precise interrupted-dose math (needs #7's planned fields), best-estimate from last
+  confirmed-running timestamp.
+- API freshness + sensor freshness watchdogs (need HDS3 reading to be meaningful).
+- systemd `Restart=always` / `WatchdogSec` integration (rollout step 8).
+- High-alert danger comparison against safe ranges (needs HDS3).
 
 ## Goal
 

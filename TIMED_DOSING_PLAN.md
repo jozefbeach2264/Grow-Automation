@@ -1,6 +1,29 @@
 # Timed Dosing And Forced Stop Plan
 
-Status: draft for review
+Status: CORE IMPLEMENTED -- live validation pending HDS3 (2026-06-02)
+
+## Implementation status (2026-06-02)
+
+CORE DONE in `dosing.py` (34/34 tests in `dosing_test.py`):
+- `calculate_timed_dose()` -- pure ramp/hold math; rejects doses below the minimum
+  ramp-only pulse (below hardware resolution).
+- `timed_dose()` -- verify-at-0 -> persist active-dose record -> start -> hold on a
+  monotonic clock -> ALWAYS stop in `finally` -> verify (retry once) -> freeze + high-alert
+  on unverified stop. Best-effort start-confirm for long doses.
+- `timed_dose_pair([1,2], ...)` -- nutrient V1+V2 dosed together; both start, both stop,
+  freeze if either start/stop fails.
+- `strength_factor` -> full-strength-equivalent mL for diluted-stock tests.
+- Playbook registry (`PLAYBOOKS` / `resolve_playbook`) -- code owns speed + dose size; the
+  AI only picks a playbook name.
+- Crash-safe via `runtime_state` active-dose record; the watchdog's
+  `active_dose_window_ports()` leaves an in-window dose alone while killing orphans.
+
+REMAINING:
+- Wire `dosing` into the AI/execution path (`execute_actions`) so playbook actions
+  actually route through `timed_dose` instead of raw `set_port_speed`.
+- Per-pump flow calibration (`FLOW_ML_MIN_<SLUG>_<port>`) by pumping into a measuring cup.
+- Verify pH moved in the expected direction after a pH dose (needs HDS3).
+- LIVE validation: needs HDS3 reading + `RESERVOIR_VOLUME_GAL`. Ready for the bucket test.
 
 ## Goal
 

@@ -2,6 +2,60 @@
 
 Status: draft master roadmap
 
+## Progress (2026-06-02) -- PR #1 `safety-leak-burst-verify` (pending merge)
+
+**Layer 1 -- DONE (1-6):**
+- #1 Manual kill switch / dosing disable -- `safety_state.py` chemical-only freeze
+  (`DOSING_DISABLED` + persistent `profiles/.safety_state.json`), enforced in `filter_actions`.
+- #2 Reservoir gate enforcement, #3 schema validation, #4 preflight -- shipped earlier.
+- #5 Read-after-write verification -- `read_port_state`/`verify_port_state`; failed
+  doser/pH stop -> retry -> freeze dosing. `VERIFY_WRITES`.
+- #6 Persistent lockouts -- shipped earlier.
+
+**Also shipped this session:**
+- Reservoir-burst response (water/chemical only: stop dosers + close CO2; lights/vent
+  NEVER cut), off the boolean leak sensor (`water_leak`) with debounce. `RES_BURST_ENABLED`.
+- Evac pump tracks leak (`EVAC_PUMP=<dev>:<port>`).
+- Two `sensorType=20` sensors split by device (`LEAK_SENSOR`): leak->water_leak, float->water_level.
+- Water-level FLOAT mode (`WATER_LEVEL_FLOAT`): boolean magnetic float, dry->FALLING/wet->STATIC.
+- `RESERVOIR_VOLUME_GAL` (default 60) in the AI snapshot.
+- Bug fixes: `labels.env` slug `RDWC_CONTROL`->`HYDROPONICS_CONTROL` (had disabled the chem
+  gate); `set_outlet` missing dev_type; CO2 pulse reopening valve during burst; burst KeyError.
+
+**Layer 1 -- #7 timed dosing: CORE DONE (`dosing.py`, 34/34 tests).**
+`calculate_timed_dose` (ramp/hold math, below-resolution rejection), `timed_dose`
+(verify-at-0 -> active-dose record -> hold -> always-stop-in-finally -> verify ->
+freeze on failure), `timed_dose_pair` (nutrient V1+V2 together), strength-factor ->
+full-strength-equiv, and a playbook registry (AI picks a name; code owns speed + mL).
+REMAINING: wire `dosing` into `execute_actions`; per-pump flow calibration; pH-direction
+check; LIVE validation (needs HDS3 + `RESERVOIR_VOLUME_GAL`) -- ready for the bucket test.
+
+**Layer 1 -- #8 watchdog/crash recovery: foundation DONE (`runtime_state.py`).**
+What is wired now (no hardware needed):
+- Heartbeat to `profiles/.runtime_state.json` each cycle (phase, pid, boot_id, wall +
+  monotonic clocks, last poll/api/readback ok). `HEARTBEAT_ENABLED`.
+- Startup crash recovery (`poller.recover_on_startup`): diagnoses how the last run
+  ended (clean / crash / reboot via boot_id / mid-dose), estimates an interrupted dose,
+  stops any running chemical pump, then freezes dosing + opens high-alert.
+- **Nonzero-doser watchdog** (`poller.doser_watchdog`): a doser/pH port running outside
+  an active-dose window is an orphan -> stop + verify + retry + freeze + high-alert.
+  Detect-always / actuate-in-LIVE (same contract as res-burst). `DOSER_WATCHDOG_ENABLED`.
+- High-alert reservoir polling: persisted faster-poll window after a scare
+  (`HIGH_ALERT_POLL_INTERVAL`, `HIGH_ALERT_DURATION_MINUTES`), auto-expires.
+- Append-only event log `profiles/events.jsonl` (process_restarted, active_dose_recovered,
+  stop_recovery_*, estimated_overdose_window, high_alert_*) -- also the Layer 2 ledger seed.
+- Clean-shutdown marker on exit so the next start can tell crash from clean stop.
+- 34/34 self-tests pass (`watchdog_test.py`, mocked hardware).
+Deferred to #7 / hardware: precise interrupted-dose math (needs the active-dose record's
+planned fields from timed dosing); sensor/API freshness watchdogs (need HDS3); systemd
+`Restart=always` + `WatchdogSec` unit.
+
+**Follow-ups / blockers (hardware + ops):**
+- Merge PR #1; re-ingest the local RAG afterward (index lags these changes).
+- Wire `EVAC_PUMP=Auxiliary Outputs:<port>` when the evac pump is ordered/installed.
+- Flip `WATER_LEVEL_FLOAT=false` when an ultrasonic/analog depth sensor replaces the float.
+- HDS3 hydro probe still not submerged/reading -- blocks all live chemical dosing validation.
+
 ## Purpose
 
 This file organizes the upgrade work into layers so implementation stays focused.

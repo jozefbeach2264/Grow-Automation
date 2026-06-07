@@ -44,11 +44,11 @@ SENSOR_TYPE = {
     7:  ("vpd",             100.0),   # built-in VPD, kPa*100
     11: ("co2_ppm",           1.0),   # CO2, raw ppm
     12: ("light",             1.0),   # light sensor, raw value
-    13: ("ph",              100.0),   # HDS3 pH*100
-    14: ("ec_us",           100.0),   # HDS3 EC µS/cm*100
-    15: ("ec_ms",           100.0),   # HDS3 EC mS/cm*100
-    16: ("tds_ppm",         100.0),   # HDS3 TDS ppm*100
-    17: ("tds_ppt",         100.0),   # HDS3 TDS ppt*100
+    13: ("ph",              100.0),   # HDS3 pH*100         (raw 738 -> 7.38, verified)
+    14: ("ec_us",            10.0),   # HDS3 EC uS/cm*10    (raw 2334 -> 233.4, verified 2026-06-02)
+    15: ("ec_ms",           100.0),   # HDS3 EC mS/cm -- scale UNVERIFIED (probe not reporting type 15)
+    16: ("tds_ppm",          10.0),   # HDS3 TDS ppm*10     (raw 1657 -> 165.7, matches controller 2026-06-02)
+    17: ("tds_ppt",         100.0),   # HDS3 TDS ppt -- scale UNVERIFIED (probe not reporting type 17)
     18: ("water_temp_f",    100.0),   # HDS3 water temp°F*100
     19: ("water_temp_c",    100.0),   # HDS3 water temp°C*100
     20: ("water_level",       1.0),   # water level sensor, raw
@@ -320,3 +320,147 @@ def ramp_seconds(target_speed: int, current_speed: int = 0, buffer: float = 2.0)
     Add `buffer` (default 2s) for API latency and settling.
     """
     return abs(int(target_speed) - int(current_speed)) + buffer
+
+
+def read_port_state(token: str, dev_id: str, port: int) -> dict | None:
+    """Fetch the current state of a single port, looked up by dev_id (names can
+    change). Returns a normalized dict, or None if device/port isn't found.
+    Raises ACInfinityAuthError on auth failure so the caller can re-auth."""
+    for raw in fetch_all_devices(token):
+        if raw.get("devId") != dev_id:
+            continue
+        dev = parse_device(raw)
+        for p in dev.get("ports", []):
+            if p.get("port") == port:
+                return {
+                    "device_name":  dev.get("name"),
+                    "dev_id":       dev_id,
+                    "dev_type":     dev.get("type"),
+                    "port":         port,
+                    "online":       p.get("online"),
+                    "is_outlet":    p.get("is_outlet"),
+                    "powered":      p.get("powered"),
+                    "speed_actual": p.get("speed_actual"),
+                    "speed_target": p.get("speed_target"),
+                    "mode":         p.get("mode"),
+                }
+    return None
+
+
+def verify_port_state(token: str, dev_id: str, port: int, expected: dict,
+                      timeout_sec: float = 15.0, poll_sec: float = 2.0,
+                      initial_delay: float = 2.0) -> dict:
+    """
+    Read-after-write check: poll the port until it reports `expected` or times out.
+    A 200 from the write only proves the API accepted it -- this proves the port
+    physically reached the state.
+
+    expected shapes:
+        {"powered": True/False}
+        {"speed_actual": <int>, "tolerance": <int, default 0>}
+
+    Returns: {ok, reason, expected, observed, attempts, elapsed_sec}.
+    ACInfinityAuthError propagates so the caller can re-auth.
+    """
+    start = time.monotonic()
+    if initial_delay > 0:
+        time.sleep(initial_delay)
+    attempts = 0
+    observed = None
+    last_reason = "no readback"
+    while time.monotonic() - start < timeout_sec:
+        attempts += 1
+        try:
+            st = read_port_state(token, dev_id, port)
+        except ACInfinityAuthError:
+            raise
+        except Exception as e:
+            last_reason = f"readback error: {e}"
+            time.sleep(poll_sec)
+            continue
+        if st is None:
+            last_reason = "port not found in readback"
+            time.sleep(poll_sec)
+            continue
+        observed = st
+        if "powered" in expected:
+            if bool(st.get("powered")) == bool(expected["powered"]):
+                return {"ok": True, "reason": "verified", "expected": expected,
+                        "observed": st, "attempts": attempts,
+                        "elapsed_sec": round(time.monotonic() - start, 1)}
+            last_reason = f"powered={st.get('powered')} != {expected['powered']}"
+        elif "speed_actual" in expected:
+            tol = int(expected.get("tolerance", 0))
+            act = st.get("speed_actual")
+            if act is not None and abs(int(act) - int(expected["speed_actual"])) <= tol:
+                return {"ok": True, "reason": "verified", "expected": expected,
+                        "observed": st, "attempts": attempts,
+                        "elapsed_sec": round(time.monotonic() - start, 1)}
+            last_reason = f"speed_actual={act} != {expected['speed_actual']} (+/-{tol})"
+        time.sleep(poll_sec)
+    return {"ok": False, "reason": f"timeout: {last_reason}", "expected": expected,
+            "observed": observed, "attempts": attempts,
+            "elapsed_sec": round(time.monotonic() - start, 1)}
+
+
+def stop_and_verify(token: str, dev: dict, port: int, *,
+                    retries: int = 1, verify: bool = True) -> dict:
+    """Command a port to speed 0 and confirm it via readback, re-issuing the stop up
+    to `retries` times if it will not verify. This is the ONE shared stop primitive --
+    a doser/pH pump that will not stop is the most critical fault in the system, and
+    every path that stops one (timed dosing, the orphan-pump watchdog, reservoir-burst,
+    the executor's read-after-write) routes its stop through here so the command +
+    verify + retry logic lives in exactly one place.
+
+    Freeze / high-alert policy is deliberately NOT handled here -- the caller decides
+    what to do with a False result (some freeze dosing, some only log). Auth failures
+    are caught and reported as a non-ok result (a stop we could not confirm), so callers
+    uniformly treat them as "did not stop" rather than having to catch separately.
+
+    `dev` is the parsed device dict ({"dev_id", "type", "name"}). `verify=False` or the
+    SIM token commands the stop and returns ok without reading back.
+
+    Returns {ok, observed, attempts, elapsed_sec, reason}.
+    """
+    dev_id, dev_type = dev["dev_id"], dev["type"]
+
+    def _issue_stop() -> str | None:
+        """Return None on success, or an error string."""
+        try:
+            set_port_speed(token, dev_id, port, 0, dev_type)
+            return None
+        except ACInfinityAuthError:
+            return "auth failure on stop write"
+        except Exception as e:  # noqa: BLE001 -- any write failure is a failed stop
+            return f"stop write failed: {e}"
+
+    err = _issue_stop()
+    if err is not None:
+        return {"ok": False, "observed": None, "attempts": 0, "elapsed_sec": 0.0,
+                "reason": err}
+    if not verify or token == "SIM":
+        return {"ok": True, "observed": None, "attempts": 0, "elapsed_sec": 0.0,
+                "reason": "verify skipped"}
+
+    timeout = ramp_seconds(0, 10) + 10
+    last = {"ok": False, "observed": None, "attempts": 0, "elapsed_sec": 0.0,
+            "reason": "no readback"}
+    for attempt in range(retries + 1):
+        try:
+            res = verify_port_state(token, dev_id, port,
+                                    {"speed_actual": 0, "tolerance": 0},
+                                    timeout_sec=timeout)
+        except ACInfinityAuthError:
+            return {"ok": False, "observed": None, "attempts": attempt + 1,
+                    "elapsed_sec": 0.0, "reason": "auth failure verifying stop"}
+        last = {"ok": res["ok"], "observed": res.get("observed"),
+                "attempts": attempt + 1, "elapsed_sec": res.get("elapsed_sec"),
+                "reason": res.get("reason", "")}
+        if res["ok"]:
+            return last
+        if attempt < retries:
+            err = _issue_stop()
+            if err is not None:
+                last["reason"] = err
+                return last
+    return last

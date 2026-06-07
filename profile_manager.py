@@ -44,6 +44,34 @@ def _outcome_wait_sec() -> int:
             * int(os.getenv("POLL_INTERVAL_ACTIVE", "60")))
 
 
+def _is_doser_action(action: dict) -> bool:
+    """True if the action targets a doser/pH port -- including the `dose` playbook verb
+    (chemicals), which must get the hard doser settle before its outcome is read."""
+    if action.get("action") == "dose":
+        return True
+    from utils import name_slug
+    port = action.get("port")
+    if port is None:
+        return False
+    slug = name_slug(action.get("device", ""))
+    for key in (f"DOSER_PORTS_{slug}", f"PH_PORTS_{slug}"):
+        ports = os.getenv(key, "")
+        if ports and str(port) in [x.strip() for x in ports.split(",")]:
+            return True
+    return False
+
+
+def _wait_for(action: dict) -> float:
+    """Outcome-read wait for one action. Doser/pH doses get a HARD 5-min minimum settle
+    (chemistry, esp. pH, keeps drifting past the apparent quick-settle); everything else
+    uses the normal ACTIVE-interval window."""
+    base = _outcome_wait_sec()
+    if _is_doser_action(action):
+        from dosing import dose_settle_seconds
+        return max(base, dose_settle_seconds())
+    return base
+
+
 # --- Persistent pending-outcome queue (survives restarts) ---
 
 def _load_pending() -> list[dict]:
@@ -108,7 +136,12 @@ def _extract_sensors(snapshot: dict) -> dict:
 
 
 def _cal_key(action: dict) -> str:
-    """Unique key for a device/port/action/speed combination."""
+    """Unique key for an action's dose-response bucket. `dose` actions key on the
+    playbook (code owns port/speed/volume), so a microdose and a small dose at the same
+    pump speed don't collide into one bucket; everything else keys on device/port/action/
+    value."""
+    if action.get("action") == "dose":
+        return f"{action.get('device')}:dose:{action.get('playbook')}"
     return (
         f"{action['device']}:port{action['port']}"
         f":{action['action']}:{action['value']}"
@@ -161,12 +194,14 @@ def track_actions(actions: list, before_snapshot: dict):
     before_sensors = _extract_sensors(before_snapshot)
     fired_at = time.time()
     for a in actions:
-        _pending.append({
-            "action":   {"device": a.get("device"), "port": a.get("port"),
-                         "action": a.get("action"), "value": a.get("value")},
-            "before":   before_sensors,
-            "fired_at": fired_at,
-        })
+        if a.get("action") == "dose":
+            rec = {"device": a.get("device"), "action": "dose",
+                   "playbook": a.get("playbook"), "kind": a.get("kind"),
+                   "ports": a.get("ports") or []}
+        else:
+            rec = {"device": a.get("device"), "port": a.get("port"),
+                   "action": a.get("action"), "value": a.get("value")}
+        _pending.append({"action": rec, "before": before_sensors, "fired_at": fired_at})
     _save_pending()
 
 
@@ -182,12 +217,11 @@ def record_outcomes(current_snapshot: dict):
 
     now    = time.time()
     after  = _extract_sensors(current_snapshot)
-    wait   = _outcome_wait_sec()
     settle = []
     keep   = []
 
     for p in _pending:
-        if now - p["fired_at"] >= wait:
+        if now - p["fired_at"] >= _wait_for(p["action"]):
             settle.append(p)
         else:
             keep.append(p)
@@ -282,22 +316,21 @@ def get_calibration_context() -> str:
         if data.get("count", 0) < MIN_CAL_OBSERVATIONS:
             continue
         parts = key.split(":")
-        if len(parts) != 4:
-            continue
-        device, port_s, action_type, value = parts
-        port_num = port_s.replace("port", "")
-
         delta_parts = []
         for sensor, avg in data["averages"].items():
             sign = "+" if avg > 0 else ""
             delta_parts.append(f"{sensor} {sign}{avg}")
-
-        if delta_parts:
-            found = True
-            lines.append(
-                f"  {device} port {port_num}  {action_type}={value}"
-                f"  ({data['count']} obs):  {', '.join(delta_parts)}"
-            )
+        if not delta_parts:
+            continue
+        if len(parts) == 3 and parts[1] == "dose":          # device:dose:playbook
+            label = f"  {parts[0]} dose {parts[2]}"
+        elif len(parts) == 4:                                # device:portN:action:value
+            device, port_s, action_type, value = parts
+            label = f"  {device} port {port_s.replace('port', '')}  {action_type}={value}"
+        else:
+            continue
+        found = True
+        lines.append(f"{label}  ({data['count']} obs):  {', '.join(delta_parts)}")
 
     if not found:
         return ""

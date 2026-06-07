@@ -1,6 +1,20 @@
 # Event Logging System Plan
 
-Status: draft for review
+Status: SEEDED -- append-only event log live; structured v1 pending (2026-06-02)
+
+## Implementation status (2026-06-02)
+
+SEEDED: `runtime_state.record_event()` writes an append-only JSONL log at
+`profiles/events.jsonl`, one JSON object per line (wall_time_utc, wall_ts, monotonic,
+pid, type, + event fields). Currently carries watchdog/recovery events
+(process_started, process_restarted, active_dose_*, stop_recovery_*,
+estimated_overdose_window, high_alert_*, clean_shutdown). This is the v1 ledger seed.
+
+REMAINING (v1 -> full): per-cycle poll snapshot + sensor readings + port states + AI
+decision summary + per-action lifecycle records flowing into the same log (or a small
+SQLite table), then retention/downsampling. Hook the existing `profile_manager.log_cycle`
+and `ai_advisor.execute_actions` paths into `record_event` so every cycle and action is
+captured, not just safety events.
 
 ## Goal
 

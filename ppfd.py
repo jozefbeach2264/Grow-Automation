@@ -237,6 +237,35 @@ def control_enabled() -> bool:
     return os.getenv("PPFD_CONTROL", "false").strip().lower() == "true"
 
 
+def controlled_level(stage: str | None = None) -> dict | None:
+    """When PPFD_CONTROL is armed AND a usable map exists, return the level the
+    light should run at to hit the stage DLI target, plus context:
+    {recommended_level, recommended_dli, target_dli, distance_in, stage, metric}.
+    Returns None when control is disabled, no map is loaded, or the current
+    level/distance isn't covered -- callers then fall back to LIGHT_INTENSITY so
+    lighting NEVER breaks because the map is missing a cell."""
+    if not control_enabled():
+        return None
+    mp = load_map()
+    if mp is None:
+        return None
+    dist = _canopy_distance_in()
+    hours = _photoperiod_hours()
+    stage = stage or "veg"
+    target = stage_dli_target(stage)
+    rec = recommend_level(target, dist, hours, mp)
+    if not rec:
+        return None
+    return {
+        "recommended_level": rec["recommended_level"],
+        "recommended_dli": rec["recommended_dli"],
+        "target_dli": rec["target_dli"],
+        "distance_in": dist,
+        "stage": stage,
+        "metric": rec["metric"],
+    }
+
+
 def build_ppfd_block(snapshot: dict, current_level: int | None,
                      stage: str | None = None) -> dict | None:
     """Advisory PPFD/DLI block for snapshot["ppfd"]. Reports the canopy PPFD +

@@ -303,6 +303,45 @@ def test_schedule_delta_fan_mismatch():
     check("fan delta detected", fan is not None and fan["expected_value"] == 5)
 
 
+# --- PPFD control wired into expected_light_state --------------------------- #
+
+def test_ppfd_controlled_light():
+    import json, tempfile
+    import ppfd
+    # Synthetic map: level L -> 100*L avg PPFD @18in. veg target 25.92 DLI @18h -> level 4.
+    tmp = Path(tempfile.mkdtemp()) / "ppfd_map.json"
+    mp = {"footprint_in": [48, 48], "grid_spacing_in": 6, "heights_in": {
+        "18": {str(l): {"grid": [[100 * l] * 3 for _ in range(3)]} for l in range(1, 11)}}}
+    tmp.write_text(json.dumps(mp))
+    ppfd._MAP_PATH = tmp
+
+    for k in ("PPFD_CONTROL", "PPFD_METRIC", "CANOPY_DISTANCE_IN", "LIGHT_HOURS_ON",
+              "LIGHT_INTENSITY", "LIGHT_HOURS_OFF", "GROW_START_DATE", "GROW_STAGE",
+              "DLI_TARGET_VEG", "LIGHT_SUNRISE_MIN", "LIGHT_SUNSET_MIN"):
+        os.environ.pop(k, None)
+    os.environ.update({"LIGHT_INTENSITY": "10", "LIGHT_HOURS_ON": "18", "LIGHT_HOURS_OFF": "6",
+                       "CANOPY_DISTANCE_IN": "18", "PPFD_METRIC": "avg",
+                       "GROW_STAGE": "veg", "DLI_TARGET_VEG": "25.92"})
+
+    # Disarmed -> uses LIGHT_INTENSITY (10) at plateau (no fades, mid-photoperiod).
+    from datetime import datetime
+    noon = datetime(2026, 6, 16, 12, 0)
+    os.environ["PPFD_CONTROL"] = "false"
+    st = schedule.expected_light_state(noon)
+    check("disarmed: plateau uses LIGHT_INTENSITY", st["on"] and st["speed"] == 10)
+
+    # Armed -> plateau intensity becomes the PPFD-recommended level (4).
+    os.environ["PPFD_CONTROL"] = "true"
+    st = schedule.expected_light_state(noon)
+    check("armed: plateau driven to PPFD level", st["speed"] == 4)
+    check("armed: reason notes PPFD control", "PPFD ctrl" in st["reason"])
+
+    # Map missing a usable rec -> falls back to LIGHT_INTENSITY (lighting never breaks).
+    ppfd._MAP_PATH = tmp.parent / "gone.json"
+    st = schedule.expected_light_state(noon)
+    check("armed but no map: falls back to LIGHT_INTENSITY", st["speed"] == 10)
+
+
 def main():
     print("Schedule / emergency deterministic self-tests")
     print("=" * 44)
@@ -329,6 +368,7 @@ def main():
         test_schedule_delta_light_mismatch,
         test_schedule_delta_in_sync,
         test_schedule_delta_fan_mismatch,
+        test_ppfd_controlled_light,
     ):
         fn()
     print("=" * 44)

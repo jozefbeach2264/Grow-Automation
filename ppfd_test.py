@@ -181,6 +181,25 @@ def test_control_gate():
     check("control off by default", ppfd.control_enabled() is False)
 
 
+def test_controlled_level():
+    # level L -> 100*L avg @18in; veg target 35 DLI @18h == 25.92->.. closest is level 4 (400 PPFD=25.92).
+    write_map({18: {lvl: uni(100 * lvl) for lvl in range(1, 11)}})
+    reset_env(PPFD_CONTROL="false")
+    check("controlled_level None when disarmed", ppfd.controlled_level("veg") is None)
+    reset_env(PPFD_CONTROL="true", PPFD_METRIC="avg", CANOPY_DISTANCE_IN="18",
+              LIGHT_HOURS_ON="18", DLI_TARGET_VEG="25.92")
+    rec = ppfd.controlled_level("veg")
+    check("controlled_level returns recommendation when armed", rec is not None)
+    check("controlled_level picks level for target DLI", rec and rec["recommended_level"] == 4)
+    check("controlled_level carries stage + distance", rec["stage"] == "veg" and rec["distance_in"] == 18.0)
+
+
+def test_controlled_level_no_map():
+    ppfd._MAP_PATH = _TMP / "absent.json"
+    reset_env(PPFD_CONTROL="true")
+    check("controlled_level None when no map (lighting falls back)", ppfd.controlled_level("veg") is None)
+
+
 # --- capture parsing ---------------------------------------------------------
 
 def test_parse_grid_rows():
@@ -218,6 +237,8 @@ def main():
         test_build_block,
         test_build_block_no_map,
         test_control_gate,
+        test_controlled_level,
+        test_controlled_level_no_map,
         test_parse_grid_rows,
         test_parse_grid_ragged,
     ):

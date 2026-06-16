@@ -542,10 +542,9 @@ stressor's top allowed playbook (one dispatch + one alert per cycle).
 
 ## Light / PPFD framework (`ppfd.py`)
 
-Turns an Apogee-measured PPFD map of the Growcraft X6 into canopy PPFD + DLI awareness
-and a level recommendation. Phase: **"recommend now, control later"** -- advisory only;
-auto-setting the level is gated by `PPFD_CONTROL` (default off) and intentionally NOT wired
-into `schedule.py` yet (so it never fights the schedule enforcer). READ-ONLY in the snapshot.
+Turns an Apogee-measured PPFD map of the Growcraft X6 into canopy PPFD + DLI awareness, a
+level recommendation, AND (opt-in) closed-loop light control. Advisory by default; when
+`PPFD_CONTROL=true` it drives the light to the level that hits the stage DLI target.
 
 - **Map** `ppfd_map.json` (repo root, committed -- it's a stable hardware characterization,
   not per-grow runtime data; `ppfd_map.example.json` is the schema template). Shape:
@@ -564,11 +563,20 @@ into `schedule.py` yet (so it never fights the schedule enforcer). READ-ONLY in 
 - **Snapshot**: `build_ppfd_block` attaches `snapshot["ppfd"]` (level, distance, PPFD, min,
   uniformity, DLI, target_dli, recommended_level, level_table, control_armed). Surfaced on the
   HUD as `[LIGHT]` and flows to the AI as context. Inert (block omitted) when no map exists.
-- Tests: `ppfd_test.py` (37 cases). Config: `CANOPY_DISTANCE_IN`, `PPFD_METRIC`, `PPFD_CONTROL`,
+- **Closed-loop control (opt-in)**: when `PPFD_CONTROL=true`, `schedule.expected_light_state`
+  resolves its plateau intensity from `ppfd.controlled_level(stage)` -- the level whose DLI
+  lands closest to the stage target -- instead of the static `LIGHT_INTENSITY`. Sunrise/sunset
+  fades + photoperiod are unchanged (they ramp toward that level). The schedule enforcer then
+  drives the light to it like any other schedule output. **Falls back to `LIGHT_INTENSITY`** if
+  the map is missing/incomplete, so lighting never breaks. The reason string carries a
+  `[PPFD ctrl: ...]` tag (visible on the `[SCHED] light` HUD line). Away-mode's `reduce_light`
+  stays advisory, so no controller fights another over the light.
+- Tests: `ppfd_test.py` (42 cases) + the `expected_light_state` PPFD-override case in
+  `schedule_test.py`. Config: `CANOPY_DISTANCE_IN`, `PPFD_METRIC`, `PPFD_CONTROL`,
   `DLI_TARGET_<STAGE>`.
-- **Deferred (control later)**: wiring the recommended level into `schedule.expected_light_state`
-  (PPFD-driven intensity) behind `PPFD_CONTROL`, and a per-position uniformity map / canopy DLI
-  averaging if point readings prove too coarse.
+- **Refinement deferred**: fades slightly undershoot the target DLI (plateau assumes full
+  photoperiod) -- subtract the fade contribution if precise DLI matters; and a heat-override so
+  a tent-temp stressor can pull the PPFD level down.
 
 ### Two `sensorType=20` water sensors (split by device)
 

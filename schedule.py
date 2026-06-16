@@ -60,6 +60,26 @@ def _parse_hhmm(s: str, default: dtime) -> dtime:
         return default
 
 
+def _ppfd_controlled_intensity() -> tuple[int, str] | None:
+    """When PPFD_CONTROL is armed and the PPFD map can recommend a level for the
+    current stage/canopy distance, return (level, reason_tag). None -> fall back
+    to LIGHT_INTENSITY (lighting must never break because the map is incomplete).
+    Lazy imports keep schedule independent of ppfd/grow_state at module load."""
+    try:
+        import ppfd
+        from grow_state import current_grow_week_and_stage
+        _, stage = current_grow_week_and_stage()
+        rec = ppfd.controlled_level(stage=stage)
+        if not rec:
+            return None
+        lvl = max(0, min(10, int(rec["recommended_level"])))
+        tag = (f"PPFD ctrl: {stage} target {rec['target_dli']} DLI @ "
+               f"{rec['distance_in']}in -> L{lvl} ({rec['recommended_dli']} DLI)")
+        return lvl, tag
+    except Exception:
+        return None
+
+
 def expected_light_state(now: datetime | None = None) -> dict:
     """
     {'on': bool, 'speed': int, 'device': str, 'port': int, 'reason': str}
@@ -70,12 +90,21 @@ def expected_light_state(now: datetime | None = None) -> dict:
     intensity = max(0, min(10, int(os.getenv("LIGHT_INTENSITY", "10"))))
     device, port = _parse_role("ROLE_LIGHT", default=("4 x 4", 1))
 
+    # PPFD control (opt-in): when armed, the plateau intensity is the level that
+    # hits the stage DLI target instead of the static LIGHT_INTENSITY. Sunrise/
+    # sunset fades and photoperiod logic below are unchanged -- they just ramp
+    # toward this level. Falls back to LIGHT_INTENSITY if the map can't advise.
+    ppfd_ctrl = _ppfd_controlled_intensity()
+    ppfd_tag = ""
+    if ppfd_ctrl is not None:
+        intensity, ppfd_tag = ppfd_ctrl[0], f"  [{ppfd_ctrl[1]}]"
+
     if hours_on == 0:
         return {"on": False, "speed": 0, "device": device, "port": port,
                 "reason": "LIGHT_HOURS_ON=0 (lights disabled)"}
     if hours_off == 0 or hours_on >= 24:
         return {"on": True, "speed": intensity, "device": device, "port": port,
-                "reason": "24h photoperiod"}
+                "reason": f"24h photoperiod{ppfd_tag}"}
 
     cycle_start  = _parse_hhmm(os.getenv("LIGHT_CYCLE_START", "06:00"), dtime(6, 0))
     cycle_total  = hours_on + hours_off  # normally 24
@@ -112,7 +141,7 @@ def expected_light_state(now: datetime | None = None) -> dict:
         "speed":  speed,
         "device": device,
         "port":   port,
-        "reason": f"{cycle_tag} -> ON {phase} ({elapsed_tag})",
+        "reason": f"{cycle_tag} -> ON {phase} ({elapsed_tag}){ppfd_tag}",
     }
 
 

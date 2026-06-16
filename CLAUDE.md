@@ -93,12 +93,53 @@ Ports 3+4 are pH ports via `PH_PORTS_HYDROPONICS_CONTROL=3,4` — safety gate ap
 | `ac_infinity_history.py` | Loader for the app's CSV "Device Data" export (1-min trend history; no cloud history API) |
 | `dose_align.py` | Aligns logged doses with the CSV trend to recover real dose-response + refine K |
 | `utils.py` | Shared text utils (currently just `name_slug`) |
+| `safety_state.py` | Persistent chemical-only freeze (dosers + pH + CO2 valve); never cuts climate |
+| `ble_logger.py` | Persistent BLE daemon: 1Hz telemetry + drains `command_queue` for one controller |
+| `aci_ble_lab/db.py` | SQLite command queue + sensor cache; gates chemical writes at enqueue |
+| `aci_ble_lab/safety.py` | Port classification + `guard_chemical_write` (the universal chemical write check) |
+| `aci_ble_lab/common.py` | BLE-side utilities (device-name matching, JSON IO) |
 | `labels.env` | Port labels, doser ports, pH ports, per-port speed caps, HIDE_AIR flags |
 | `.env` | Credentials, AI settings, safety thresholds, calendar, strain config |
 | `profiles/` | Per-strain JSON files accumulating run history and calibration data |
 | `profiles/.pending_outcomes.json` | Persistent queue of actions awaiting outcome readback |
 | `Floraflex1.webp` | FloraFlex Full Tilt schedule reference image |
 | `dwc res rules.jpeg` | DWC water/EC/pH trend diagnostic table reference image |
+
+---
+
+## BLE layer (optional local transport)
+
+Forked from PR #2 (sethmblack); kept his protocol decoders and reused the
+`ac-infinity-ble` library, dropped his ungated `ctl.py` / SQLite-queue bypass
+and replaced them with a hard chemical-port guard.
+
+**Architecture.** `ble_logger.py` is a long-running daemon (one per CTR89Q
+controller) that holds the BLE connection, subscribes to the 1Hz status
+packet, periodically polls per-port state, and drains a SQLite command queue
+(`profiles/controller.db`). Callers (poller / dosing.py / future operator
+tools) enqueue rows via `aci_ble_lab.db.enqueue_command(device, port,
+work_type, speed, source)`; the daemon claims and writes them. The BLE
+channel is **not** a parallel control path -- it is a transport that all the
+existing safety code can use.
+
+**Safety model -- defense in depth.** `aci_ble_lab.safety.guard_chemical_write`
+classifies a port as chemical (it's in `DOSER_PORTS_<SLUG>`,
+`PH_PORTS_<SLUG>`, or it is the `CO2_VALVE` outlet) and rejects the write if
+`safety_state.dosing_disable_status()` is active. This guard runs in BOTH
+`enqueue_command` AND the executor in `ble_logger.py` -- a row that became
+stale during a freeze drops at the daemon before the write goes out.
+Classification is recomputed on every call so `.env` edits take effect
+mid-run (same model as `schedule.py`).
+
+**Wiring.** Each controller needs `BLE_<SLUG>_MAC=AA:BB:CC:DD:EE:FF` in
+`.env`, where `<SLUG>` is `name_slug(device_name)`. Run the daemon as:
+`python ble_logger.py --device-name "4 x 4"`. Per-device daemons share the
+queue; each silently re-queues rows addressed to a different device.
+
+**What the BLE channel buys you.** ~1Hz local telemetry vs the cloud poller's
+60s active interval, no dependency on AC Infinity's cloud (works during
+outages), and a separately-attestable command path for audit. The cloud
+transport (`ac_infinity_client.py`) stays as the default and as the fallback.
 
 ---
 

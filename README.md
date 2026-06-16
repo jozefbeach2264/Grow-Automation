@@ -246,6 +246,30 @@ export (`ac_infinity_history.py`), aligned to dose events by `dose_align.py`.
 
 ---
 
+## Tests
+
+Deterministic self-tests — no hardware, no network (writes/readbacks are mocked,
+state files redirected to temp dirs). Run any individually, e.g. `python3 schedule_test.py`:
+
+| Suite | Covers |
+|-------|--------|
+| `core_logic_test.py` | `res_health_check` gate table + `_trend` rate-normalized classification |
+| `schedule_test.py` | High-temp exhaust guardrail, CO2 dump/pulse, light/fan schedule deltas |
+| `diagnostics_test.py` | Deterministic stressor list + playbook registry |
+| `event_log_test.py` | Cycle + action-lifecycle ledger, `recent_actions()` |
+| `safety_gate_test.py` | `validate_actions` / `filter_actions` gates, dose verb, reason collectors |
+| `dosing_test.py` | Timed dosing ramp math, forced stop, freeze-on-unverified-stop |
+| `watchdog_test.py` | Heartbeat, crash recovery, orphan-pump watchdog |
+
+```bash
+# Run them all
+for t in core_logic schedule diagnostics event_log safety_gate dosing watchdog; do
+  python3 ${t}_test.py || break
+done
+```
+
+---
+
 ## Documentation
 
 - [`CLAUDE.md`](CLAUDE.md) — project context for AI agents and contributors.

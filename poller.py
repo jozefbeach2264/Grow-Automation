@@ -27,6 +27,7 @@ from ac_infinity_client import (
 )
 from utils import name_slug
 import runtime_state
+import event_log
 
 EMAIL           = os.getenv("AC_INFINITY_EMAIL", "")
 PASSWORD        = os.getenv("AC_INFINITY_PASSWORD", "")
@@ -200,6 +201,36 @@ def enforce_co2_emergency(snapshot: dict, devices: list, token: str) -> list:
             fired.append(a)
         except Exception as e:
             print(f"  [CO2-EM] FAILED {a['device']} port {a['port']}: {e}")
+    return fired
+
+
+def enforce_temp_emergency(snapshot: dict, devices: list, token: str) -> list:
+    """
+    Fire the high-temperature exhaust guardrail deterministically. Climate-only
+    (ramps ROLE_EXHAUST to max) -- never touches chemicals or the CO2 valve, so
+    it runs independently of the reservoir/CO2 emergencies. Returns the actions
+    actually executed (empty list when the guardrail is not active).
+    """
+    te = snapshot.get("temp_emergency")
+    if not te or not te.get("active"):
+        return []
+
+    print(f"  [!!! HIGH TEMP !!!] {te['sensor']}={te['temp_f']} "
+          f"(trigger={te['trigger']}, clear={te['clear']}) -- forcing exhaust to max")
+    dev_map = {d["name"]: d for d in devices}
+    fired   = []
+    for a in te["actions"]:
+        dev = dev_map.get(a["device"])
+        if not dev:
+            print(f"  [TEMP-EM] Unknown device '{a['device']}' -- cannot enforce")
+            continue
+        try:
+            set_port_speed(token, dev["dev_id"], a["port"], int(a["value"]), dev["type"])
+            print(f"  [TEMP-EM] {a['device']} port {a['port']} -> "
+                  f"{a['action']}={a['value']}  ({a['reason']})")
+            fired.append(a)
+        except Exception as e:
+            print(f"  [TEMP-EM] FAILED {a['device']} port {a['port']}: {e}")
     return fired
 
 
@@ -498,6 +529,8 @@ def main():
               f"{'ACTIVE' if not ADVISORY_MODE else 'inactive (advisory)'}")
         print(f"  - CO2 emergency dump "
               f"{'ACTIVE' if not ADVISORY_MODE else 'inactive (advisory)'}")
+        print(f"  - High-temp exhaust guardrail "
+              f"{'ACTIVE' if not ADVISORY_MODE else 'inactive (advisory)'}")
         print(f"  - Sensor monitoring active either way")
         print()
 
@@ -542,6 +575,13 @@ def main():
                 heartbeat("building_snapshot", poll_ok=True, api_ok=True)
                 snapshot = build_snapshot(devices)
 
+                # Open the cycle ledger record (one cycle_id per poll). Threads
+                # through execute_actions so every action ties back to the
+                # conditions that produced it. Logging never raises.
+                cycle_id = event_log.start_cycle(
+                    snapshot, mode="advisory" if ADVISORY_MODE else "live")
+                event_log.log_stressors(cycle_id, snapshot.get("diagnostics"))
+
                 active = False
                 if AI_ENABLED:
                     record_outcomes(snapshot)
@@ -564,6 +604,18 @@ def main():
                     print(f"  [RES] {rh['state']}  "
                           f"water:{rh['water_trend']}  ec:{rh['ec_trend']}  "
                           f"co2:{rh['co2_gate']}  dose:{rh['dose_gate']}  ph:{rh['ph_gate']}")
+
+                diag = snapshot.get("diagnostics", {})
+                stressors = diag.get("stressors", [])
+                if stressors:
+                    print(f"  [DIAG] {diag.get('count')} stressor(s), "
+                          f"worst={diag.get('worst_severity')}")
+                    for s in stressors:
+                        pbs = ",".join(s.get("allowed_playbooks", []))
+                        print(f"         [{s['severity']:<8}] {s['name']}: "
+                              f"{s['evidence']}  -> {pbs}")
+                else:
+                    print("  [DIAG] no stressors detected")
 
                 exp = snapshot.get("expected", {})
                 lt  = exp.get("light", {})
@@ -589,6 +641,10 @@ def main():
                 rb = snapshot.get("res_burst")
                 if rb and rb.get("active"):
                     print(f"  [!!! RES BURST ALERT !!!] {rb['reason']}")
+                te = snapshot.get("temp_emergency")
+                if te and te.get("active"):
+                    print(f"  [!!! HIGH TEMP ALERT !!!] {te['sensor']}={te['temp_f']}F "
+                          f">= {te['trigger']}F -- exhaust to max until < {te['clear']}F")
 
                 executed_actions: list[dict] = []
 
@@ -631,6 +687,12 @@ def main():
                     em_fired = enforce_co2_emergency(snapshot, devices, token)
                     executed_actions.extend(em_fired)
 
+                    # --- Pre-AI high-temp exhaust guardrail (climate-only) ---
+                    temp_fired = enforce_temp_emergency(snapshot, devices, token)
+                    if temp_fired:
+                        executed_actions.extend(temp_fired)
+                        active = True
+
                 # --- Optional AI cycle ---
                 ai_result = None
                 ai_next   = None
@@ -638,6 +700,8 @@ def main():
                     print("  [AI] Thinking...", flush=True)
                     ai_start  = time.time()
                     ai_result = ask_ai(snapshot)
+                    ai_latency = time.time() - ai_start
+                    event_log.log_ai_decision(cycle_id, ai_result, ai_latency)
                     if ai_result:
                         ai_failure_count = 0
                         LAST_AI_TIME = time.time()
@@ -648,7 +712,8 @@ def main():
                             # actions are enriched with playbook + resolved ports); track
                             # those, not the raw proposals.
                             executed = execute_actions(ai_result, devices, token,
-                                                       snapshot=snapshot)
+                                                       snapshot=snapshot,
+                                                       cycle_id=cycle_id)
                             if executed:
                                 track_actions(executed, snapshot)
                                 executed_actions.extend(executed)
@@ -670,6 +735,12 @@ def main():
                         re_em = enforce_co2_emergency(snapshot, devices, token)
                         if re_em:
                             executed_actions.extend(re_em)
+                            active = True
+
+                    if snapshot.get("temp_emergency"):
+                        re_temp = enforce_temp_emergency(snapshot, devices, token)
+                        if re_temp:
+                            executed_actions.extend(re_temp)
                             active = True
 
                 # --- Log cycle (when AI ran successfully) ---

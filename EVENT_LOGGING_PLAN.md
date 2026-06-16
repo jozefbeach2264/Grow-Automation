@@ -1,20 +1,33 @@
 # Event Logging System Plan
 
-Status: SEEDED -- append-only event log live; structured v1 pending (2026-06-02)
+Status: v1 SHIPPED on JSONL (2026-06-16); SQLite + v1.1 analytics deferred
 
-## Implementation status (2026-06-02)
+## Implementation status (2026-06-16)
 
-SEEDED: `runtime_state.record_event()` writes an append-only JSONL log at
-`profiles/events.jsonl`, one JSON object per line (wall_time_utc, wall_ts, monotonic,
-pid, type, + event fields). Currently carries watchdog/recovery events
-(process_started, process_restarted, active_dose_*, stop_recovery_*,
-estimated_overdose_window, high_alert_*, clean_shutdown). This is the v1 ledger seed.
+DONE (v1, JSONL): `event_log.py` is a structured cycle + action-lifecycle ledger built on
+top of the same append-only `profiles/events.jsonl` (`runtime_state.record_event`). Per the
+architect review in `UPGRADE_PRIORITY_TREE.md`, JSONL stays until it's genuinely painful to
+query -- the SQLite schema below is the v1.1 target, NOT built yet.
 
-REMAINING (v1 -> full): per-cycle poll snapshot + sensor readings + port states + AI
-decision summary + per-action lifecycle records flowing into the same log (or a small
-SQLite table), then retention/downsampling. Hook the existing `profile_manager.log_cycle`
-and `ai_advisor.execute_actions` paths into `record_event` so every cycle and action is
-captured, not just safety events.
+- `start_cycle(snapshot, mode) -> cycle_id` -- one per poll: grow week/stage, res-health
+  gates, flat sensor map, schedule-delta count, active emergencies. Wired in `poller.py`
+  after `build_snapshot`.
+- `log_ai_decision(cycle_id, result, latency)` -- assessment, action count, next_check,
+  parsed_ok, latency. Wired after `ask_ai`.
+- Per-action lifecycle threaded through `ai_advisor.execute_actions(..., cycle_id=)`:
+  `action_request` + `action_validation` (stage = schema / safety_gate / passed) +
+  `action_execution` (sent/success/verified/error). Precise reject reasons via the opt-in
+  `reasons` collector on `validate_actions` / `filter_actions`.
+- `recent_actions(limit, window_hours)` query for the AI prompt / HUD.
+- Event types: cycle, ai_decision, action_request, action_validation, action_execution,
+  action_outcome (alongside the existing watchdog/recovery events).
+- Tests: `event_log_test.py` (40) + reason-collector cases in `safety_gate_test.py`.
+
+REMAINING (v1.1, deferred): migrate to SQLite when JSON gets painful; `action_outcome`
+auto-emission from `profile_manager.record_outcomes`; stressors/alerts/manual_events tables;
+retention/downsampling; export tooling; dashboard/TUI.
+
+The SQLite design below is retained as the v1.1 target reference.
 
 ## Goal
 

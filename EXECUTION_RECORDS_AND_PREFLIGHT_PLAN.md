@@ -1,6 +1,18 @@
 # Execution Records And Device Preflight Plan
 
-Status: PARTIAL -- validation + preflight done (#3/#4); records seeded (2026-06-02)
+Status: DONE -- validation + preflight (#3/#4) + unified per-action lifecycle records (2026-06-16)
+
+## Update (2026-06-16)
+
+The remaining item below -- a single per-action lifecycle record threading requested ->
+validated -> executed -> verified under one id -- is now SHIPPED via `event_log.py`.
+`ai_advisor.execute_actions(..., cycle_id=)` emits an `action_request` (with a fresh
+action_id), an `action_validation` at the deciding stage (schema / safety_gate / passed)
+carrying the precise reject reason (from the opt-in `reasons` collector on
+`validate_actions` / `filter_actions`), and an `action_execution` (sent / success /
+verified / error) for actions that ran. See `EVENT_LOGGING_PLAN.md` for the ledger.
+Still deferred (needs hardware): linking the delayed `action_outcome` back to its
+action_id from `profile_manager.record_outcomes`.
 
 ## Implementation status (2026-06-02)
 

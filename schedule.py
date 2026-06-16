@@ -243,6 +243,111 @@ def compute_co2_emergency(snapshot: dict) -> dict | None:
     }
 
 
+# ---------------------------------------------------------------------------
+# High-temperature exhaust guardrail
+# ---------------------------------------------------------------------------
+
+# Stateful hysteresis, same model as the CO2 dump above: once the trigger
+# fires, stay ACTIVE until the temperature drops below the clear threshold.
+# Module-level state -- if the poller restarts during an active guardrail, the
+# next cycle re-evaluates against the current reading and re-enters if the
+# canopy is still above trigger.
+_temp_emergency_active: bool = False
+
+
+def _high_temp_sensor_key() -> str:
+    """Snapshot sensor key the guardrail watches (default the in-canopy probe)."""
+    return os.getenv("HIGH_TEMP_SENSOR", "temp_f_tent").strip() or "temp_f_tent"
+
+
+def _read_named_temp(snapshot: dict, key: str) -> float | None:
+    for dev in snapshot.get("devices", []):
+        v = dev.get("sensors", {}).get(key)
+        if isinstance(v, (int, float)):
+            return float(v)
+    return None
+
+
+def compute_temp_emergency(snapshot: dict) -> dict | None:
+    """
+    Deterministic high-temperature exhaust guardrail. Forces ROLE_EXHAUST to
+    max when the canopy sensor crosses the emergency threshold, holding until
+    it falls back below the clear threshold (hysteresis). Returns an action
+    block when active, or None when no action is required.
+
+    Climate-only: it commands the exhaust fan ONLY. It never touches chemicals,
+    the CO2 valve, lights, or any other output -- cooling the tent is always a
+    safe action, and the guardrail must never cascade into the chemical side.
+
+    Trigger:  <sensor> >= AIR_TEMP_EMERGENCY_F
+    Clear:    <sensor> <  AIR_TEMP_CLEAR_F    (between the two = hold prior state)
+
+    Inert unless AIR_TEMP_EMERGENCY_F > 0 (default 0 = disabled), mirroring the
+    CO2 dump's opt-in convention. The watched sensor defaults to `temp_f_tent`
+    (the in-canopy external probe on "4 x 4"); override with HIGH_TEMP_SENSOR.
+
+    Block shape:
+      {
+        "active":  True,
+        "temp_f":  <reading>,
+        "sensor":  <watched snapshot key>,
+        "trigger": <AIR_TEMP_EMERGENCY_F>,
+        "clear":   <AIR_TEMP_CLEAR_F>,
+        "actions": [ <exhaust ramp to max> ],
+      }
+    """
+    global _temp_emergency_active
+
+    try:
+        trigger = float(os.getenv("AIR_TEMP_EMERGENCY_F", "0"))
+    except ValueError:
+        return None
+    if trigger <= 0:
+        return None  # disabled
+
+    try:
+        clear = float(os.getenv("AIR_TEMP_CLEAR_F", str(trigger - 7)))
+    except ValueError:
+        clear = trigger - 7
+    if clear >= trigger:
+        clear = trigger - 7  # enforce a real hysteresis gap
+
+    key  = _high_temp_sensor_key()
+    temp = _read_named_temp(snapshot, key)
+    if temp is None:
+        # No reading -> cannot evaluate safely. Leave prior state alone; if a
+        # previous cycle entered the guardrail, the exhaust ramp still gets issued.
+        if not _temp_emergency_active:
+            return None
+    else:
+        if temp >= trigger:
+            _temp_emergency_active = True
+        elif temp < clear:
+            _temp_emergency_active = False
+        # else: hold previous state (hysteresis zone)
+
+    if not _temp_emergency_active:
+        return None
+
+    exhaust_dev, exhaust_port = _parse_role("ROLE_EXHAUST", default=("4 x 4", 2))
+    temp_tag = f"{temp:.1f}F" if temp is not None else "no reading"
+    actions = [{
+        "device": exhaust_dev, "port": exhaust_port,
+        "action": "set_speed", "value": 10,
+        "reason": (f"high-temp guardrail: exhaust to max until {key} < "
+                   f"{clear:g}F ({key}={temp_tag}, trigger={trigger:g}F)"),
+    }]
+
+    return {
+        "active":  True,
+        "temp_f":  temp,
+        "sensor":  key,
+        "trigger": trigger,
+        "clear":   clear,
+        "actions": actions,
+    }
+
+
 def compute_schedule_deltas(snapshot: dict, now: datetime | None = None) -> list[dict]:
     """
     Returns one delta per schedule-controlled output whose actual state

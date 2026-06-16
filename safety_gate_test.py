@@ -178,6 +178,43 @@ check("AUTONOMOUS_DOSING on -> timed_dose_pair routed", _dose_calls and _dose_ca
 os.environ.pop("AUTONOMOUS_DOSING", None)
 
 
+print("\n== reason collectors: precise ledger reasons ==")
+reset()
+# validate_actions populates the reasons collector with (action, code) per rejection.
+r = []
+ai_advisor.validate_actions([
+    {"device": "Ghost", "port": 9, "action": "set_speed", "value": 3},
+    {"device": "TestRes", "port": 1, "action": "set_speed", "value": 99},
+    {"device": "TestRes", "action": "dose", "playbook": "not_real"},
+], snapshot=snap(), reasons=r)
+codes = {c for _, c in r}
+check("validate collector: unknown_device", "unknown_device" in codes)
+check("validate collector: value_range", "value_range" in codes)
+check("validate collector: invalid_dose", "invalid_dose" in codes)
+check("validate collector size matches rejections", len(r) == 3)
+
+# filter_actions collector carries the safety-gate block code.
+reset()
+rf = []
+ai_advisor.filter_actions(
+    [{"device": "TestRes", "port": 1, "action": "set_speed", "value": 1}],
+    snapshot=snap(), reasons=rf)
+check("filter collector: raw_chem_not_permitted", rf and rf[0][1] == "raw_chem_not_permitted")
+
+reset()
+rf = []
+ai_advisor.filter_actions([dose("timed_ph_down_microdose")],
+                          snapshot=snap(ph_gate="HOLD"), reasons=rf)
+check("filter collector: ph_gate_hold reason on blocked pH dose",
+      rf and "ph_gate" in rf[0][1].lower())
+
+# Collector is opt-in: omitting it leaves behavior identical (no crash, same filtering).
+reset()
+out = ai_advisor.filter_actions(
+    [{"device": "TestRes", "port": 1, "action": "set_speed", "value": 0}], snapshot=snap())
+check("collector omitted -> filtering unchanged (stop allowed)", len(out) == 1)
+
+
 print("\n== schedule clamp: bloom week > 8 holds the flush ==")
 os.environ["GROW_STAGE"] = "bloom"
 os.environ["GROW_WEEK"] = "9"

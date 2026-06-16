@@ -2,6 +2,30 @@
 
 Status: draft master roadmap
 
+## Progress (2026-06-16) -- non-hardware production-readiness pass (branch `ble-layer-safe`)
+
+Knocked out the software-only work that doesn't need the (disconnected) reservoir/CO2
+hardware. All deterministic, all unit-tested (259 self-tests green across 7 suites).
+
+- **High-temp exhaust guardrail** (`schedule.compute_temp_emergency` + `poller.enforce_temp_emergency`):
+  canopy >= `AIR_TEMP_EMERGENCY_F` (95) forces `ROLE_EXHAUST` to max, holds until
+  `AIR_TEMP_CLEAR_F` (88). Climate-only, independent of the chem-side emergencies. Closes the
+  open CLAUDE.md TODO. `schedule_test.py`.
+- **Event ledger** (`event_log.py`, Layer 4 v1 on JSONL -- SQLite still deferred per the
+  review below): cycle + AI-decision + full per-action lifecycle (request -> validation@stage
+  -> execution) threaded through `execute_actions(cycle_id=)`, with precise reject reasons via
+  opt-in `reasons` collectors on `validate_actions`/`filter_actions`. `recent_actions()` query.
+  `event_log_test.py` + collector cases in `safety_gate_test.py`. Closes EXECUTION_RECORDS
+  remaining item + EVENT_LOGGING v1.
+- **Away-mode foundation** (`diagnostics.py`, Layer 3 step 1-2): deterministic stressor list +
+  code-owned playbook registry, attached READ-ONLY to the snapshot (HUD + AI context + ledger).
+  Does NOT change the AI action contract (the riskier step, still deferred). `diagnostics_test.py`.
+- **Hardening**: added `core_logic_test.py` (res_health gate table + `_trend`) and CO2
+  dump/pulse + schedule-delta tests, covering previously-untested deterministic core.
+
+Still hardware/trust-gated: live chemical dosing validation (HDS3), the away-mode playbook
+executor + AI selected_playbook contract, SQLite migration, alert channel.
+
 ## Progress (2026-06-02) -- PR #1 `safety-leak-burst-verify` (pending merge)
 
 **Layer 1 -- DONE (1-6):**

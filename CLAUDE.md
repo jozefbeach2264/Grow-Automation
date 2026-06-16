@@ -41,12 +41,18 @@ issues automated control commands across all devices.
   built-in sensor hub, `HIDE_AIR_EXT_<SLUG>` hides only the external probe.
   Water temp, CO2, light, and hydro sensors are unaffected — only temp/humidity/VPD filter.
 
-**X6 heat curve + planned 95F guardrail (2026-06-05).** Light setting 7, exhaust OFF: Tent (external)
+**X6 heat curve + 95F guardrail (built 2026-06-16).** Light setting 7, exhaust OFF: Tent (external)
 ramps ~73 -> 93F over ~90 min and plateaus. Exhaust ON pulls it to a ~81.5F hold at full light
 (-2.2F/min initial bite); light OFF returns it to room. Room (Hydroponics "Outside") held 73-77F
-throughout. **TODO (not yet built):** deterministic high-temp guardrail mirroring the CO2 dump in
-`schedule.py` -- Tent (external/type0 sensor) >= 95F -> force `ROLE_EXHAUST` to max, hold until
-< ~88F (hysteresis), fired pre-AI. AIR_TEMP_MAX=85 is just a target band, not a hard cutoff.
+throughout. **DONE:** deterministic high-temp guardrail mirroring the CO2 dump --
+`schedule.compute_temp_emergency` watches `HIGH_TEMP_SENSOR` (default `temp_f_tent`, the
+external/type0 canopy probe); >= `AIR_TEMP_EMERGENCY_F` (95) forces `ROLE_EXHAUST` to max, holds
+until < `AIR_TEMP_CLEAR_F` (88, hysteresis). Attached to the snapshot as `temp_emergency`,
+actuated pre-AI + re-checked post-AI by `poller.enforce_temp_emergency` (detect-always /
+actuate-in-LIVE, same contract as the CO2 dump). CLIMATE-ONLY: never touches chemicals or the CO2
+valve, so it runs independently of the reservoir/CO2 emergencies. The AI is told (system prompt)
+not to fight an active guardrail. Tests: `schedule_test.py` (29 cases). AIR_TEMP_MAX=85 is just a
+soft target band, not the cutoff -- the guardrail's 95F is the hard one.
 
 **Device display order** (controlled by `DISPLAY_ORDER_<SLUG>` in `labels.env`):
 1. "4 x 4" — tent climate/lighting
@@ -88,6 +94,12 @@ Ports 3+4 are pH ports via `PH_PORTS_HYDROPONICS_CONTROL=3,4` — safety gate ap
 | `grow_state.py` | Auto-compute current week + stage from `GROW_START_DATE` and `VEG_DAYS` |
 | `runtime_state.py` | Heartbeat, active-dose record, high-alert window, event log -- crash recovery |
 | `dosing.py` | Timed dosing with forced stop (#7) -- bounded doses, ramp math, playbooks |
+| `schedule.py` | Schedule-driven expected states (light fade, osc fans) + deterministic emergencies: CO2 dump, CO2 pulse, high-temp exhaust guardrail |
+| `schedule_test.py` | Self-tests for the high-temp exhaust guardrail (29 cases, mocked snapshots) |
+| `event_log.py` | Structured cycle + action-lifecycle ledger over `events.jsonl` (cycle_id/action_id threading, `recent_actions()`) |
+| `event_log_test.py` | Self-tests for the event ledger (40 cases, temp JSONL) |
+| `diagnostics.py` | Deterministic stressor list + code-owned playbook registry (away-mode triage foundation; READ-ONLY, no actuation) |
+| `diagnostics_test.py` | Self-tests for the stressor list + registry (32 cases) |
 | `bucket_ai_dose_test.py` | Supervised closed-loop bucket calibration harness (feedforward + creep; reworked 2026-06-04) |
 | `bucket_dose_test.py` | Manual single-pump dose-response characterization |
 | `ac_infinity_history.py` | Loader for the app's CSV "Device Data" export (1-min trend history; no cloud history API) |
@@ -433,6 +445,60 @@ with the wall clock -- NTP can jump it).
 - Tests: `watchdog_test.py` (34 cases, mocked hardware + temp state files).
 - Deferred to #7/hardware: precise dose-estimate math, sensor/API freshness watchdogs
   (need HDS3), systemd `Restart=always`/`WatchdogSec`.
+
+## Event ledger (`event_log.py`)
+
+Structured cycle + action-lifecycle log built ON TOP of the same append-only
+`profiles/events.jsonl` (via `runtime_state.record_event`). NOT a new store -- per the
+architect review, JSONL stays until it's genuinely painful to query; the 10-table SQLite
+design in `EVENT_LOGGING_PLAN.md` is deferred to v1.1. All helpers swallow errors --
+logging must never take down the control loop.
+
+- **`start_cycle(snapshot, mode)` -> cycle_id** (one per poll): records grow week/stage,
+  res-health gates, flat sensor map, schedule-delta count, and which emergencies are active.
+  Called in `poller.py` right after `build_snapshot`.
+- **`log_ai_decision(cycle_id, result, latency)`**: assessment (clipped), action count,
+  next_check, parsed_ok, latency. Called after `ask_ai`.
+- **Per-action lifecycle** threaded through `ai_advisor.execute_actions(..., cycle_id=)`:
+  every proposed action gets an `action_request` + an `action_validation` at the stage that
+  decided it (`schema` / `safety_gate` / passed), plus an `action_execution` (sent? success?
+  verified? error) for the ones that ran. Precise per-action reject reasons come from the
+  optional `reasons` collector on `validate_actions` / `filter_actions` (e.g. `unknown_device`,
+  `value_range`, `raw_chem_not_permitted`, `ph_gate_hold`, `lockout_active`) -- opt-in, so
+  omitting it leaves the gates' behavior identical.
+- **`recent_actions(limit, window_hours)`**: compact newest-first summary of executed actions
+  (age, device/port, command, success, verified) for the AI prompt / HUD so corrections
+  aren't repeated blindly.
+- Event types: `cycle`, `ai_decision`, `action_request`, `action_validation`,
+  `action_execution`, `action_outcome` -- alongside the watchdog/recovery events already there.
+- Tests: `event_log_test.py` (40 cases) + reason-collector cases in `safety_gate_test.py`.
+
+## Deterministic stressor list (`diagnostics.py`) -- away-mode foundation
+
+Layer 3 (away-mode triage) FOUNDATION, built READ-ONLY. `build_diagnostics(snapshot)`
+attaches `snapshot["diagnostics"]` = `{stressors, count, worst_severity}` where each
+stressor is `{name, severity, evidence, likely_effect, allowed_playbooks}`. It is a pure
+function of the snapshot (thresholds from `.env`, re-read each call) and **does not actuate
+anything** and **does not change the AI action contract** -- the raw-action ->
+`selected_playbook` contract switch is the riskier, separately-gated next step (architect
+review). The block flows to the HUD (`[DIAG]`), the AI prompt (situational awareness, via
+the serialized snapshot), and the ledger (`event_log.log_stressors`).
+
+- Stressors emit ONLY for sensors actually present + out of band (so the disconnected HDS3 /
+  CO2 stay quiet instead of false-alarming), plus `device_offline` and water-level trend.
+  Supported: `tent_temp_high/low`, `humidity_high/low`, `vpd_high/low`, `ph_high/low`,
+  `tds_high/low`, `water_temp_high/low` (alert-only, no chiller), `co2_high`,
+  `co2_high_while_res_stalled`, `water_level_rising/static`, `device_offline`.
+- Severity: info/watch/medium/high/critical; sorted critical-first. Tent temp escalates to
+  `critical` at `AIR_TEMP_EMERGENCY_F` (ties to the exhaust guardrail). Water temp capped at
+  `medium` (reference-only).
+- Canopy sensor keys resolve via `HIGH_TEMP_SENSOR` / `CANOPY_HUMIDITY_SENSOR` /
+  `CANOPY_VPD_SENSOR` (defaults `temp_f_tent` / `humidity_tent` / `vpd_tent`).
+- `PLAYBOOKS` is the code-owned registry (tier, actuates, chemical flag, summary);
+  `allowed_playbooks(name)` returns the per-stressor allow-list with `alert_only` always
+  last. Climate playbooks are Tier 1/2; chemical ones are Tier 3 and still inert (the
+  away-mode executor that dispatches them is the deferred remainder). Tests:
+  `diagnostics_test.py` (32 cases).
 
 ### Two `sensorType=20` water sensors (split by device)
 

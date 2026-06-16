@@ -16,8 +16,10 @@ from utils import name_slug
 from grow_state import current_grow_week_and_stage, days_into_current_stage
 from schedule import (compute_schedule_deltas, expected_light_state,
                       expected_osc_fan_state, compute_co2_emergency,
-                      compute_co2_pulse)
+                      compute_co2_pulse, compute_temp_emergency)
 from safety_state import dosing_disable_status, disable_dosing
+import event_log
+import diagnostics
 
 OLLAMA_HOST   = os.getenv("OLLAMA_HOST",   "http://localhost:11434")
 # Default chosen via head-to-head benchmark (2026-05-30): qwen2.5:3b-instruct
@@ -260,7 +262,8 @@ def _validate_dose_action(a: dict, dev_map: dict) -> dict | None:
     return {**a, "_resolved": resolved}
 
 
-def validate_actions(actions: list, snapshot: dict | None = None) -> list:
+def validate_actions(actions: list, snapshot: dict | None = None,
+                     reasons: list | None = None) -> list:
     """
     Schema + preflight validation.
 
@@ -301,11 +304,17 @@ def validate_actions(actions: list, snapshot: dict | None = None) -> list:
                 if isinstance(p, dict) and isinstance(p.get("port"), int)
             }
 
+    def _rej(action, code):
+        """Record a structured rejection reason for the ledger (no-op if no collector)."""
+        if reasons is not None:
+            reasons.append((action, code))
+
     valid: list[dict] = []
     for i, a in enumerate(actions):
         # 1. Structural
         if not isinstance(a, dict):
             print(f"  [VALIDATE] reject action #{i}: not a dict ({type(a).__name__})")
+            _rej(a, "not_a_dict")
             continue
 
         # Chemical doses use the `dose` verb (device + playbook only -- code owns the
@@ -314,11 +323,14 @@ def validate_actions(actions: list, snapshot: dict | None = None) -> list:
             dv = _validate_dose_action(a, dev_map)
             if dv is not None:
                 valid.append(dv)
+            else:
+                _rej(a, "invalid_dose")
             continue
 
         missing = [k for k in ("device", "port", "action", "value") if k not in a]
         if missing:
             print(f"  [VALIDATE] reject {a}: missing required keys {missing}")
+            _rej(a, "missing_keys")
             continue
 
         device = a["device"]
@@ -330,12 +342,14 @@ def validate_actions(actions: list, snapshot: dict | None = None) -> list:
         if verb not in _VALID_ACTIONS:
             print(f"  [VALIDATE] reject {device} p{port}: unknown action {verb!r} "
                   f"(allowed: {sorted(_VALID_ACTIONS)})")
+            _rej(a, "unknown_action")
             continue
 
         # 3. Port is int
         if not isinstance(port, int) or isinstance(port, bool):
             print(f"  [VALIDATE] reject {device}: port must be int, got "
                   f"{type(port).__name__} ({port!r})")
+            _rej(a, "port_not_int")
             continue
 
         # 4. Value type per verb
@@ -344,15 +358,18 @@ def validate_actions(actions: list, snapshot: dict | None = None) -> list:
             if not isinstance(value, int) or isinstance(value, bool):
                 print(f"  [VALIDATE] reject {device} p{port} set_speed: value must "
                       f"be int 0-10, got {type(value).__name__} ({value!r})")
+                _rej(a, "value_type")
                 continue
             if value < 0 or value > 10:
                 print(f"  [VALIDATE] reject {device} p{port} set_speed: value "
                       f"{value} out of range [0, 10]")
+                _rej(a, "value_range")
                 continue
         elif verb == "set_outlet":
             if not isinstance(value, bool):
                 print(f"  [VALIDATE] reject {device} p{port} set_outlet: value must "
                       f"be bool, got {type(value).__name__} ({value!r})")
+                _rej(a, "value_type")
                 continue
 
         # 5. Device + port existence (skipped if no snapshot)
@@ -361,11 +378,13 @@ def validate_actions(actions: list, snapshot: dict | None = None) -> list:
                 known = sorted(dev_map.keys())
                 print(f"  [VALIDATE] reject p{port}: unknown device {device!r} "
                       f"(known: {known})")
+                _rej(a, "unknown_device")
                 continue
             ports = dev_map[device]
             if port not in ports:
                 print(f"  [VALIDATE] reject {device}: port {port} not present in "
                       f"snapshot (have {sorted(ports.keys())})")
+                _rej(a, "unknown_port")
                 continue
 
             # 6. Port type vs verb. Outlet ports have a "powered" key; speed
@@ -375,10 +394,12 @@ def validate_actions(actions: list, snapshot: dict | None = None) -> list:
             if verb == "set_speed" and is_outlet:
                 print(f"  [VALIDATE] reject {device} p{port} set_speed: target is "
                       "an outlet port (use set_outlet)")
+                _rej(a, "wrong_port_type")
                 continue
             if verb == "set_outlet" and not is_outlet:
                 print(f"  [VALIDATE] reject {device} p{port} set_outlet: target is "
                       "a variable-speed port (use set_speed)")
+                _rej(a, "wrong_port_type")
                 continue
 
         valid.append(a)
@@ -429,12 +450,18 @@ def _dose_gate(a: dict, dose_gate: str, ph_gate: str, dosing_off: bool,
     return True, is_ph, "ok"
 
 
-def filter_actions(actions: list, snapshot: dict | None = None) -> list:
+def filter_actions(actions: list, snapshot: dict | None = None,
+                   reasons: list | None = None) -> list:
     """Apply safety rules to AI-proposed actions before they touch the API."""
     global _last_ph_time
     now = time.time()
     safe = []
     ph_used_this_cycle = False
+
+    def _rej(action, code):
+        """Record a structured block reason for the ledger (no-op if no collector)."""
+        if reasons is not None:
+            reasons.append((action, code))
 
     # Build a flat sensor dict from the snapshot for validation checks
     _snapshot_sensors: dict = {}
@@ -466,6 +493,7 @@ def filter_actions(actions: list, snapshot: dict | None = None) -> list:
             if not allowed:
                 print(f"  [SAFETY] Blocked dose {a.get('playbook')} on "
                       f"{a.get('device')}: {why}")
+                _rej(a, why)
                 continue
             if is_ph_dose:
                 ph_used_this_cycle = True
@@ -494,23 +522,27 @@ def filter_actions(actions: list, snapshot: dict | None = None) -> list:
         if (is_doser or is_ph) and not is_safety_dir:
             print(f"  [SAFETY] Blocked {key}: raw chemical set_speed not permitted -- "
                   "use a dose playbook (timed_dose owns chem pumps). Stops are allowed.")
+            _rej(a, "raw_chem_not_permitted")
             continue
 
         # 0-. Chemical freeze: block any dosing-direction action on doser/pH ports.
         #     Climate ports are unaffected. Stops fall through (is_safety_dir).
         if dosing_off and (is_doser or is_ph) and not is_safety_dir:
             print(f"  [SAFETY] Blocked {key}: dosing disabled -- {dosing_reason}")
+            _rej(a, "dosing_disabled")
             continue
 
         # 0. Hard block: never dose pH ports without a live pH reading
         if is_ph and not is_safety_dir and "ph" not in _snapshot_sensors:
             print(f"  [SAFETY] Blocked pH {key}: no pH sensor reading -- cannot dose blind")
+            _rej(a, "missing_ph_sensor")
             continue
 
         # 0a. Reservoir pH gate -- block pH dosing when res is stressed
         if is_ph and not is_safety_dir and ph_gate == "HOLD":
             print(f"  [SAFETY] Blocked pH {key}: res_health.ph_gate=HOLD "
                   "(resolve water/EC issue first -- pH chasing during stress causes more harm)")
+            _rej(a, "ph_gate_hold")
             continue
 
         # 0b. Reservoir dose gate -- block nutrient dosing (non-pH doser ports)
@@ -518,12 +550,14 @@ def filter_actions(actions: list, snapshot: dict | None = None) -> list:
         if is_doser and not is_ph and not is_safety_dir and dose_gate in ("HOLD", "NONE"):
             print(f"  [SAFETY] Blocked nutrient {key}: res_health.dose_gate={dose_gate} "
                   "(plant not consuming correctly -- adding nutrients would worsen imbalance)")
+            _rej(a, f"dose_gate_{dose_gate.lower()}")
             continue
 
         # 0c. CO2 gate -- block turning the CO2 enrichment valve ON when gate
         #     says HOLD or REDUCE. OFF is always allowed (safety direction).
         if is_co2 and not is_safety_dir and co2_gate in ("HOLD", "REDUCE"):
             print(f"  [SAFETY] Blocked CO2 valve ON {key}: res_health.co2_gate={co2_gate}")
+            _rej(a, f"co2_gate_{co2_gate.lower()}")
             continue
 
         # 1. Per-port dose lockout -- only applies to doser ports (not fans/lights/outlets)
@@ -532,6 +566,7 @@ def filter_actions(actions: list, snapshot: dict | None = None) -> list:
             if remaining > 0:
                 m, s = divmod(int(remaining), 60)
                 print(f"  [SAFETY] Blocked {key}: lockout {m}m{s:02}s remaining")
+                _rej(a, "lockout_active")
                 continue
 
         # 2. pH-specific lockout
@@ -540,9 +575,11 @@ def filter_actions(actions: list, snapshot: dict | None = None) -> list:
             if remaining > 0:
                 m, s = divmod(int(remaining), 60)
                 print(f"  [SAFETY] Blocked pH {key}: pH lockout {m}m{s:02}s remaining")
+                _rej(a, "ph_lockout")
                 continue
             if ph_used_this_cycle:
                 print(f"  [SAFETY] Blocked {key}: only one pH adjustment per cycle")
+                _rej(a, "one_ph_per_cycle")
                 continue
             ph_used_this_cycle = True
 
@@ -788,6 +825,12 @@ deterministically. DO NOT propose actions that re-enable the CO2 valve, lower
 the exhaust, or otherwise contradict the dump. The emergency clears when
 co2_ppm falls below the configured threshold (also shown in the block).
 Your only role during a CO2 emergency is to acknowledge it in your assessment.
+
+HIGH-TEMP GUARDRAIL -- if snapshot.temp_emergency is present, the canopy is too
+hot and the exhaust has been forced to max deterministically. DO NOT propose
+actions that lower the exhaust or otherwise fight the cooldown. It clears when
+the watched sensor falls below the clear threshold (shown in the block). Your
+only role here is to acknowledge it in your assessment.
 
 RESERVOIR HEALTH GATES -- the res is the anchor for ALL decisions. Read snapshot.res_health first.
 The gates override the schedule. Do not let the calendar run the plant -- let the plant run the calendar.
@@ -1280,6 +1323,11 @@ def build_snapshot(devices: list[dict]) -> dict:
     # CO2 target -- per-week Bugbee value, used by the pulse modulator.
     snapshot["co2_target"] = _get_co2_target()
 
+    # Deterministic stressor list (away-mode triage foundation). READ-ONLY: gives
+    # the HUD/AI/ledger structured situational awareness; does not actuate. Reads
+    # sensors + res_health + trends + co2_target (all set above).
+    snapshot["diagnostics"] = diagnostics.build_diagnostics(snapshot)
+
     snapshot["schedule_deltas"] = compute_schedule_deltas(snapshot)
 
     # Reservoir burst -- computed BEFORE CO2 modulation so the pulse can defer to it.
@@ -1302,6 +1350,14 @@ def build_snapshot(devices: list[dict]) -> dict:
         pulse_delta = compute_co2_pulse(snapshot)
         if pulse_delta:
             snapshot["schedule_deltas"].append(pulse_delta)
+
+    # High-temperature exhaust guardrail -- climate-only and INDEPENDENT of the
+    # reservoir/CO2 emergencies above (cooling the tent is always safe and must
+    # never be suppressed by a chemical-side fault). Forces the exhaust to max
+    # when the canopy crosses the threshold; inert unless AIR_TEMP_EMERGENCY_F>0.
+    temp_em = compute_temp_emergency(snapshot)
+    if temp_em:
+        snapshot["temp_emergency"] = temp_em
 
     # Update previous readings + timestamp for next cycle's trend computation
     _prev_sensors.update(all_sensors)
@@ -1474,36 +1530,66 @@ def _execute_dose(a: dict, dev: dict, token: str) -> dict | None:
 
 
 def execute_actions(result: dict, devices: list[dict], token: str,
-                    snapshot: dict | None = None) -> list[dict]:
+                    snapshot: dict | None = None,
+                    cycle_id: str | None = None) -> list[dict]:
     """Validate -> safety-gate -> execute approved actions via the AC Infinity API.
     Climate writes are read-after-write verified; chemical `dose` actions run through
     dosing.timed_dose (which verifies + force-stops internally) and are gated by
-    AUTONOMOUS_DOSING. Returns the actions that actually executed (for tracking)."""
+    AUTONOMOUS_DOSING. Returns the actions that actually executed (for tracking).
+
+    Every proposed action is recorded in the event ledger under cycle_id: an
+    action_request, a validation result at the stage that decided it (schema /
+    safety_gate / executed) with the precise rejection reason, and an execution
+    record for the ones that ran."""
     from ac_infinity_client import set_port_speed, set_outlet
 
-    proposed  = result.get("actions", [])
-    validated = validate_actions(proposed, snapshot=snapshot)
-    if len(validated) != len(proposed):
-        rejected = len(proposed) - len(validated)
-        print(f"  [VALIDATE] {rejected} action(s) rejected by schema validation")
+    proposed = result.get("actions", [])
 
-    safe_actions = filter_actions(validated, snapshot=snapshot)
-    if len(validated) != len(safe_actions):
-        blocked = len(validated) - len(safe_actions)
-        print(f"  [SAFETY] {blocked} action(s) blocked by safety gate")
+    # Reason collectors capture exactly which actions each gate rejected and why,
+    # so the ledger gets precise per-action reasons (no fragile set-difference).
+    schema_rejected: list = []
+    validated = validate_actions(proposed, snapshot=snapshot, reasons=schema_rejected)
+    if schema_rejected:
+        print(f"  [VALIDATE] {len(schema_rejected)} action(s) rejected by schema validation")
+
+    safety_blocked: list = []
+    safe_actions = filter_actions(validated, snapshot=snapshot, reasons=safety_blocked)
+    if safety_blocked:
+        print(f"  [SAFETY] {len(safety_blocked)} action(s) blocked by safety gate")
+
+    # Ledger: log rejected/blocked actions with their precise reason. Survivors
+    # get their request + validation + execution records in the exec loop below.
+    # Best-effort -- logging never breaks execution.
+    for action, code in schema_rejected:
+        req = action if isinstance(action, dict) else {"reason": repr(action)}
+        aid = event_log.log_action_request(cycle_id, req, source="ai")
+        event_log.log_action_validation(cycle_id, aid, False, reason=code, stage="schema")
+    for action, code in safety_blocked:
+        aid = event_log.log_action_request(cycle_id, action, source="ai")
+        event_log.log_action_validation(cycle_id, aid, False, reason=code, stage="safety_gate")
 
     dev_map = {d["name"]: d for d in devices}
     verify_enabled = _verify_writes_enabled(token)
     executed = []
     for a in safe_actions:
+        aid = event_log.log_action_request(cycle_id, a, source="ai")
+        event_log.log_action_validation(cycle_id, aid, True, stage="safety_gate")
         dev = dev_map.get(a["device"])
         if not dev:
             print(f"  [EXEC] Unknown device '{a['device']}' -- skipping")
+            event_log.log_action_execution(cycle_id, aid, executed=False,
+                                           success=False, error="unknown_device",
+                                           device=a.get("device"), port=a.get("port"))
             continue
 
         # Chemical doses route through the bounded timed-dose path (own verify + stop).
         if a.get("action") == "dose":
             done = _execute_dose(a, dev, token)
+            event_log.log_action_execution(
+                cycle_id, aid, executed=done is not None,
+                success=done is not None, device=a.get("device"),
+                command_type="dose", playbook=a.get("playbook"),
+                target_ml=(done or {}).get("target_ml") if isinstance(done, dict) else None)
             if done is not None:
                 executed.append(done)
             continue
@@ -1517,14 +1603,30 @@ def execute_actions(result: dict, devices: list[dict], token: str,
             else:
                 print(f"  [EXEC] Unknown action '{a['action']}' on {a['device']} "
                       f"port {a['port']} -- skipped")
+                event_log.log_action_execution(cycle_id, aid, executed=False,
+                                               success=False, error="unknown_action",
+                                               device=a["device"], port=a["port"],
+                                               command_type=a.get("action"))
                 continue
             print(f"  [EXEC] {a['device']} port {a['port']} -> {a['action']}={a['value']}")
             executed.append(a)
         except Exception as e:
             print(f"  [EXEC] Failed {a['device']} port {a['port']}: {e}")
+            event_log.log_action_execution(cycle_id, aid, executed=True,
+                                           success=False, error=str(e),
+                                           device=a["device"], port=a["port"],
+                                           command_type=a["action"],
+                                           value_sent=a.get("value"))
             continue
+        verified = None
         if verify_enabled:
-            _verify_executed_action(token, dev, a)
+            vres = _verify_executed_action(token, dev, a)
+            verified = bool(vres.get("ok")) if isinstance(vres, dict) else None
+        event_log.log_action_execution(cycle_id, aid, executed=True,
+                                       success=True, verified=verified,
+                                       device=a["device"], port=a["port"],
+                                       command_type=a["action"],
+                                       value_sent=a.get("value"))
 
     if executed:
         record_actions(executed)

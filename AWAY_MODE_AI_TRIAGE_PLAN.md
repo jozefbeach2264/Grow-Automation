@@ -1,14 +1,33 @@
 # Away-Mode AI Triage Plan
 
-Status: NOT STARTED -- Layer 3, gated behind Layers 1-2 (2026-06-02)
+Status: FOUNDATION SHIPPED (stressor list + registry, read-only) -- executor deferred (2026-06-16)
 
-## Implementation status (2026-06-02)
+## Implementation status (2026-06-16)
 
-NOT STARTED. This is Layer 3 and must wait until Layer 1 is complete (only #7 timed dosing
-remains, blocked on HDS3) and Layer 2 supervised live testing has proven the control path.
-No deterministic stressor list, playbook registry, or escalation yet. The safety primitives
-it will lean on -- reservoir gate, dosing freeze, res-burst, read-after-write, crash
-recovery -- are now in place, so this becomes actionable once live control is trusted.
+FOUNDATION DONE (read-only, no actuation): `diagnostics.py` builds the deterministic
+stressor list (rollout step 1) and the code-owned playbook registry (step 2's data side).
+`build_diagnostics(snapshot)` attaches `snapshot["diagnostics"]` = `{stressors, count,
+worst_severity}`; each stressor carries `name / severity / evidence / likely_effect /
+allowed_playbooks`. Wired into `build_snapshot`, the HUD (`[DIAG]`), the AI prompt (the
+serialized snapshot, so the model sees stressors as situational awareness), and the ledger
+(`event_log.log_stressors`). `PLAYBOOKS` registry tags each playbook tier / actuates /
+chemical; `allowed_playbooks(name)` returns the allow-list with `alert_only` always last.
+Tests: `diagnostics_test.py` (32 cases). Stressors fire only for present + out-of-band
+sensors, so the disconnected HDS3 / CO2 stay quiet.
+
+DEFERRED (the riskier, hardware/trust-gated remainder, rollout steps 3-11):
+- The AI response-contract change from raw actions to `selected_playbook` (architect review
+  flags this as a full refactor of prompt + registry + execute_actions + filter_actions; do
+  it only after live control is trusted). The stressor list is deliberately additive context
+  for now -- it does NOT yet replace the action contract.
+- Bounded per-playbook execution wrappers + verification/outcome tracking per playbook.
+- Live enablement of Tier 1/2 climate playbooks, then Tier 3 chemical playbooks (needs HDS3 +
+  AUTONOMOUS_DOSING proven).
+- A dedicated alert channel (KDE Connect / desktop / email).
+
+The safety primitives this leans on -- reservoir gate, dosing freeze, res-burst,
+read-after-write, crash recovery, the high-temp guardrail, and the action ledger -- are all
+in place.
 
 ## Goal
 

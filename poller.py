@@ -364,7 +364,7 @@ def doser_watchdog(devices: list, token: str, startup: bool = False) -> list:
 
 
 def recover_on_startup(token: str) -> None:
-    """Pre-loop crash-recovery check (rollout step 3 of WATCHDOG_HEARTBEAT_PLAN).
+    """Pre-loop crash-recovery check (rollout step 3 of docs/done/WATCHDOG_HEARTBEAT_PLAN.md).
     Diagnose how the previous run ended, estimate any interrupted dose, then poll the
     hardware and stop any chemical pump still running. Runs before AI / normal
     polling so a pump left on by a crash is dealt with first."""

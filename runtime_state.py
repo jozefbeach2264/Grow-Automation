@@ -10,7 +10,7 @@ the watchdog needs to notice a crash and recover safely:
   - a persisted high-alert window (faster reservoir polling after a scare)
   - an append-only event log (events.jsonl) -- also the Layer 2 ledger seed
 
-Clock model (per WATCHDOG_HEARTBEAT_PLAN.md):
+Clock model (per docs/done/WATCHDOG_HEARTBEAT_PLAN.md):
   - wall clock (time.time / UTC) for timestamps, cross-restart math, logs
   - monotonic clock (time.monotonic) for in-process durations / heartbeat age
   Never time a dose with the wall clock -- NTP can jump it.

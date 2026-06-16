@@ -1,5 +1,5 @@
 """
-Timed dosing with forced stop -- Layer 1 #7 (TIMED_DOSING_PLAN.md).
+Timed dosing with forced stop -- Layer 1 #7 (docs/done/TIMED_DOSING_PLAN.md).
 
 Replaces open-ended `set_port_speed(port, speed)` doses (which run until something
 else stops them) with bounded `timed_dose()` / `timed_dose_pair()` calls that:

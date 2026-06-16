@@ -252,7 +252,7 @@ Exit criteria:
 
 Reference:
 
-- `READBACK_VERIFICATION_PLAN.md`
+- `docs/done/READBACK_VERIFICATION_PLAN.md`
 
 ### 6. Timed Dosing With Forced Stop
 
@@ -277,7 +277,7 @@ Exit criteria:
 
 Reference:
 
-- `TIMED_DOSING_PLAN.md`
+- `docs/done/TIMED_DOSING_PLAN.md`
 
 ### 7. Persistent Lockouts
 
@@ -313,7 +313,7 @@ Exit criteria:
 
 Reference:
 
-- `WATCHDOG_HEARTBEAT_PLAN.md`
+- `docs/done/WATCHDOG_HEARTBEAT_PLAN.md`
 
 ## Layer 2: Safe Supervised Live Testing
 
@@ -488,10 +488,10 @@ If moving from planning to code, start here:
 
 ```text
 AWAY_MODE_AI_TRIAGE_PLAN.md
-TIMED_DOSING_PLAN.md
-READBACK_VERIFICATION_PLAN.md
+docs/done/TIMED_DOSING_PLAN.md
+docs/done/READBACK_VERIFICATION_PLAN.md
 EXECUTION_RECORDS_AND_PREFLIGHT_PLAN.md
-WATCHDOG_HEARTBEAT_PLAN.md
+docs/done/WATCHDOG_HEARTBEAT_PLAN.md
 EVENT_LOGGING_PLAN.md
 STRAIN_PHENO_LEARNING_PLAN.md
 ```

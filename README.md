@@ -39,7 +39,7 @@ are enforced by code regardless of AI behavior.
 ## AI layer
 
 - **Default model:** `qwen2.5:3b-instruct` — chosen via head-to-head benchmark
-  (`model_benchmark.py`), 100 % schema-valid on 32/32 hardware-command prompts at
+  (2026-05-30), 100 % schema-valid on 32/32 hardware-command prompts at
   ~1.9 s median latency, fits in 4 GB VRAM.
 - **Backup:** `phi4-mini` — also 100 % valid, slower (~3 s).
 - **Reasoning models** (DeepSeek-R1 family) were tested and rejected — small
@@ -236,10 +236,7 @@ export (`ac_infinity_history.py`), aligned to dose events by `dose_align.py`.
 | Script | Purpose |
 |--------|---------|
 | `poller.py` | Main poller and AI-driven controller. |
-| `demo_cycle.py` | Deterministic demo — turn all aux outlets on, then sequentially ramp every variable-speed port 0 → 10 → hold → 0. |
 | `ai_cycle_test.py` | AI-driven cycle test. Walks every port through 0 → 10 → 0 using the configured model. Useful for validating AI + hardware end-to-end. |
-| `model_benchmark.py` | Head-to-head LLM benchmark. Edit `MODELS_UNDER_TEST` and run to compare schema validity and latency. |
-| `ramp_probe.py` | Measure the linear ramp rate of a single port (used to establish the 1 unit/sec model). |
 | `dosing.py` | Timed, bounded doses with forced stop + verify, ramp math, and the V1+V2 pair path. |
 | `bucket_dose_test.py` | Manual single-pump dose-response characterization (mL → ΔpH / ΔTDS). |
 | `bucket_ai_dose_test.py` | Supervised closed-loop bucket calibration — 85% fast shot + creep, online K update. |
@@ -256,10 +253,10 @@ export (`ac_infinity_history.py`), aligned to dose events by `dose_align.py`.
   current state to plant-ready, ordered by safety layer.
 - Per-layer design docs:
   - [`AWAY_MODE_AI_TRIAGE_PLAN.md`](AWAY_MODE_AI_TRIAGE_PLAN.md)
-  - [`TIMED_DOSING_PLAN.md`](TIMED_DOSING_PLAN.md)
-  - [`READBACK_VERIFICATION_PLAN.md`](READBACK_VERIFICATION_PLAN.md)
+  - [`TIMED_DOSING_PLAN.md`](docs/done/TIMED_DOSING_PLAN.md)
+  - [`READBACK_VERIFICATION_PLAN.md`](docs/done/READBACK_VERIFICATION_PLAN.md)
   - [`EXECUTION_RECORDS_AND_PREFLIGHT_PLAN.md`](EXECUTION_RECORDS_AND_PREFLIGHT_PLAN.md)
-  - [`WATCHDOG_HEARTBEAT_PLAN.md`](WATCHDOG_HEARTBEAT_PLAN.md)
+  - [`WATCHDOG_HEARTBEAT_PLAN.md`](docs/done/WATCHDOG_HEARTBEAT_PLAN.md)
   - [`EVENT_LOGGING_PLAN.md`](EVENT_LOGGING_PLAN.md)
   - [`STRAIN_PHENO_LEARNING_PLAN.md`](STRAIN_PHENO_LEARNING_PLAN.md)
 

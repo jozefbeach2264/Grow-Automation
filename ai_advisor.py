@@ -20,9 +20,9 @@ from schedule import (compute_schedule_deltas, expected_light_state,
 from safety_state import dosing_disable_status, disable_dosing
 
 OLLAMA_HOST   = os.getenv("OLLAMA_HOST",   "http://localhost:11434")
-# Default chosen via head-to-head benchmark (model_benchmark.py): qwen2.5:3b-instruct
+# Default chosen via head-to-head benchmark (2026-05-30): qwen2.5:3b-instruct
 # scored 32/32 schema-valid at 1.9s median, fits in 4GB VRAM. Set OLLAMA_MODEL in
-# .env to override. See project_rdwc_controller.md memory for full benchmark.
+# .env to override.
 OLLAMA_MODEL  = os.getenv("OLLAMA_MODEL",  "qwen2.5:3b-instruct")
 
 # Lockout state lives here so a poller restart doesn't clear cooldown clocks.
@@ -154,7 +154,7 @@ def _is_co2_valve(device: str, port: int) -> bool:
 def _autonomous_dosing() -> bool:
     """Gate for ACTUATING chemical doses. Default OFF -- when off, the AI's `dose`
     actions are validated, gated, and logged as 'would dose' but never run, even in
-    LIVE. Flip true only after supervised live validation (see TIMED_DOSING_PLAN.md)."""
+    LIVE. Flip true only after supervised live validation (see docs/done/TIMED_DOSING_PLAN.md)."""
     return os.getenv("AUTONOMOUS_DOSING", "false").strip().lower() == "true"
 
 

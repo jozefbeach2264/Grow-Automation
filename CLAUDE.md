@@ -93,7 +93,6 @@ Ports 3+4 are pH ports via `PH_PORTS_HYDROPONICS_CONTROL=3,4` — safety gate ap
 | `ac_infinity_history.py` | Loader for the app's CSV "Device Data" export (1-min trend history; no cloud history API) |
 | `dose_align.py` | Aligns logged doses with the CSV trend to recover real dose-response + refine K |
 | `utils.py` | Shared text utils (currently just `name_slug`) |
-| `ramp_probe.py` | Standalone CTR89Q port ramp-rate measurement tool |
 | `labels.env` | Port labels, doser ports, pH ports, per-port speed caps, HIDE_AIR flags |
 | `.env` | Credentials, AI settings, safety thresholds, calendar, strain config |
 | `profiles/` | Per-strain JSON files accumulating run history and calibration data |
@@ -197,7 +196,7 @@ to be enabled manually after NM brings the hotspot up.
 ## AI layer (Ollama)
 
 - Default model: `qwen2.5:3b-instruct` running locally via Ollama (`ollama serve`)
-- Model was chosen via head-to-head benchmark (`model_benchmark.py`, 2026-05-30):
+- Model was chosen via head-to-head benchmark (2026-05-30):
   100% schema-valid on 32/32 set_speed prompts at 1.9s median, fits in 4GB VRAM.
   Backup: `phi4-mini` (also 100%, slower). DeepSeek-R1 1.5B was rejected (~35% pass
   rate — math-tuned base, weak at structured output). Override via `OLLAMA_MODEL`
@@ -363,7 +362,7 @@ nutrient V1+V2 together: both start, both stop, freeze if either start/stop fail
 
 Detects a process crash / power loss mid-dose and makes sure no chemical pump is left
 running. Separate from `safety_state.py` (which owns the persistent dosing freeze) --
-this module owns liveness. Two clocks per `WATCHDOG_HEARTBEAT_PLAN.md`: wall clock for
+this module owns liveness. Two clocks per `docs/done/WATCHDOG_HEARTBEAT_PLAN.md`: wall clock for
 timestamps/cross-restart math, monotonic for in-process durations (never time a dose
 with the wall clock -- NTP can jump it).
 

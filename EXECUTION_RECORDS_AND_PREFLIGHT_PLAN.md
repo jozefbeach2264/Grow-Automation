@@ -10,7 +10,7 @@ DONE:
   port name used as device name.
 - Device/port preflight (#4) -- folded into `validate_actions` (snapshot lookup confirms
   device exists, port exists on device, port type matches verb).
-- Read-after-write verification (`hardware_verified` step) -- see READBACK_VERIFICATION_PLAN.
+- Read-after-write verification (`hardware_verified` step) -- see docs/done/READBACK_VERIFICATION_PLAN.md.
 - Execution-record seed -- `runtime_state.record_event()` appends to `profiles/events.jsonl`
   (active_dose_*, stop_recovery_*, process_*, high_alert_*, estimated_overdose_window).
 

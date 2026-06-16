@@ -13,6 +13,10 @@ Env reference:
   LIGHT_HOURS_OFF     hours per cycle the light is off  (0-24, default 0)
   LIGHT_CYCLE_START   local time when on-period starts  (HH:MM, default 06:00)
   LIGHT_INTENSITY     speed 0-10 when on                (default 10)
+  LIGHT_SUNRISE_MIN   minutes ramping 0 -> intensity at start of on-period
+                      (0 = no fade, default 0; stepped, X6 only takes int 0-10)
+  LIGHT_SUNSET_MIN    minutes ramping intensity -> 0 at end of on-period
+                      (0 = no fade, default 0)
   ROLE_LIGHT          "<device>:<port>"                 (default "4 x 4:1")
   OSC_FAN_SPEED       speed 0-10 for oscillating fans   (default 10)
   ROLE_OSC_FANS       comma-separated "<device>:<port>" (default "4 x 4:3,4 x 4:4")
@@ -78,16 +82,37 @@ def expected_light_state(now: datetime | None = None) -> dict:
     minutes_now  = now.hour * 60 + now.minute
     minutes_zero = cycle_start.hour * 60 + cycle_start.minute
     offset_min   = (minutes_now - minutes_zero) % (cycle_total * 60)
-    on           = offset_min < (hours_on * 60)
+    on_total     = hours_on * 60
+    cycle_tag    = (f"{hours_on}/{hours_off} cycle starting "
+                    f"{cycle_start.strftime('%H:%M')}")
+    elapsed_tag  = f"t+{offset_min // 60}h{offset_min % 60:02d}m"
+
+    if offset_min >= on_total:
+        return {"on": False, "speed": 0, "device": device, "port": port,
+                "reason": f"{cycle_tag} -> currently OFF ({elapsed_tag} into cycle)"}
+
+    sunrise_min = max(0, int(os.getenv("LIGHT_SUNRISE_MIN", "0")))
+    sunset_min  = max(0, int(os.getenv("LIGHT_SUNSET_MIN",  "0")))
+    fade_in     = min(sunrise_min, on_total)
+    fade_out    = min(sunset_min,  on_total - fade_in)  # never overlap sunrise
+
+    if fade_in > 0 and offset_min < fade_in:
+        speed = round(intensity * offset_min / fade_in)
+        phase = f"sunrise {offset_min}/{fade_in}m"
+    elif fade_out > 0 and offset_min >= on_total - fade_out:
+        rem   = on_total - offset_min                  # 1..fade_out
+        speed = round(intensity * rem / fade_out)
+        phase = f"sunset {fade_out - rem}/{fade_out}m"
+    else:
+        speed = intensity
+        phase = "plateau"
 
     return {
-        "on":     on,
-        "speed":  intensity if on else 0,
+        "on":     True,
+        "speed":  speed,
         "device": device,
         "port":   port,
-        "reason": f"{hours_on}/{hours_off} cycle starting {cycle_start.strftime('%H:%M')} "
-                  f"-> currently {'ON' if on else 'OFF'} "
-                  f"(t+{offset_min // 60}h{offset_min % 60:02d}m into cycle)",
+        "reason": f"{cycle_tag} -> ON {phase} ({elapsed_tag})",
     }
 
 

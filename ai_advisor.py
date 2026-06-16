@@ -20,6 +20,7 @@ from schedule import (compute_schedule_deltas, expected_light_state,
 from safety_state import dosing_disable_status, disable_dosing
 import event_log
 import diagnostics
+import ppfd
 
 OLLAMA_HOST   = os.getenv("OLLAMA_HOST",   "http://localhost:11434")
 # Default chosen via head-to-head benchmark (2026-05-30): qwen2.5:3b-instruct
@@ -1327,6 +1328,21 @@ def build_snapshot(devices: list[dict]) -> dict:
     # the HUD/AI/ledger structured situational awareness; does not actuate. Reads
     # sensors + res_health + trends + co2_target (all set above).
     snapshot["diagnostics"] = diagnostics.build_diagnostics(snapshot)
+
+    # PPFD / DLI advisory (light framework). READ-ONLY: reports canopy PPFD + DLI
+    # for the live ROLE_LIGHT level and the recommended level for the stage's DLI
+    # target. Auto-control is gated by PPFD_CONTROL and intentionally unwired from
+    # the schedule for now. None (omitted) when no profiles/ppfd_map.json exists.
+    try:
+        from schedule import _parse_role, _find_port
+        _ldev, _lport = _parse_role("ROLE_LIGHT", ("4 x 4", 1))
+        _lp = _find_port(snapshot, _ldev, _lport)
+        _cur_level = int((_lp or {}).get("speed") or 0)
+        _ppfd_block = ppfd.build_ppfd_block(snapshot, _cur_level)
+        if _ppfd_block:
+            snapshot["ppfd"] = _ppfd_block
+    except Exception as e:
+        print(f"  [PPFD] advisory skipped: {e}")
 
     snapshot["schedule_deltas"] = compute_schedule_deltas(snapshot)
 

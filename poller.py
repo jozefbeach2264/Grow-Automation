@@ -618,6 +618,17 @@ def main():
                 else:
                     print("  [DIAG] no stressors detected")
 
+                ppfd_b = snapshot.get("ppfd")
+                if ppfd_b and ppfd_b.get("ppfd") is not None:
+                    rec = ppfd_b.get("recommended_level")
+                    rec_str = (f"  rec L{rec} for {ppfd_b['target_dli']} DLI"
+                               if rec is not None else "")
+                    print(f"  [LIGHT] L{ppfd_b.get('level')} @ {ppfd_b['distance_in']}in -> "
+                          f"PPFD {ppfd_b['ppfd']} (min {ppfd_b.get('ppfd_min')}, "
+                          f"unif {ppfd_b.get('uniformity')})  DLI {ppfd_b.get('dli')}"
+                          f"{rec_str}"
+                          f"{'  [CONTROL ARMED]' if ppfd_b.get('control_armed') else ''}")
+
                 exp = snapshot.get("expected", {})
                 lt  = exp.get("light", {})
                 if lt:

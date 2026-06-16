@@ -102,6 +102,10 @@ Ports 3+4 are pH ports via `PH_PORTS_HYDROPONICS_CONTROL=3,4` — safety gate ap
 | `diagnostics_test.py` | Self-tests for the stressor list + registry (32 cases) |
 | `away_mode.py` | Away-mode triage executor: code-driven worst-first playbook dispatch (climate-only live, chemical/CO2 dry-run) |
 | `away_mode_test.py` | Self-tests for the away-mode executor (17 cases) |
+| `ppfd.py` | Light/PPFD framework: PPFD-map loader, grid stats, height interpolation, DLI math, level recommendation (advisory) |
+| `ppfd_capture.py` | Interactive ingest tool — records an Apogee PPFD grid per level x height into `ppfd_map.json` |
+| `ppfd_test.py` | Self-tests for the PPFD framework (37 cases, synthetic map) |
+| `ppfd_map.json` | Measured PPFD map (Growcraft X6 grid at each level x canopy distance); committed hardware characterization. `ppfd_map.example.json` = schema template |
 | `bucket_ai_dose_test.py` | Supervised closed-loop bucket calibration harness (feedforward + creep; reworked 2026-06-04) |
 | `bucket_dose_test.py` | Manual single-pump dose-response characterization |
 | `ac_infinity_history.py` | Loader for the app's CSV "Device Data" export (1-min trend history; no cloud history API) |
@@ -535,6 +539,36 @@ stressor's top allowed playbook (one dispatch + one alert per cycle).
 - **Deferred:** the AI `selected_playbook` contract change; live light reduction (needs the
   schedule override); live chemical/CO2 playbooks (need HDS3 + reconnected hardware); a real
   alert channel (KDE/desktop/email) beyond the console + ledger.
+
+## Light / PPFD framework (`ppfd.py`)
+
+Turns an Apogee-measured PPFD map of the Growcraft X6 into canopy PPFD + DLI awareness
+and a level recommendation. Phase: **"recommend now, control later"** -- advisory only;
+auto-setting the level is gated by `PPFD_CONTROL` (default off) and intentionally NOT wired
+into `schedule.py` yet (so it never fights the schedule enforcer). READ-ONLY in the snapshot.
+
+- **Map** `ppfd_map.json` (repo root, committed -- it's a stable hardware characterization,
+  not per-grow runtime data; `ppfd_map.example.json` is the schema template). Shape:
+  `heights_in -> level(1-10) -> {grid: [[..]]}` where `grid` is the full PPFD reading matrix
+  at 6-inch spacing across the 48x48 footprint. Stats are computed over ALL cells, so any
+  rectangular grid (9x9, 8x8) works. Build it with `python3 ppfd_capture.py`.
+- **Derived per level x height**: avg / min / max / center / **uniformity (min/avg)** -- the
+  point of mapping a grid instead of one point. `PPFD_METRIC` (default `avg`) picks which
+  metric drives DLI + recommendations; min/uniformity are always surfaced.
+- **Height**: `ppfd_for(level, distance_in)` linearly interpolates between the two nearest
+  MEASURED heights (clamped outside the range). Current canopy distance from
+  `CANOPY_DISTANCE_IN` (bump it as the plant grows, like the float line). Level 0 -> 0 PPFD.
+- **DLI**: `dli(ppfd, hours) = ppfd * hours * 3600 / 1e6`. `recommend_level(target_dli, ...)`
+  picks the level whose DLI lands closest to the per-stage target (`DLI_TARGET_<STAGE>`,
+  defaults seedling 15 / veg 35 / bloom 45 mol/m2/day).
+- **Snapshot**: `build_ppfd_block` attaches `snapshot["ppfd"]` (level, distance, PPFD, min,
+  uniformity, DLI, target_dli, recommended_level, level_table, control_armed). Surfaced on the
+  HUD as `[LIGHT]` and flows to the AI as context. Inert (block omitted) when no map exists.
+- Tests: `ppfd_test.py` (37 cases). Config: `CANOPY_DISTANCE_IN`, `PPFD_METRIC`, `PPFD_CONTROL`,
+  `DLI_TARGET_<STAGE>`.
+- **Deferred (control later)**: wiring the recommended level into `schedule.expected_light_state`
+  (PPFD-driven intensity) behind `PPFD_CONTROL`, and a per-position uniformity map / canopy DLI
+  averaging if point readings prove too coarse.
 
 ### Two `sensorType=20` water sensors (split by device)
 

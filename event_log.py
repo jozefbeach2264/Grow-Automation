@@ -190,6 +190,21 @@ def log_action_execution(cycle_id: str | None, action_id: str, *,
     )
 
 
+def log_alert(cycle_id: str | None, severity: str, title: str,
+              message: str | None = None, **fields) -> None:
+    """Record an alert-worthy event (away-mode triage, escalation, etc.). Console
+    is the v1 channel; this is the ledger seed for future KDE/desktop/email sends."""
+    runtime_state.record_event(
+        "alert",
+        cycle_id=cycle_id,
+        severity=severity,
+        title=_clip(title, 120),
+        message=_clip(message),
+        sent=False,
+        **{k: _jsonsafe(v) for k, v in fields.items()},
+    )
+
+
 def log_action_outcome(cycle_id: str | None, action_id: str | None,
                        success: bool | None, **fields) -> None:
     """Record a measured outcome after the wait window (status, deltas, etc.)."""

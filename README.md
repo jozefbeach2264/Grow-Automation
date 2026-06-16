@@ -256,6 +256,7 @@ state files redirected to temp dirs). Run any individually, e.g. `python3 schedu
 | `core_logic_test.py` | `res_health_check` gate table + `_trend` rate-normalized classification |
 | `schedule_test.py` | High-temp exhaust guardrail, CO2 dump/pulse, light/fan schedule deltas |
 | `diagnostics_test.py` | Deterministic stressor list + playbook registry |
+| `away_mode_test.py` | Away-mode triage executor: selection, live/advisory/dry dispatch, gating |
 | `event_log_test.py` | Cycle + action-lifecycle ledger, `recent_actions()` |
 | `safety_gate_test.py` | `validate_actions` / `filter_actions` gates, dose verb, reason collectors |
 | `dosing_test.py` | Timed dosing ramp math, forced stop, freeze-on-unverified-stop |
@@ -263,7 +264,7 @@ state files redirected to temp dirs). Run any individually, e.g. `python3 schedu
 
 ```bash
 # Run them all
-for t in core_logic schedule diagnostics event_log safety_gate dosing watchdog; do
+for t in core_logic schedule diagnostics away_mode event_log safety_gate dosing watchdog; do
   python3 ${t}_test.py || break
 done
 ```

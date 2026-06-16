@@ -19,7 +19,13 @@ hardware. All deterministic, all unit-tested (259 self-tests green across 7 suit
   remaining item + EVENT_LOGGING v1.
 - **Away-mode foundation** (`diagnostics.py`, Layer 3 step 1-2): deterministic stressor list +
   code-owned playbook registry, attached READ-ONLY to the snapshot (HUD + AI context + ledger).
-  Does NOT change the AI action contract (the riskier step, still deferred). `diagnostics_test.py`.
+  `diagnostics_test.py`.
+- **Away-mode executor** (`away_mode.py`, Layer 3 steps 6-7, code-driven): deterministic
+  worst-first playbook dispatch over the stressor list. `increase_exhaust_one_step` actuates
+  LIVE (bounded/capped, yields to the high-temp guardrail); `reduce_light` advisory; CO2 +
+  chemical playbooks dry-run. Gated by `AWAY_MODE`, actuate-in-LIVE only. Alerts via
+  `event_log.log_alert`. Does NOT change the AI action contract (still deferred).
+  `away_mode_test.py`.
 - **Hardening**: added `core_logic_test.py` (res_health gate table + `_trend`) and CO2
   dump/pulse + schedule-delta tests, covering previously-untested deterministic core.
 

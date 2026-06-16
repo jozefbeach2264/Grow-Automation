@@ -28,6 +28,7 @@ from ac_infinity_client import (
 from utils import name_slug
 import runtime_state
 import event_log
+import away_mode
 
 EMAIL           = os.getenv("AC_INFINITY_EMAIL", "")
 PASSWORD        = os.getenv("AC_INFINITY_PASSWORD", "")
@@ -742,6 +743,14 @@ def main():
                         if re_temp:
                             executed_actions.extend(re_temp)
                             active = True
+
+                # --- Away-mode triage (deterministic; inert unless AWAY_MODE) ---
+                # Runs in both modes: detects + alerts + logs intent always,
+                # actuates LIVE climate playbooks only when not ADVISORY_MODE.
+                away_fired = away_mode.run(snapshot, devices, token, cycle_id)
+                if away_fired:
+                    executed_actions.extend(away_fired)
+                    active = True
 
                 # --- Log cycle (when AI ran successfully) ---
                 if AI_ENABLED and ai_result:

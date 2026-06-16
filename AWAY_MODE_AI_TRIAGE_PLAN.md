@@ -1,6 +1,26 @@
 # Away-Mode AI Triage Plan
 
-Status: FOUNDATION SHIPPED (stressor list + registry, read-only) -- executor deferred (2026-06-16)
+Status: EXECUTOR SHIPPED (code-driven, climate-only live) -- AI contract change still deferred (2026-06-16)
+
+## Executor update (2026-06-16)
+
+`away_mode.py` is the deterministic, code-driven triage executor (rollout steps 6-7,
+code-driven variant). Each cycle it reads the `diagnostics` stressor list, alerts on the
+worst stressor, and dispatches the worst ACTIONABLE stressor's top allowed playbook. The AI
+contract is intentionally UNCHANGED -- code owns selection, not the model.
+
+- LIVE: `increase_exhaust_one_step` steps `ROLE_EXHAUST` +`AWAY_EXHAUST_STEP` capped at
+  `AWAY_EXHAUST_MAX`; yields to the high-temp guardrail while `temp_emergency` is active.
+- ADVISORY: `reduce_light_one_step` (the schedule enforcer pins light -- live needs a
+  schedule-aware override, deferred).
+- DRY: `disable_co2` (valve disconnected) + `timed_*_microdose` (Tier 3 gated) -> logged intent.
+- `alert_only` -> `event_log.log_alert`. Gated by `AWAY_MODE`; actuates only when not
+  `ADVISORY_MODE` (detect-always / actuate-in-LIVE). Wired in `poller.py`. Tests:
+  `away_mode_test.py` (17 cases).
+
+STILL DEFERRED: the AI `selected_playbook` contract change (steps 3-4; the riskier refactor);
+live light reduction (schedule override); live chemical/CO2 playbooks (need HDS3 + reconnected
+hardware); a real alert channel (KDE/desktop/email) beyond console + ledger.
 
 ## Implementation status (2026-06-16)
 

@@ -100,6 +100,8 @@ Ports 3+4 are pH ports via `PH_PORTS_HYDROPONICS_CONTROL=3,4` — safety gate ap
 | `event_log_test.py` | Self-tests for the event ledger (40 cases, temp JSONL) |
 | `diagnostics.py` | Deterministic stressor list + code-owned playbook registry (away-mode triage foundation; READ-ONLY, no actuation) |
 | `diagnostics_test.py` | Self-tests for the stressor list + registry (32 cases) |
+| `away_mode.py` | Away-mode triage executor: code-driven worst-first playbook dispatch (climate-only live, chemical/CO2 dry-run) |
+| `away_mode_test.py` | Self-tests for the away-mode executor (17 cases) |
 | `bucket_ai_dose_test.py` | Supervised closed-loop bucket calibration harness (feedforward + creep; reworked 2026-06-04) |
 | `bucket_dose_test.py` | Manual single-pump dose-response characterization |
 | `ac_infinity_history.py` | Loader for the app's CSV "Device Data" export (1-min trend history; no cloud history API) |
@@ -499,6 +501,40 @@ the serialized snapshot), and the ledger (`event_log.log_stressors`).
   last. Climate playbooks are Tier 1/2; chemical ones are Tier 3 and still inert (the
   away-mode executor that dispatches them is the deferred remainder). Tests:
   `diagnostics_test.py` (32 cases).
+
+## Away-mode triage executor (`away_mode.py`) -- Layer 3
+
+Code-driven deterministic dispatch over the `diagnostics` stressor list. The AI action
+contract is deliberately UNCHANGED (the AI stays advisory) -- per the architect review, the
+raw-action -> `selected_playbook` prompt refactor is a separate, riskier step. Here CODE owns
+the triage: each cycle it alerts on the worst stressor and dispatches the worst ACTIONABLE
+stressor's top allowed playbook (one dispatch + one alert per cycle).
+
+- **Gating.** Inert unless `AWAY_MODE=true`. Detect-always / actuate-in-LIVE (same contract as
+  the CO2 dump / high-temp guardrail): it alerts + logs intent in any mode, but only ACTUATES a
+  live climate playbook when `ADVISORY_MODE=false`. Wired in `poller.py` after the schedule
+  fallback + emergency re-checks; runs in both modes.
+- **Dispatch policy** (current hardware reality -- reservoir + CO2 disconnected):
+  - `increase_exhaust_one_step` -> **LIVE**: steps `ROLE_EXHAUST` by `AWAY_EXHAUST_STEP` (default
+    1), capped at `AWAY_EXHAUST_MAX` (10). No-op (skips to next playbook) when already at cap.
+    **Yields to the high-temp guardrail** -- returns None while `temp_emergency` is active so it
+    doesn't fight the fan the guardrail is slamming to max. Composes nicely: away-mode ramps
+    exhaust as the tent climbs 85->95F, the guardrail catches >=95F.
+  - `reduce_light_one_step` -> **advisory** (never actuates yet): the schedule enforcer pins
+    light intensity, so going live needs a schedule-aware light override (deferred).
+  - `disable_co2` -> **dry** (valve disconnected); `timed_*_microdose` -> **dry** (Tier 3,
+    gated). Both log "would dispatch".
+  - `alert_only` -> log + notify (`event_log.log_alert`, the alert-channel seed).
+- **Selection.** `select(snapshot)` walks stressors worst-first (diagnostics already sorts by
+  severity); for each it takes the first allowed playbook with an applicable plan. Returns the
+  worst stressor (always alerted) + the chosen dispatch (or None -> alert-only).
+- **Ledger.** Every dispatch logs an `action_request` (source `away_mode`) + `action_validation`
+  (stage `away_dispatch`) + `action_execution`; alerts log an `alert` event. Tests:
+  `away_mode_test.py` (17 cases).
+- Config: `AWAY_MODE`, `AWAY_EXHAUST_STEP`, `AWAY_EXHAUST_MAX`, `AWAY_LIGHT_FLOOR`.
+- **Deferred:** the AI `selected_playbook` contract change; live light reduction (needs the
+  schedule override); live chemical/CO2 playbooks (need HDS3 + reconnected hardware); a real
+  alert channel (KDE/desktop/email) beyond the console + ledger.
 
 ### Two `sensorType=20` water sensors (split by device)
 

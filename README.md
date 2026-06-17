@@ -20,6 +20,9 @@ are enforced by code regardless of AI behavior.
 > autonomous dosing stays gated behind `AUTONOMOUS_DOSING` (default off)** while
 > the calibration matures. See [`UPGRADE_PRIORITY_TREE.md`](UPGRADE_PRIORITY_TREE.md).
 
+> **In progress (reserved):** reverse-engineering the AC Infinity **UIS sensor-bus protocol**
+> for direct, controller-free sensor reads. The implementation is kept private and obfuscated.
+
 ---
 
 ## Hardware

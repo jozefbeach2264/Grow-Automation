@@ -66,7 +66,15 @@ def match_fire(log_ts, fires):
 
 
 def analyze():
-    exp = H.parse_export(H.latest_export())
+    H.ingest()                              # fold any newly-arrived phone exports in first
+    exp = H.load_history()                  # prefer the full merged history...
+    if exp is None or not exp.samples:      # ...fall back to the newest single export
+        latest = H.latest_export()
+        if not latest:
+            print("no AC Infinity trend data -- export 'Device Data' from the app and share"
+                  " it to this machine (KDE Connect / Taildrop); see CLAUDE.md.")
+            return
+        exp = H.parse_export(latest)
     print(f"trend : {exp.path.name}  {exp.samples[0].ts:%m-%d %H:%M} -> {exp.samples[-1].ts:%m-%d %H:%M}"
           f"  ({len(exp.samples)} samples @ {exp.sample_seconds}s)\n")
     doses, fires = load_doses(), fire_times()

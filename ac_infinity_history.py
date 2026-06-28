@@ -20,7 +20,10 @@ Format quirks handled:
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
+import json
+import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -29,6 +32,20 @@ NBSP = " "                       # narrow no-break space the app injects befor
 DEFAULT_DOWNLOADS = Path.home() / "Downloads"
 EXPORT_GLOB = "AC INFINITY Data*.csv"
 _TS_FORMATS = ("%m/%d/%Y, %I:%M:%S %p", "%m/%d/%Y %I:%M:%S %p")
+
+# Phone exports land in the "incoming" dir (KDE Connect / Taildrop / Syncthing /
+# manual copy -- the transport is interchangeable). They accrete into one merged,
+# deduped trend store under trend_data/ so overlapping or re-exported windows build a
+# single continuous per-device series instead of fragmenting across files.
+REPO_DIR = Path(__file__).resolve().parent
+TREND_DIR = REPO_DIR / "trend_data"
+ARCHIVE_DIR = TREND_DIR / "acinfinity"               # raw exports, content-hash deduped
+STORE_PATH = TREND_DIR / "acinfinity_history.jsonl"  # merged sample ledger
+
+
+def incoming_dir() -> Path:
+    """Directory phone exports arrive in. Override with ACI_EXPORT_DIR; default ~/Downloads."""
+    return Path(os.environ.get("ACI_EXPORT_DIR") or DEFAULT_DOWNLOADS).expanduser()
 
 
 @dataclass
@@ -151,10 +168,197 @@ def parse_export(path: str | Path) -> Export:
     )
 
 
-def latest_export(downloads: str | Path = DEFAULT_DOWNLOADS) -> Path | None:
-    """Newest 'AC INFINITY Data*.csv' in the downloads dir, or None."""
-    files = sorted(Path(downloads).glob(EXPORT_GLOB), key=lambda p: p.stat().st_mtime)
+def latest_export(downloads: str | Path | None = None) -> Path | None:
+    """Newest 'AC INFINITY Data*.csv' in the incoming dir, or None."""
+    base = Path(downloads).expanduser() if downloads else incoming_dir()
+    files = sorted(base.glob(EXPORT_GLOB), key=lambda p: p.stat().st_mtime)
     return files[-1] if files else None
+
+
+# --- merged trend store (transport-agnostic ingest) -----------------------------
+
+def _sample_row(device: str, s: Sample) -> dict:
+    return {
+        "device": device, "ts": s.ts.isoformat(),
+        "ph": s.ph, "tds_ppm": s.tds_ppm, "water_temp_f": s.water_temp_f,
+        "water_leak": s.water_leak, "out_temp_f": s.out_temp_f,
+        "out_humidity": s.out_humidity, "out_vpd": s.out_vpd,
+    }
+
+
+def _row_sample(row: dict) -> Sample:
+    return Sample(
+        ts=datetime.fromisoformat(row["ts"]),
+        ph=row.get("ph"), tds_ppm=row.get("tds_ppm"),
+        water_temp_f=row.get("water_temp_f"), water_leak=row.get("water_leak"),
+        out_temp_f=row.get("out_temp_f"), out_humidity=row.get("out_humidity"),
+        out_vpd=row.get("out_vpd"),
+    )
+
+
+def _read_store(store: Path) -> list[dict]:
+    if not store.exists():
+        return []
+    rows = []
+    for line in store.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return rows
+
+
+def ingest(src: str | Path | None = None, *, archive: bool = True,
+           store: str | Path = STORE_PATH, archive_dir: str | Path = ARCHIVE_DIR) -> dict:
+    """Fold every 'AC INFINITY Data*.csv' in the incoming dir into the merged trend
+    store, deduping samples by (device, timestamp). Overlapping or re-exported windows
+    accrete into one continuous per-device series instead of fragmenting; byte-identical
+    re-exports are skipped via content hash. Returns a summary dict.
+
+    Transport is irrelevant here -- files reach `src` however you move them off the
+    phone (KDE Connect, Taildrop, Syncthing, USB, manual copy).
+    """
+    src = Path(src).expanduser() if src else incoming_dir()
+    store, archive_dir = Path(store), Path(archive_dir)
+    store.parent.mkdir(parents=True, exist_ok=True)
+    if archive:
+        archive_dir.mkdir(parents=True, exist_ok=True)
+
+    seen = {(r.get("device", "?"), r.get("ts", "")) for r in _read_store(store)}
+    files = sorted(src.glob(EXPORT_GLOB), key=lambda p: p.stat().st_mtime)
+    archived, added, devices, new_rows = 0, 0, set(), []
+
+    for f in files:
+        if archive:
+            digest = hashlib.sha1(f.read_bytes()).hexdigest()[:8]
+            if not list(archive_dir.glob(f"*__{digest}.csv")):
+                (archive_dir / f"{f.stem}__{digest}.csv").write_bytes(f.read_bytes())
+                archived += 1
+        try:
+            exp = parse_export(f)
+        except Exception as e:                         # one malformed file never aborts ingest
+            print(f"  skip {f.name}: {e}")
+            continue
+        for s in exp.samples:
+            key = (exp.device, s.ts.isoformat())
+            if key in seen:
+                continue
+            seen.add(key)
+            new_rows.append(json.dumps(_sample_row(exp.device, s)))
+            added += 1
+            devices.add(exp.device)
+        _trend_db_write(lambda db, e=exp: db.ingest_samples_db(e.device, e.samples, "csv"))
+
+    if new_rows:
+        with store.open("a", encoding="utf-8") as fh:
+            fh.write("\n".join(new_rows) + "\n")
+
+    return {
+        "incoming": str(src), "files_seen": len(files), "files_archived": archived,
+        "samples_added": added, "samples_total": len(seen),
+        "devices": sorted(devices), "store": str(store),
+    }
+
+
+def load_history(device: str | None = None, *, store: str | Path = STORE_PATH) -> Export | None:
+    """The merged trend as one sorted, deduped Export (None if the store is empty).
+    `device` filters to matching device IDs by case-insensitive substring."""
+    rows = _read_store(Path(store))
+    if device:
+        rows = [r for r in rows if device.lower() in str(r.get("device", "")).lower()]
+    if not rows:
+        return None
+    rows.sort(key=lambda r: r.get("ts", ""))
+    samples = [_row_sample(r) for r in rows]
+    devs = sorted({r.get("device", "?") for r in rows})
+    gaps = [(b.ts - a.ts).total_seconds() for a, b in zip(samples, samples[1:])]
+    gaps = [g for g in gaps if g > 0]
+    return Export(
+        device=devs[0] if len(devs) == 1 else f"merged({len(devs)} devices)",
+        sample_seconds=int(min(gaps)) if gaps else 60,
+        start=samples[0].ts, end=samples[-1].ts,
+        samples=samples, path=Path(store),
+    )
+
+
+def _numf(v) -> float | None:
+    """Coerce a live snapshot sensor value (already numeric, or a string) to float."""
+    try:
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_snapshot_ts(s: str | None) -> datetime:
+    """build_snapshot stamps '%Y-%m-%d %H:%M:%S'; fall back to now() if absent/odd."""
+    try:
+        return datetime.strptime((s or "").strip(), "%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return datetime.now().replace(microsecond=0)
+
+
+# A device carrying any of these is the reservoir/hydro source worth logging.
+_HYDRO_KEYS = ("ph", "tds_ppm", "water_temp_f", "water_level", "ec_us", "ec_ms")
+
+
+def _trend_db_write(call) -> None:
+    """Best-effort mirror to the TimescaleDB trend store (trend_db.py). Never raises
+    -- the JSONL store is the source of truth and the control loop must not depend on
+    Postgres. Disable with TREND_DB_ENABLED=false."""
+    if os.environ.get("TREND_DB_ENABLED", "true").strip().lower() == "false":
+        return
+    try:
+        import trend_db
+        if trend_db.available():
+            call(trend_db)
+    except Exception:
+        pass
+
+
+def record_snapshot(snapshot: dict, *, store: str | Path = STORE_PATH,
+                    seen: set | None = None) -> int:
+    """Append the reservoir reading(s) from a live poller snapshot to the merged
+    trend store -- the phone-free path. Instead of importing the app's CSV, the
+    automation logs the sensors it already reads each cycle, in the SAME schema as
+    `ingest()`, so `load_history()` / `dose_align` read self-logged and CSV-imported
+    history transparently. Deduped by (device, timestamp). Returns rows appended.
+
+    A long-running logger can pass a persistent `seen` set to skip re-reading the
+    store every cycle; omit it and the store is read once per call for the dedup set.
+    """
+    store = Path(store)
+    store.parent.mkdir(parents=True, exist_ok=True)
+    if seen is None:
+        seen = {(r.get("device", "?"), r.get("ts", "")) for r in _read_store(store)}
+
+    ts = _parse_snapshot_ts(snapshot.get("timestamp"))
+    rows = []
+    for dev in snapshot.get("devices", []):
+        sensors = dev.get("sensors", {})
+        if not any(k in sensors for k in _HYDRO_KEYS):
+            continue                                   # skip air/outlet-only devices
+        device = dev.get("name", "?")
+        key = (device, ts.isoformat())
+        if key in seen:
+            continue
+        seen.add(key)
+        leak = sensors.get("water_leak")
+        rows.append(json.dumps(_sample_row(device, Sample(
+            ts=ts,
+            ph=_numf(sensors.get("ph")),
+            tds_ppm=_numf(sensors.get("tds_ppm")),
+            water_temp_f=_numf(sensors.get("water_temp_f")),
+            water_leak=(bool(leak) if leak is not None else None),
+            out_temp_f=None, out_humidity=None, out_vpd=None,
+        ))))
+    if rows:
+        with store.open("a", encoding="utf-8") as fh:
+            fh.write("\n".join(rows) + "\n")
+    _trend_db_write(lambda db: db.record_snapshot_db(snapshot))   # mirror to TimescaleDB
+    return len(rows)
 
 
 def _summary(exp: Export) -> str:
@@ -176,9 +380,21 @@ def _summary(exp: Export) -> str:
 if __name__ == "__main__":
     import sys
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    target = sys.argv[1] if len(sys.argv) > 1 else latest_export()
-    if not target:
-        print("no AC Infinity CSV export found in", DEFAULT_DOWNLOADS)
-        sys.exit(1)
-    exp = parse_export(target)
-    print(_summary(exp))
+    args = sys.argv[1:]
+    cmd = args[0] if args else ""
+
+    if cmd == "ingest":                       # fold new phone exports into the merged store
+        for k, v in ingest(args[1] if len(args) > 1 else None).items():
+            print(f"  {k:14}: {v}")
+    elif cmd == "history":                    # summarize the merged store
+        exp = load_history(args[1] if len(args) > 1 else None)
+        if not exp or not exp.samples:
+            print("merged store empty -- run: python3 ac_infinity_history.py ingest")
+            sys.exit(1)
+        print(_summary(exp))
+    else:                                     # summarize a single file (default: newest)
+        target = args[0] if args else latest_export()
+        if not target:
+            print("no AC Infinity CSV export found in", incoming_dir())
+            sys.exit(1)
+        print(_summary(parse_export(target)))

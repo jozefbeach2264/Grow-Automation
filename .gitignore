@@ -5,6 +5,11 @@
 # Runtime data -- grow logs, strain history, lockouts, pending outcomes
 profiles/
 
+# AC Infinity CSV trend store -- per-grow runtime data (raw exports + merged ledger).
+# The committed heat-curve CSV elsewhere in trend_data/ stays tracked.
+trend_data/acinfinity/
+trend_data/acinfinity_history.jsonl
+
 # Test artifacts
 benchmark_results.json
 

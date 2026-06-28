@@ -29,6 +29,7 @@ from utils import name_slug
 import runtime_state
 import event_log
 import away_mode
+import ac_infinity_history as history
 
 EMAIL           = os.getenv("AC_INFINITY_EMAIL", "")
 PASSWORD        = os.getenv("AC_INFINITY_PASSWORD", "")
@@ -40,6 +41,8 @@ ADVISORY_MODE   = os.getenv("ADVISORY_MODE", "true").lower() != "false"
 HEARTBEAT_ENABLED      = os.getenv("HEARTBEAT_ENABLED", "true").strip().lower() != "false"
 DOSER_WATCHDOG_ENABLED = os.getenv("DOSER_WATCHDOG_ENABLED", "true").strip().lower() != "false"
 VERIFY_WRITES          = os.getenv("VERIFY_WRITES", "true").strip().lower() != "false"
+TREND_LOG_ENABLED      = os.getenv("TREND_LOG_ENABLED", "true").strip().lower() != "false"
+TREND_DB_ENABLED       = os.getenv("TREND_DB_ENABLED", "true").strip().lower() != "false"
 
 START_TIME     = time.time()
 LAST_AI_TIME   = None
@@ -575,6 +578,27 @@ def main():
                 # --- Deterministic foundation -- runs regardless of AI ---
                 heartbeat("building_snapshot", poll_ok=True, api_ok=True)
                 snapshot = build_snapshot(devices)
+
+                # Self-logged trend history (phone-free): record the reservoir
+                # readings we already polled into the merged store, so dose_align /
+                # load_history get dense history without the app's CSV export.
+                # Logging never raises.
+                if TREND_LOG_ENABLED:
+                    try:
+                        history.record_snapshot(snapshot)
+                    except Exception:
+                        pass
+
+                # Trend analysis for the AI (best-effort; reads the TimescaleDB rollups).
+                if TREND_DB_ENABLED:
+                    try:
+                        import trend_features
+                        ta = trend_features.trend_features()
+                        if ta:
+                            snapshot["trend_analysis"] = ta
+                            print("  [TREND] " + trend_features.format_block(ta).replace("\n", "\n  "))
+                    except Exception:
+                        pass
 
                 # Open the cycle ledger record (one cycle_id per poll). Threads
                 # through execute_actions so every action ties back to the

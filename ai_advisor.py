@@ -1394,9 +1394,21 @@ def ask_ai(snapshot: dict) -> dict | None:
     if history:
         context_block += f"\n\n--- Strain History ---\n{history}\n--- End History ---"
 
+    # Multi-window trend analysis (TimescaleDB) rendered as a readable block; the raw
+    # dict is dropped from the JSON to avoid duplicating it in the small context window.
+    trend_block = ""
+    ta = snapshot.get("trend_analysis")
+    if ta:
+        import trend_features
+        rendered = trend_features.format_block(ta)
+        if rendered:
+            trend_block = "\n\n" + rendered
+    snap_for_json = {k: v for k, v in snapshot.items() if k != "trend_analysis"} if ta else snapshot
+
     prompt = (
         "Here is the current grow system snapshot:\n\n"
-        + json.dumps(snapshot, indent=2)
+        + json.dumps(snap_for_json, indent=2)
+        + trend_block
         + context_block
         + "\n\nAnalyze conditions and respond with the JSON action object."
     )

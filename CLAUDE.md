@@ -105,11 +105,19 @@ Ports 3+4 are pH ports via `PH_PORTS_HYDROPONICS_CONTROL=3,4` — safety gate ap
 | `ppfd.py` | Light/PPFD framework: PPFD-map loader, grid stats, height interpolation, DLI math, level recommendation (advisory) |
 | `ppfd_capture.py` | Interactive ingest tool — records an Apogee PPFD grid per level x height into `ppfd_map.json` |
 | `ppfd_test.py` | Self-tests for the PPFD framework (37 cases, synthetic map) |
-| `ppfd_map.json` | Measured PPFD map (Growcraft X6 grid at each level x canopy distance); committed hardware characterization. `ppfd_map.example.json` = schema template |
+| `ppfd_map.json` | Measured/modeled PPFD map (Growcraft X6 grid at each level x canopy distance); committed hardware characterization. **2026-06-28: DUAL-HEIGHT predictive map (16in + 24in, levels 1-7), each grid source-tagged measured/predicted -- 24in L1-7 + 16in L5/6/7 measured, gaps predicted via the measured 16/24in center-ratio (~1.19); `ppfd.py` interpolates any canopy distance between. Levels 8-10 omitted (operator run-and-read).** `ppfd_map.example.json` = schema template |
+| `ppfd_build_map.py` | Builds the SMOOTHED, PREDICTIVE `ppfd_map.json` for every level at every measured height -- one fixture beam-shape + per-level magnitude (measured where read, predicted for the gaps via the cross-height center-ratio), each grid source-tagged measured/predicted. Re-runnable as more readings come in |
 | `bucket_ai_dose_test.py` | Supervised closed-loop bucket calibration harness (feedforward + creep; reworked 2026-06-04) |
 | `bucket_dose_test.py` | Manual single-pump dose-response characterization |
-| `ac_infinity_history.py` | Loader for the app's CSV "Device Data" export (1-min trend history; no cloud history API) |
+| `ac_infinity_history.py` | Loader + merged store for trend history: `record_snapshot()` self-logs the poller's own reservoir readings (phone-free), `ingest()` accretes/dedupes the app's CSV "Device Data" exports, `load_history()` reads the merged series; `parse_export`/`latest_export` for single files (no cloud history API) |
+| `ac_infinity_history_test.py` | Self-tests for the CSV loader + merged trend store + self-logging (44 cases, synthetic) |
 | `dose_align.py` | Aligns logged doses with the CSV trend to recover real dose-response + refine K |
+| `trend_db.py` | TimescaleDB trend store: hypertable + continuous aggregates, best-effort writes, query helpers (`record_snapshot_db`/`ingest_samples_db`/`bucketed`/`latest`/`stats`) |
+| `trend_features.py` | Multi-window trend analysis for the AI (per-metric level/range/slope-per-hr) + `format_block` for the prompt/HUD |
+| `migrate_trend_to_db.py` | One-time backfill of the JSONL trend store into TimescaleDB (idempotent) |
+| `trend_db_test.py` | Self-tests for trend_db + trend_features (22 cases, throwaway schema, real TimescaleDB) |
+| `sql/trend_schema.sql`, `sql/trend_policies.sql` | Trend hypertable + continuous aggregates; cagg refresh policies |
+| `scripts/setup_timescaledb.sh` | One-time TimescaleDB bring-up (install, initdb, role/db, extension) |
 | `utils.py` | Shared text utils (currently just `name_slug`) |
 | `safety_state.py` | Persistent chemical-only freeze (dosers + pH + CO2 valve); never cuts climate |
 | `ble_logger.py` | Persistent BLE daemon: 1Hz telemetry + drains `command_queue` for one controller |
@@ -183,15 +191,65 @@ online-updates K, logs to `profiles/bucket_test_log.jsonl`. **Reworked 2026-06-0
   `timed_dose_pair` (each pump still stops on its own clock).
 
 **Trend / history data -- CSV export, NOT the API.** The cloud API has **no history endpoint**
-(confirmed against the reverse-engineered API + 24 probed names; only `appUserLogin`,
+(confirmed by probing the API across 24 candidate endpoint names; only `appUserLogin`,
 `devInfoListAll`, `getdevModeSettingList`, `addDevMode` exist; `devInfoListAll` returns current
 values + a 1-bit trend *direction* only). Export **"Device Data" to CSV** from the AC Infinity app
 (saved to `~/Downloads`, e.g. `AC INFINITY Data (N).csv`; 1-min resolution pH / TDS / water-temp /
-leak / outside-air -- **TDS only, no EC**). Read it via **`ac_infinity_history.py`** (`parse_export`,
-`latest_export`, `Export.window` / `.around`). **`dose_align.py`** aligns logged doses with these
+leak / outside-air -- **TDS only, no EC**). **Transport off the phone:** the export lands on the
+phone; get it to this machine via KDE Connect (the Pixel is already paired) or Taildrop, dropping
+into the incoming dir (`~/Downloads`, override `ACI_EXPORT_DIR`). Read/ingest it via
+**`ac_infinity_history.py`**: `ingest()` accretes every export into one deduped, continuous
+per-device store (`trend_data/acinfinity_history.jsonl` + a content-hashed raw archive under
+`trend_data/acinfinity/`, both gitignored) keyed by (device, timestamp), so overlapping or
+re-exported windows stop fragmenting/overwriting; `load_history()` returns the whole merged series,
+with `parse_export` / `latest_export` / `Export.window` / `.around` for single files.
+**Phone-free primary path:** `record_snapshot(snapshot)` logs the reservoir sensors the poller
+already reads each cycle into the SAME store (gated by `TREND_LOG_ENABLED`, default on; wired in
+`poller.py` right after `build_snapshot`, error-swallowed), so the automation accretes its own dense
+trend with no phone/app involved -- during dose windows the ACTIVE 60s cadence captures the
+dose-response curves natively. The CSV export then drops to a one-time backfill of pre-automation
+history; the denser/offline upgrade is the BLE `sensor_readings` table (`aci_ble_lab/db.py`, ~1Hz).
+(Self-logging only accrues while the poller runs -- an always-on service is the 24/7 piece.)
+**`dose_align.py`** (now ingests first, then reads the merged history) aligns logged doses with these
 1-min curves to recover the real dose-response -- the dense data caught the 4.60 pH transient and
 the +57 -> +45 nutrient settle that the single before/after reads miss. When the HDS3 EC channel
 glitches (reads ~1/10 scale), rebuild EC from TDS: **`EC ~= 1.41 * TDS`** (steady ratio).
+
+---
+
+## Trend store — Postgres / TimescaleDB (AI trend analysis)
+
+The queryable time-series home for trend data so the AI can analyze multi-hour/day patterns,
+not just the previous-cycle `_trend()` delta. **Postgres 18 + TimescaleDB 2.27** (local, unix
+socket, db `grow`, role = OS user via trust/peer auth — no password). **Opt-in + decoupled:**
+writes are best-effort, the JSONL store stays the source of truth, and the control loop never
+blocks on Postgres. Disable with `TREND_DB_ENABLED=false`.
+
+- **Setup (one-time, sudo):** `sudo bash scripts/setup_timescaledb.sh` — installs
+  postgresql/timescaledb/python-psycopg, initdb (`--encoding=UTF8`), enables the preload, creates
+  role + db `grow`, `CREATE EXTENSION timescaledb`. Idempotent. (timescaledb is in the official
+  `extra` repo — no AUR. `CREATE EXTENSION` needs superuser so it's done as `postgres`; the app
+  role is non-superuser but owns its tables, so it can still create hypertables/caggs.)
+- **Schema** (`sql/trend_schema.sql`, applied by `trend_db.ensure_schema()`): hypertable
+  `trend_samples(ts, device, metric, value, source)`, dedup UNIQUE (device, metric, ts) — so a
+  backfill row and a live row at the same instant can't double-count. Real-time continuous
+  aggregates `trend_hourly` / `trend_daily` (`time_bucket` avg/min/max/first/last/n;
+  `materialized_only=false` so reads are correct with no manual refresh). Policies in
+  `sql/trend_policies.sql` (`ensure_policies()`).
+- **Writes** (`trend_db.py`): `record_snapshot_db()` (poll) + `ingest_samples_db()` (csv) are
+  mirrored from `ac_infinity_history.record_snapshot()` / `ingest()` via `_trend_db_write`
+  (best-effort, `connect_timeout=3`). `migrate_trend_to_db.py` backfills the JSONL store once
+  (22.8k metric-rows from the 5070 samples on first run).
+- **Analysis** (`trend_features.py`): `trend_features()` → per-metric {last, avg, min, max,
+  slope/hr (least-squares over hourly buckets), n} over a window; `format_block()` renders it.
+  `poller.py` attaches `snapshot["trend_analysis"]` each cycle (HUD `[TREND]`), and
+  `ai_advisor.ask_ai` injects the rendered block into the prompt (raw dict dropped from the JSON
+  to save context). CSV backfill has no EC; live polls log `ec_us`.
+- **Config:** `DATABASE_URL` (default `postgresql:///grow?host=/run/postgresql`),
+  `TREND_DB_ENABLED` (default true). **Ops:** `python3 trend_db.py stats|ensure|policies`.
+- **Tests:** `trend_db_test.py` (22, throwaway schema vs real TimescaleDB). **Deferred (Phase 5):**
+  compression/retention policies; BLE `sensor_readings` → PG bridge for ~1Hz density. The
+  event-log/profiles migration to PG (the 10-table design) stays deferred — this was trend-data only.
 
 ---
 
@@ -550,7 +608,9 @@ level recommendation, AND (opt-in) closed-loop light control. Advisory by defaul
   not per-grow runtime data; `ppfd_map.example.json` is the schema template). Shape:
   `heights_in -> level(1-10) -> {grid: [[..]]}` where `grid` is the full PPFD reading matrix
   at 6-inch spacing across the 48x48 footprint. Stats are computed over ALL cells, so any
-  rectangular grid (9x9, 8x8) works. Build it with `python3 ppfd_capture.py`.
+  rectangular grid (9x9, 8x8) works. Build it interactively with `python3 ppfd_capture.py`, or
+  regenerate the SMOOTHED map from raw readings with `python3 ppfd_build_map.py` (24in populated for
+  levels 1-7 as of 2026-06-26 -- smoothed/modeled from the raw Apogee grids; real uniformity ~0.76-0.83).
 - **Derived per level x height**: avg / min / max / center / **uniformity (min/avg)** -- the
   point of mapping a grid instead of one point. `PPFD_METRIC` (default `avg`) picks which
   metric drives DLI + recommendations; min/uniformity are always surfaced.

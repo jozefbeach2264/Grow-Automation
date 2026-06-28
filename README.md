@@ -20,8 +20,8 @@ are enforced by code regardless of AI behavior.
 > autonomous dosing stays gated behind `AUTONOMOUS_DOSING` (default off)** while
 > the calibration matures. See [`UPGRADE_PRIORITY_TREE.md`](UPGRADE_PRIORITY_TREE.md).
 
-> **In progress (reserved):** reverse-engineering the AC Infinity **UIS sensor-bus protocol**
-> for direct, controller-free sensor reads. The implementation is kept private and obfuscated.
+> **In active development (reserved):** a custom **sensor-interface layer** to expand the
+> system's sensor support. Implementation details are kept private.
 
 ---
 
@@ -293,14 +293,14 @@ done
 
 ## Reference
 
-The AC Infinity write protocol used by this project was reverse-engineered by
-capturing the official mobile app's traffic over a WiFi hotspot. The findings
+The AC Infinity control API used by this project was worked out by observing the
+official mobile app's network traffic. The findings
 are documented in `CLAUDE.md` under "AC Infinity API" and "Control writes". The
 key field that took a while to identify: `onSelfSpead` is the new target speed,
 **not** `onSpead` (which is the readback from the controller).
 
 The cloud API exposes only *current* sensor values — there is **no history
-endpoint** (confirmed against the reverse-engineered API). Trend history comes
+endpoint** (confirmed by probing the API). Trend history comes
 from the app's "Device Data" CSV export, ingested by `ac_infinity_history.py`.
 
 Reference materials in repo:

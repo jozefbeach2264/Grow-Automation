@@ -269,6 +269,60 @@ check("startup orphan freezes immediately despite debounce", safety_state.is_dos
 os.environ["DOSER_WATCHDOG_DEBOUNCE"] = "1"
 
 
+print("\n== runtime_state: a crash-surviving dose record does NOT shield an orphan (regression #2) ==")
+reset_state()
+_writes.clear()
+ac_infinity_client.verify_port_state = _make_verify(ok=True)
+poller.ADVISORY_MODE = False
+# Write an active-dose record as if a PRIOR process started it (begin_active_dose stamps
+# pid/boot_id), then simulate that process having crashed by changing the owning pid.
+runtime_state.begin_active_dose({
+    "device": "RDWC Control", "dev_id": "d-rdwc", "port": 4, "speed": 2,
+    "started_wall_ts": time.time(), "planned_stop_wall_ts": time.time() + 60,
+})
+ad = runtime_state.get_active_dose()
+ad["pid"] = os.getpid() + 99999          # a different (dead) process owned this dose
+runtime_state._save({"heartbeat": None, "active_dose": ad, "high_alert": None})
+check("foreign-pid record does NOT vouch for a port",
+      runtime_state.active_dose_window_ports() == set())
+# The pump is physically still spinning on port 4 after the crash -- the startup watchdog
+# must now stop it instead of being shielded by the stale window.
+dev_orphan = dev_with_doser(0, 0)
+dev_orphan["ports"][3]["speed_actual"] = 5
+fired = poller.doser_watchdog([dev_orphan], "TEST", startup=True)
+check("crash-orphan pump is stopped (not shielded by stale dose window)",
+      len(fired) == 1 and fired[0]["port"] == 4)
+check("crash-orphan stop sent to port 4", ("d-rdwc", 4, 0) in _writes)
+check("crash-orphan freezes dosing", safety_state.is_dosing_disabled() is True)
+
+
+print("\n== runtime_state: estimate honors persisted per-port flow (regression #17) ==")
+ad_fast = {"speed": 2, "start_verified": True, "target_ml": 5.0,
+           "started_wall_ts": 1000.0, "flow_ml_min": 42.0}   # 2x the 21 spec, per level
+est = runtime_state.estimate_interrupted_dose(ad_fast, stop_wall_ts=1030.0)
+check("estimate uses FLOW override (84 mL/min total -> 42 mL in 30s)",
+      abs(est["estimated_actual_ml_max"] - 42.0) < 0.01)
+ad_def = {"speed": 2, "start_verified": True, "target_ml": 5.0, "started_wall_ts": 1000.0}
+est_def = runtime_state.estimate_interrupted_dose(ad_def, stop_wall_ts=1030.0)
+check("estimate falls back to the 21 spec without override",
+      abs(est_def["estimated_actual_ml_max"] - 21.0) < 0.01)
+check("interrupted-dose bracket never inverts (min <= max)",
+      est["estimated_actual_ml_min"] <= est["estimated_actual_ml_max"])
+
+
+print("\n== runtime_state: rebooted not falsely set when current boot_id unreadable (regression #18) ==")
+reset_state()
+runtime_state.write_heartbeat("polling_devices", poll_ok=True)
+_orig_boot = runtime_state.boot_id
+runtime_state.boot_id = lambda: ""        # simulate /proc boot_id unreadable right now
+try:
+    d = runtime_state.diagnose_restart()
+    check("unreadable current boot_id -> rebooted False (no phantom reboot)",
+          d["rebooted"] is False)
+finally:
+    runtime_state.boot_id = _orig_boot
+
+
 # =========================================================================== #
 print(f"\n{'='*48}")
 print(f"  {_PASS} passed, {_FAIL} failed")

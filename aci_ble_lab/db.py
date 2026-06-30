@@ -113,8 +113,48 @@ def enqueue_command(device: str, port: int, work_type: int, speed: int,
         return r.lastrowid
 
 
+def claim_next_command(device: str) -> dict | None:
+    """Atomically claim the oldest pending command FOR THIS DEVICE and mark it 'sent'.
+    Returns the row dict or None.
+
+    Device-scoped + atomic by design: BEGIN IMMEDIATE takes the write lock BEFORE the
+    SELECT, so two daemons can never read-then-claim the same row (the old bare
+    SELECT-then-UPDATE allowed a double-claim -> double dose), and a daemon never touches
+    another controller's rows -- foreign rows stay 'pending' for their own daemon instead
+    of being requeued (which livelocked the drain loop and could grow the queue without
+    bound)."""
+    c = _conn()
+    c.isolation_level = None                 # manage the transaction explicitly
+    try:
+        c.execute("BEGIN IMMEDIATE")         # take the write lock up front
+        row = c.execute(
+            "SELECT * FROM command_queue WHERE status='pending' AND device=? "
+            "ORDER BY id LIMIT 1",
+            (device,),
+        ).fetchone()
+        if row is None:
+            c.execute("COMMIT")
+            return None
+        c.execute(
+            "UPDATE command_queue SET status='sent', sent_at=? WHERE id=?",
+            (time.time(), row["id"]),
+        )
+        c.execute("COMMIT")
+        return dict(row)
+    except Exception:
+        try:
+            c.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        c.close()
+
+
 def pop_next_command() -> dict | None:
-    """Atomically claim the oldest pending command. Returns the row dict or None."""
+    """DEPRECATED -- not device-scoped and NOT atomic (bare SELECT-then-UPDATE under
+    sqlite3 default isolation lets two connections claim the same row). Kept only for
+    compatibility; the daemon uses claim_next_command(device) instead."""
     with _conn() as c:
         row = c.execute(
             "SELECT * FROM command_queue WHERE status='pending' ORDER BY id LIMIT 1"

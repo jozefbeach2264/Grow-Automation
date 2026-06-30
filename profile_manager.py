@@ -191,6 +191,12 @@ def track_actions(actions: list, before_snapshot: dict):
     Call immediately after actions are executed.
     Queues each action for outcome measurement N cycles later.
     """
+    # record_outcomes (the only drain path) returns early without a strain, so queuing
+    # here when STRAIN_NAME is unset (a supported climate-only config) would grow the
+    # pending file unbounded AND pin the poller to ACTIVE polling forever. Mirror the
+    # strain guard every other function here already has.
+    if not _strain_name():
+        return
     before_sensors = _extract_sensors(before_snapshot)
     fired_at = time.time()
     for a in actions:
@@ -203,6 +209,27 @@ def track_actions(actions: list, before_snapshot: dict):
                    "action": a.get("action"), "value": a.get("value")}
         _pending.append({"action": rec, "before": before_sensors, "fired_at": fired_at})
     _save_pending()
+
+
+def _relevant_sensors(action: dict) -> set:
+    """Which tracked sensors a CHEMICAL action can plausibly move, so two doses that
+    settle in the same window don't cross-contaminate each other's dose-response buckets
+    (a nutrient dose otherwise learns a spurious pH drop from a co-occurring pH dose, and
+    vice-versa). Returns an empty set for non-chemical actions -> no restriction, current
+    behavior preserved."""
+    if action.get("action") == "dose":
+        return {"ph"} if action.get("kind") == "ph" else {"ec_ms", "ec_us", "tds_ppm"}
+    port = action.get("port")
+    if port is not None:
+        from utils import name_slug
+        slug = name_slug(action.get("device", ""))
+        ph_ports    = [x.strip() for x in os.getenv(f"PH_PORTS_{slug}", "").split(",") if x.strip()]
+        doser_ports = [x.strip() for x in os.getenv(f"DOSER_PORTS_{slug}", "").split(",") if x.strip()]
+        if str(port) in ph_ports:
+            return {"ph"}
+        if str(port) in doser_ports:
+            return {"ec_ms", "ec_us", "tds_ppm"}
+    return set()
 
 
 def record_outcomes(current_snapshot: dict):
@@ -226,10 +253,6 @@ def record_outcomes(current_snapshot: dict):
         else:
             keep.append(p)
 
-    _pending.clear()
-    _pending.extend(keep)
-    _save_pending()
-
     if not settle:
         return
 
@@ -237,9 +260,14 @@ def record_outcomes(current_snapshot: dict):
     cal     = profile.setdefault("calibration", {})
 
     for p in settle:
-        before = p["before"]
+        before   = p["before"]
+        relevant = _relevant_sensors(p["action"])   # empty -> no restriction (non-chem)
         deltas = {}
         for sensor in _TRACKED_SENSORS:
+            # For a chemical action, fold in ONLY the sensors it can plausibly move so a
+            # co-settling pH + nutrient dose don't pollute each other's buckets.
+            if relevant and sensor not in relevant:
+                continue
             if sensor in before and sensor in after:
                 delta = round(after[sensor] - before[sensor], 3)
                 if abs(delta) >= 0.01:   # filter measurement noise
@@ -272,7 +300,13 @@ def record_outcomes(current_snapshot: dict):
 
         print(f"  [CAL] {key}  ->  {entry['averages']}  ({entry['count']} obs)")
 
+    # Persist calibration BEFORE dropping the settled entries from the queue. A crash
+    # between the two writes then re-settles those entries next cycle (a second, slightly
+    # later observation for a noise-averaged table) instead of losing them entirely.
     _save(strain, profile)
+    _pending.clear()
+    _pending.extend(keep)
+    _save_pending()
 
 
 # ---------------------------------------------------------------------------

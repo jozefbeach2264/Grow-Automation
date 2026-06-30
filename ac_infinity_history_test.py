@@ -283,6 +283,21 @@ def test_record_snapshot_seen_set_persists():
         check("record: shared seen dedups without re-read", n == 0 and len(seen) == 1)
 
 
+def test_load_seen_preseeds():
+    # load_seen() pre-builds the dedup set from an existing store so a long-running
+    # poller doesn't re-read the whole JSONL every cycle (regression #12).
+    with tempfile.TemporaryDirectory() as d:
+        store = Path(d) / "s.jsonl"
+        H.record_snapshot(snap(ts="2026-06-04 14:00:00"), store=store)
+        H.record_snapshot(snap(ts="2026-06-04 14:01:00"), store=store)
+        seen = H.load_seen(store=store)
+        check("load_seen: picks up existing rows", len(seen) == 2)
+        n = H.record_snapshot(snap(ts="2026-06-04 14:00:00"), store=store, seen=seen)
+        check("load_seen: seeded set dedups an existing reading", n == 0)
+        n2 = H.record_snapshot(snap(ts="2026-06-04 14:02:00"), store=store, seen=seen)
+        check("load_seen: new reading still logged + tracked", n2 == 1 and len(seen) == 3)
+
+
 def main():
     for fn in (
         test_parse_basic,
@@ -302,6 +317,7 @@ def main():
         test_record_snapshot_skips_non_hydro,
         test_record_snapshot_merges_with_csv,
         test_record_snapshot_seen_set_persists,
+        test_load_seen_preseeds,
     ):
         fn()
     print("=" * 44)

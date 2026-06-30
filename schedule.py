@@ -110,7 +110,14 @@ def expected_light_state(now: datetime | None = None) -> dict:
     cycle_total  = hours_on + hours_off  # normally 24
     minutes_now  = now.hour * 60 + now.minute
     minutes_zero = cycle_start.hour * 60 + cycle_start.minute
-    offset_min   = (minutes_now - minutes_zero) % (cycle_total * 60)
+    # Anchor the cycle phase to an ABSOLUTE, non-wrapping minute timeline so it stays
+    # continuous across midnight for ANY photoperiod -- not just ones whose hours_on +
+    # hours_off divides 24. Minute-of-day wraps 1439->0 at midnight; a cycle whose total
+    # doesn't divide 24 (e.g. 12/6 = 18h period) would otherwise reset its phase every
+    # midnight and silently run the wrong schedule (12/6 -> 18h on / 6h off). For a
+    # 24-summing cycle this reduces exactly to the old (minutes_now - minutes_zero) math.
+    abs_minutes  = now.toordinal() * 1440 + minutes_now
+    offset_min   = (abs_minutes - minutes_zero) % (cycle_total * 60)
     on_total     = hours_on * 60
     cycle_tag    = (f"{hours_on}/{hours_off} cycle starting "
                     f"{cycle_start.strftime('%H:%M')}")
@@ -282,6 +289,9 @@ def compute_co2_emergency(snapshot: dict) -> dict | None:
 # next cycle re-evaluates against the current reading and re-enters if the
 # canopy is still above trigger.
 _temp_emergency_active: bool = False
+# Throttle the "armed but sensor missing" warning so it logs once per outage, not every
+# cycle. Reset when the watched sensor reading reappears.
+_temp_sensor_missing_warned: bool = False
 
 
 def _high_temp_sensor_key() -> str:
@@ -341,14 +351,24 @@ def compute_temp_emergency(snapshot: dict) -> dict | None:
     if clear >= trigger:
         clear = trigger - 7  # enforce a real hysteresis gap
 
+    global _temp_sensor_missing_warned
     key  = _high_temp_sensor_key()
     temp = _read_named_temp(snapshot, key)
     if temp is None:
+        # The guardrail is armed (trigger>0) but its watched sensor is absent from the
+        # snapshot -- a config drift (renamed sensor / wrong HIGH_TEMP_SENSOR) silently
+        # disables the high-temp safety net. Warn once per outage so it isn't invisible.
+        if not _temp_sensor_missing_warned:
+            print(f"  [WARN] high-temp guardrail armed but sensor '{key}' is not in the "
+                  f"snapshot -- the {trigger:g}F net is INACTIVE until it reads. "
+                  f"Check HIGH_TEMP_SENSOR.")
+            _temp_sensor_missing_warned = True
         # No reading -> cannot evaluate safely. Leave prior state alone; if a
         # previous cycle entered the guardrail, the exhaust ramp still gets issued.
         if not _temp_emergency_active:
             return None
     else:
+        _temp_sensor_missing_warned = False
         if temp >= trigger:
             _temp_emergency_active = True
         elif temp < clear:

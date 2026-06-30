@@ -76,6 +76,8 @@ def snap_with(stressors, **extra):
                          "worst_severity": diag_stressors[0]["severity"] if diag_stressors else "none"}}
     if extra.get("temp_emergency"):
         s["temp_emergency"] = {"active": True}
+    if extra.get("co2_emergency"):
+        s["co2_emergency"] = {"active": True}
     return s
 
 
@@ -121,6 +123,17 @@ def test_exhaust_yields_to_guardrail():
     reset(AWAY_MODE="true", ADVISORY_MODE="false", ROLE_EXHAUST="4 x 4:2")
     out = run(snap_with(["tent_temp_high"], exhaust_speed=3, temp_emergency=True))
     check("away-mode yields exhaust to active guardrail", _writes == [])
+
+
+def test_exhaust_yields_to_co2_emergency():
+    # A CO2 dump also forces the exhaust to max; away-mode must not step it (a stale
+    # snapshot speed could otherwise drive the exhaust BELOW the forced maximum). Uses the
+    # same tent_temp_high stressor as the guardrail test so it WOULD step exhaust but for
+    # the yield.
+    reset(AWAY_MODE="true", ADVISORY_MODE="false", ROLE_EXHAUST="4 x 4:2",
+          AWAY_EXHAUST_STEP="1", AWAY_EXHAUST_MAX="10")
+    out = run(snap_with(["tent_temp_high"], exhaust_speed=3, co2_emergency=True))
+    check("away-mode yields exhaust to active CO2 dump", _writes == [] and out == [])
 
 
 def test_custom_step():
@@ -194,6 +207,7 @@ def main():
         test_exhaust_dispatch_live,
         test_exhaust_capped,
         test_exhaust_yields_to_guardrail,
+        test_exhaust_yields_to_co2_emergency,
         test_custom_step,
         test_advisory_mode_no_actuation,
         test_reduce_light_is_advisory,

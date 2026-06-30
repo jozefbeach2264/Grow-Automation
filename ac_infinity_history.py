@@ -318,6 +318,14 @@ def _trend_db_write(call) -> None:
         pass
 
 
+def load_seen(store: str | Path = STORE_PATH) -> set:
+    """Build the (device, ts) dedup set from the current store ONCE. A long-running
+    poller seeds this at startup and passes it to every record_snapshot() call, so the
+    whole growing JSONL store isn't re-read + re-parsed every poll cycle (O(n) per
+    cycle -> O(n^2) over a run)."""
+    return {(r.get("device", "?"), r.get("ts", "")) for r in _read_store(Path(store))}
+
+
 def record_snapshot(snapshot: dict, *, store: str | Path = STORE_PATH,
                     seen: set | None = None) -> int:
     """Append the reservoir reading(s) from a live poller snapshot to the merged

@@ -71,9 +71,12 @@ def _light_floor() -> int:
 # the action would be a no-op). A None means "try the next playbook".
 # --------------------------------------------------------------------------- #
 def _plan_increase_exhaust(snapshot: dict) -> dict | None:
-    # The high-temp guardrail owns the exhaust during an active emergency -- don't
-    # fight it with a +1 step against a fan it's slamming to max.
-    if (snapshot.get("temp_emergency") or {}).get("active"):
+    # The high-temp guardrail AND the CO2 dump both force the exhaust to max during an
+    # active emergency -- don't fight either with a +1 step. The snapshot speed read
+    # below predates this cycle's emergency enforcement, so a stale value could otherwise
+    # drive the exhaust BELOW the forced maximum.
+    if (snapshot.get("temp_emergency") or {}).get("active") \
+            or (snapshot.get("co2_emergency") or {}).get("active"):
         return None
     dev, port = _parse_role("ROLE_EXHAUST", ("4 x 4", 2))
     p = _find_port(snapshot, dev, port)

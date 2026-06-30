@@ -49,6 +49,7 @@ def reset():
 
 # --- mocks ------------------------------------------------------------------ #
 _writes = []          # (port, speed)
+_op_log = []          # ordered ("write", port, speed) / ("verify", port, None)
 _start_raise_on = set()   # ports where the START write (speed>0) should raise
 _verify_ok = True
 _precheck_speed = 0       # what read_port_state reports before dosing
@@ -58,6 +59,7 @@ def fake_set_port_speed(token, dev_id, port, speed, dev_type):
     if speed > 0 and port in _start_raise_on:
         raise RuntimeError(f"simulated start failure on port {port}")
     _writes.append((port, speed))
+    _op_log.append(("write", port, speed))
 
 
 def fake_read_port_state(token, dev_id, port):
@@ -66,6 +68,7 @@ def fake_read_port_state(token, dev_id, port):
 
 
 def fake_verify(token, dev_id, port, expected, timeout_sec=0):
+    _op_log.append(("verify", port, None))
     return {"ok": _verify_ok, "reason": "" if _verify_ok else "still_running",
             "observed": {"speed_actual": 0 if _verify_ok else 5},
             "elapsed_sec": 1, "attempts": 1}
@@ -197,6 +200,74 @@ check("equal target -> equal estimated mL each",
       abs(r["estimated_actual_ml_each"][1] - r["estimated_actual_ml_each"][2]) < 1e-6)
 os.environ.pop("FLOW_ML_MIN_RDWC_CONTROL_1", None)
 os.environ.pop("FLOW_ML_MIN_RDWC_CONTROL_2", None)
+
+
+print("\n== timed_dose: exception mid-dose + unverified stop STILL freezes (regression #1) ==")
+reset(); _writes.clear()
+# Start write raises AND the stop cannot be verified -- the exact token-expiry/network
+# fault the freeze exists for. Previously the freeze sat outside the try/finally and was
+# skipped when the body raised; it must now fire from inside the finally.
+_start_raise_on = {4}; _verify_ok = False; _precheck_speed = 0
+raised = False
+try:
+    dosing.timed_dose("TEST", DEV, 4, 1, 0.5)
+except RuntimeError:
+    raised = True
+check("exception still propagates", raised is True)
+check("stop attempted in finally", len(stops_for(4)) >= 1)
+check("unverified stop on EXCEPTION path freezes dosing", safety_state.is_dosing_disabled() is True)
+check("active dose torn down even on exception", runtime_state.get_active_dose() is None)
+_start_raise_on.clear(); _verify_ok = True
+safety_state.clear_dosing_disable()
+
+
+print("\n== timed_dose: refuses to start when dosing already frozen (regression #11) ==")
+reset(); _writes.clear()
+_verify_ok = True; _precheck_speed = 0
+safety_state.disable_dosing("test freeze")
+r = dosing.timed_dose("TEST", DEV, 4, 1, 0.5)
+check("frozen single dose returns not ok", r["ok"] is False and "frozen" in r.get("reason", ""))
+check("frozen single dose issues NO pump start", _writes == [])
+r = dosing.timed_dose_pair("TEST", DEV, [1, 2], 2, 5.0)
+check("frozen pair returns not ok", r["ok"] is False and "frozen" in r.get("reason", ""))
+check("frozen pair issues NO pump start", _writes == [])
+safety_state.clear_dosing_disable()
+
+
+print("\n== timed_dose_pair: stop COMMANDS decoupled from verify (regression #5) ==")
+reset(); _writes.clear(); _op_log.clear()
+_verify_ok = True; _precheck_speed = 0; _start_raise_on.clear()
+r = dosing.timed_dose_pair("TEST", DEV, [1, 2], 2, 5.0, solution="nutrient")
+check("pair ok", r["ok"] is True)
+# Both ports' stop COMMANDS must be issued before the FIRST verify -- otherwise port 2's
+# stop would block on port 1's verify latency and over-run the faster pump.
+first_verify = next((i for i, op in enumerate(_op_log) if op[0] == "verify"), None)
+stops_before_verify = [op for op in _op_log[:first_verify] if op[0] == "write" and op[2] == 0]
+check("both stop commands fire before the first verify",
+      first_verify is not None and len({op[1] for op in stops_before_verify}) == 2)
+
+
+print("\n== calculate_timed_dose: rejects non-positive flow/ramp (regression #16) ==")
+threw = False
+try:
+    dosing.calculate_timed_dose(2, 5.0, flow_ml_min=0)
+except ValueError:
+    threw = True
+check("flow=0 raises ValueError (not ZeroDivisionError)", threw is True)
+threw = False
+try:
+    dosing.calculate_timed_dose(2, 5.0, ramp_rate=0)
+except ValueError:
+    threw = True
+check("ramp_rate=0 raises ValueError", threw is True)
+os.environ["FLOW_ML_MIN_RDWC_CONTROL_3"] = "0"
+check("env flow=0 clamps back to default",
+      dosing._flow_ml_min("RDWC Control", 3) == dosing.DEFAULT_FLOW_ML_MIN)
+os.environ.pop("FLOW_ML_MIN_RDWC_CONTROL_3", None)
+os.environ["RAMP_SPEED_PER_SEC"] = "0"
+check("env ramp=0 clamps back to default",
+      dosing._ramp_rate() == dosing.DEFAULT_RAMP_SPEED_PER_SEC)
+os.environ.pop("RAMP_SPEED_PER_SEC", None)
 
 
 # =========================================================================== #

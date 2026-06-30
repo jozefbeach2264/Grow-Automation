@@ -458,6 +458,7 @@ def filter_actions(actions: list, snapshot: dict | None = None,
     now = time.time()
     safe = []
     ph_used_this_cycle = False
+    dosed_ports_this_cycle: set = set()
 
     def _rej(action, code):
         """Record a structured block reason for the ledger (no-op if no collector)."""
@@ -488,6 +489,19 @@ def filter_actions(actions: list, snapshot: dict | None = None,
         # one or two ports; code owns speed/volume). Handled before the per-port logic
         # below, which assumes a single `port` key that dose actions do not carry.
         if a.get("action") == "dose":
+            resolved = a.get("_resolved") or _resolve_dose_ports(
+                a["device"], a.get("playbook", ""))
+            dose_ports = set(resolved["ports"]) if resolved else set()
+            # Reject a second dose on a port already approved this cycle -- the nutrient
+            # analogue of one-pH-per-cycle. Lockout state (_last_dose_time) is written
+            # only AFTER the whole execute loop, so it cannot catch an in-cycle duplicate;
+            # without this guard the AI could emit two nutrient doses and double-deliver
+            # to ports 1+2 (pH is already covered by ph_used_this_cycle).
+            if dose_ports and (dose_ports & dosed_ports_this_cycle):
+                print(f"  [SAFETY] Blocked dose {a.get('playbook')} on "
+                      f"{a.get('device')}: port(s) already dosed this cycle")
+                _rej(a, "duplicate_dose_this_cycle")
+                continue
             allowed, is_ph_dose, why = _dose_gate(
                 a, dose_gate, ph_gate, dosing_off, _snapshot_sensors,
                 ph_used_this_cycle, now)
@@ -498,6 +512,7 @@ def filter_actions(actions: list, snapshot: dict | None = None,
                 continue
             if is_ph_dose:
                 ph_used_this_cycle = True
+            dosed_ports_this_cycle.update(dose_ports)
             safe.append(a)
             continue
 
@@ -561,8 +576,10 @@ def filter_actions(actions: list, snapshot: dict | None = None,
             _rej(a, f"co2_gate_{co2_gate.lower()}")
             continue
 
-        # 1. Per-port dose lockout -- only applies to doser ports (not fans/lights/outlets)
-        if is_doser and key in _last_dose_time:
+        # 1. Per-port dose lockout -- only applies to doser ports (not fans/lights/outlets).
+        #    Exempt stops (is_safety_dir): a STOP must ALWAYS be allowed through, even on a
+        #    port still inside its dose lockout window ("stops are always allowed").
+        if is_doser and not is_safety_dir and key in _last_dose_time:
             remaining = _dose_lockout_sec() - (now - _last_dose_time[key])
             if remaining > 0:
                 m, s = divmod(int(remaining), 60)
@@ -570,8 +587,9 @@ def filter_actions(actions: list, snapshot: dict | None = None,
                 _rej(a, "lockout_active")
                 continue
 
-        # 2. pH-specific lockout
-        if is_ph:
+        # 2. pH-specific lockout. Exempt stops (is_safety_dir) -- a STOP must always be
+        #    allowed and must not consume the one-pH-per-cycle budget below.
+        if is_ph and not is_safety_dir:
             remaining = _ph_lockout_sec() - (now - _last_ph_time)
             if remaining > 0:
                 m, s = divmod(int(remaining), 60)
@@ -851,7 +869,7 @@ res_health.ph_gate rules:
   HOLD    -- do not adjust pH; resolve water/EC issue first, pH chasing during stress causes more harm
 
 Week advancement note: only suggest advancing grow_week in your assessment if res_health.state
-is IDEAL or GOOD for at least the past 2 cycles. If state is STALL, STRESS, or PROBLEM, explicitly
+is IDEAL for at least the past 2 cycles. If state is STALL, STRESS, or PROBLEM, explicitly
 flag that week advancement should be delayed until res health recovers.
 
 DWC diagnostic rules -- always evaluate WATER LEVEL + EC + PH together as a trend, not individually.
@@ -1010,7 +1028,7 @@ def res_health_check(trends: dict) -> dict:
       ec/tds trend      = is the plant eating?
 
     Returns:
-      state      -- IDEAL / GOOD / WATCH / STALL / STRESS / UNKNOWN
+      state      -- IDEAL / WATCH / STALL / STRESS / PROBLEM / UNKNOWN
       co2_gate   -- ADVANCE / HOLD / REDUCE
       dose_gate  -- NORMAL / HOLD / NONE
       ph_gate    -- ALLOW / HOLD  (never adjust pH when res is stressed)
@@ -1612,7 +1630,18 @@ def execute_actions(result: dict, devices: list[dict], token: str,
 
         # Chemical doses route through the bounded timed-dose path (own verify + stop).
         if a.get("action") == "dose":
-            done = _execute_dose(a, dev, token)
+            try:
+                done = _execute_dose(a, dev, token)
+            except Exception as e:
+                # timed_dose/timed_dose_pair already ran their finally (stop +
+                # freeze-on-unverified-stop) before this propagated -- the safety action
+                # is done. Just don't let the exception abort the rest of the loop.
+                print(f"  [EXEC] dose {a.get('playbook')} on {a.get('device')} raised: {e}")
+                event_log.log_action_execution(
+                    cycle_id, aid, executed=True, success=False, error=str(e),
+                    device=a.get("device"), command_type="dose",
+                    playbook=a.get("playbook"))
+                continue
             event_log.log_action_execution(
                 cycle_id, aid, executed=done is not None,
                 success=done is not None, device=a.get("device"),

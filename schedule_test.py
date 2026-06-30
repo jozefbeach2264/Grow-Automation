@@ -175,6 +175,46 @@ def test_enforce():
         poller.set_port_speed = orig
 
 
+# --- poller.enforce_co2_emergency ------------------------------------------- #
+
+def test_enforce_co2():
+    import poller
+    import ac_infinity_client as acic
+    speed_calls, outlet_calls = [], []
+    orig_s, orig_o = poller.set_port_speed, acic.set_outlet
+    # enforce_co2_emergency uses the module-global set_port_speed but LOCAL-imports
+    # set_outlet from ac_infinity_client, so patch each at its real source.
+    poller.set_port_speed = lambda t, d, p, s, dt: speed_calls.append((d, p, s, dt))
+    acic.set_outlet = lambda t, d, p, v, dt: outlet_calls.append((d, p, v, dt))
+    try:
+        devices = [{"name": "4 x 4", "dev_id": "DEV1", "type": 20},
+                   {"name": "Auxiliary Outputs", "dev_id": "DEV2", "type": 21}]
+
+        # Inactive -> nothing fired.
+        fired = poller.enforce_co2_emergency({"co2_emergency": None}, devices, "TOKEN")
+        check("enforce_co2: inactive fires nothing",
+              fired == [] and speed_calls == [] and outlet_calls == [])
+
+        # Active -> BOTH the valve-OFF (set_outlet) and exhaust-max (set_speed) branches
+        # fire -- the set_outlet branch the temp twin lacks.
+        reset_co2(CO2_EMERGENCY_PPM="3000", CO2_DUMP_CLEAR_PPM="1800",
+                  CO2_VALVE="Auxiliary Outputs:2", ROLE_EXHAUST="4 x 4:2")
+        em = schedule.compute_co2_emergency(co2_snap(3200))
+        fired = poller.enforce_co2_emergency({"co2_emergency": em}, devices, "TOKEN")
+        check("enforce_co2: fires both actions", len(fired) == 2)
+        check("enforce_co2: exhaust ramped to 10 (set_speed branch)", ("DEV1", 2, 10, 20) in speed_calls)
+        check("enforce_co2: CO2 valve forced OFF (set_outlet branch)", ("DEV2", 2, False, 21) in outlet_calls)
+
+        # Unknown device -> skipped, no crash, no write.
+        speed_calls.clear()
+        outlet_calls.clear()
+        fired = poller.enforce_co2_emergency({"co2_emergency": em}, [], "TOKEN")
+        check("enforce_co2: unknown device skipped safely",
+              fired == [] and speed_calls == [] and outlet_calls == [])
+    finally:
+        poller.set_port_speed, acic.set_outlet = orig_s, orig_o
+
+
 # --- compute_co2_emergency (CO2 dump) --------------------------------------- #
 
 def co2_snap(co2=None, valve_powered=None, valve=("Auxiliary Outputs", 2)):
@@ -342,6 +382,32 @@ def test_ppfd_controlled_light():
     check("armed but no map: falls back to LIGHT_INTENSITY", st["speed"] == 10)
 
 
+def test_photoperiod_continuous_across_midnight():
+    # A non-24 photoperiod (12/6 = 18h period) must free-run continuously instead of
+    # resetting its phase at midnight -- the bug turned a 12/6 into a single 18h ON block.
+    from datetime import datetime, timedelta
+    for k in ("PPFD_CONTROL", "LIGHT_SUNRISE_MIN", "LIGHT_SUNSET_MIN",
+              "GROW_START_DATE", "GROW_STAGE"):
+        os.environ.pop(k, None)
+    os.environ.update({"LIGHT_HOURS_ON": "12", "LIGHT_HOURS_OFF": "6",
+                       "LIGHT_CYCLE_START": "18:00", "LIGHT_INTENSITY": "10"})
+    t = datetime(2026, 6, 30, 18, 0)
+    longest_on = cur_on = 0
+    for _ in range(48 * 12):              # 48h, sampled every 5 minutes
+        if schedule.expected_light_state(t)["on"]:
+            cur_on += 5
+            longest_on = max(longest_on, cur_on)
+        else:
+            cur_on = 0
+        t += timedelta(minutes=5)
+    check("12/6 max contiguous ON is 12h, not the 18h midnight-reset bug (regression #8)",
+          longest_on <= 12 * 60 + 10)
+    check("12/6 still delivers ~12h ON blocks (not broken to all-off)",
+          longest_on >= 12 * 60 - 10)
+    for k in ("LIGHT_HOURS_ON", "LIGHT_HOURS_OFF", "LIGHT_CYCLE_START", "LIGHT_INTENSITY"):
+        os.environ.pop(k, None)
+
+
 def main():
     print("Schedule / emergency deterministic self-tests")
     print("=" * 44)
@@ -357,6 +423,7 @@ def main():
         test_custom_exhaust_role,
         test_independent_of_chem_emergencies,
         test_enforce,
+        test_enforce_co2,
         test_co2_emergency_disabled,
         test_co2_emergency_trips_and_clears,
         test_co2_emergency_clear_gap_enforced,
@@ -369,6 +436,7 @@ def main():
         test_schedule_delta_in_sync,
         test_schedule_delta_fan_mismatch,
         test_ppfd_controlled_light,
+        test_photoperiod_continuous_across_midnight,
     ):
         fn()
     print("=" * 44)

@@ -131,33 +131,24 @@ async def _scan_until_found(address: str, timeout: float = 60) -> bool:
 
 
 async def _pop_filtered(device_name: str) -> dict | None:
-    """Pop the next command intended for this device, or None.
+    """Claim the next command for THIS device (device-scoped atomic claim), or None.
 
-    The shared queue can carry rows for multiple controllers; we silently skip
-    any row whose device != ours (other daemons claim those). A row that was
-    enqueued under a now-frozen chemical port is rejected here so the freeze
-    is honored even if the writer races the safety state change."""
-    row = db.pop_next_command()
-    while row is not None:
-        if row["device"] != device_name:
-            # Not ours -- requeue it for the right daemon by inserting a fresh
-            # pending copy. The original row stays in 'sent' status (effectively
-            # a no-op for this daemon).
-            db.enqueue_command(
-                row["device"], row["port"], row["work_type"], row["speed"],
-                source=f"{row.get('source','?')}|requeue:{row['id']}",
-            )
-            row = db.pop_next_command()
-            continue
+    The shared queue can carry rows for multiple controllers; the device-scoped claim
+    simply never touches another daemon's rows -- they stay 'pending' for their own
+    daemon (no cross-device requeue, so no livelock / unbounded queue growth / requeue
+    crash). A row enqueued under a now-frozen chemical port is rejected here (marked
+    failed) so the freeze is honored even if the writer raced the safety state change."""
+    while True:
+        row = db.claim_next_command(device_name)
+        if row is None:
+            return None
         try:
             guard_chemical_write(row["device"], row["port"])
         except SafetyBlocked as e:
             db.mark_command_failed(row["id"], str(e))
             log.warning("Executor dropped row %d: %s", row["id"], e)
-            row = db.pop_next_command()
             continue
         return row
-    return None
 
 
 async def _run_session(device_name: str, address: str,

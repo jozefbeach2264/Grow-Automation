@@ -155,6 +155,44 @@ check("dose blocked when target_ml exceeds MAX_DOSE_ML_CYCLE", out == [])
 os.environ["MAX_DOSE_ML_CYCLE"] = "50"
 
 
+print("\n== filter_actions: nutrient per-cycle dedup (regression #4) ==")
+reset()
+out = ai_advisor.filter_actions(
+    [dose("timed_nutrient_microdose"), dose("timed_nutrient_small")], snapshot=snap())
+check("two nutrient doses in one cycle -> only ONE passes (no 2x over-dose)", len(out) == 1)
+reset()
+out = ai_advisor.filter_actions(
+    [dose("timed_nutrient_microdose"), dose("timed_nutrient_microdose")], snapshot=snap())
+check("duplicate nutrient dose deduped to one", len(out) == 1)
+reset()
+# A nutrient (ports 1+2) and a pH (port 4) dose touch different ports -> both allowed.
+out = ai_advisor.filter_actions(
+    [dose("timed_nutrient_microdose"), dose("timed_ph_down_microdose")], snapshot=snap())
+check("nutrient + pH in one cycle both pass (no false collision)", len(out) == 2)
+
+
+print("\n== filter_actions: STOP always allowed, even inside lockout ==")
+reset()
+# Drive ports 1-4 into an active dose/pH lockout, then try to STOP them.
+ai_advisor.record_actions([
+    {"device": "TestRes", "action": "dose", "playbook": "timed_nutrient_microdose", "ports": [1, 2]},
+    {"device": "TestRes", "action": "dose", "playbook": "timed_ph_down_microdose", "ports": [4]},
+])
+out = ai_advisor.filter_actions(
+    [{"device": "TestRes", "port": 1, "action": "set_speed", "value": 0}], snapshot=snap())
+check("doser STOP passes despite active lockout", len(out) == 1)
+out = ai_advisor.filter_actions(
+    [{"device": "TestRes", "port": 4, "action": "set_speed", "value": 0}], snapshot=snap())
+check("pH STOP passes despite active pH lockout", len(out) == 1)
+# A pH STOP must NOT consume the one-pH-per-cycle budget -> a real pH dose still allowed.
+reset()
+out = ai_advisor.filter_actions(
+    [{"device": "TestRes", "port": 4, "action": "set_speed", "value": 0},
+     dose("timed_ph_up_microdose")], snapshot=snap())
+check("pH STOP does not consume the one-pH-per-cycle budget",
+      has_dose(out, "timed_ph_up_microdose"))
+
+
 print("\n== execute_actions: AUTONOMOUS_DOSING gate ==")
 reset()
 DEVS = [{"name": "TestRes", "dev_id": "d-test", "type": 20}]
@@ -176,6 +214,35 @@ executed = ai_advisor.execute_actions(
 check("AUTONOMOUS_DOSING on -> dose executed", len(executed) == 1 and executed[0]["action"] == "dose")
 check("AUTONOMOUS_DOSING on -> timed_dose_pair routed", _dose_calls and _dose_calls[0][0] == "pair")
 os.environ.pop("AUTONOMOUS_DOSING", None)
+
+
+print("\n== _verify_executed_action: failed chem STOP freezes dosing (regression #14) ==")
+import ac_infinity_client as acic
+_orig_v = (acic.set_port_speed, acic.verify_port_state, acic.stop_and_verify)
+acic.set_port_speed = lambda *a, **k: None
+acic.verify_port_state = lambda *a, **k: {"ok": False, "reason": "still_running",
+                                          "observed": {"speed_actual": 5}, "elapsed_sec": 1, "attempts": 1}
+acic.stop_and_verify = lambda *a, **k: {"ok": False, "reason": "still_running",
+                                        "observed": {"speed_actual": 5}, "elapsed_sec": 1, "attempts": 2}
+os.environ["VERIFY_WRITES"] = "true"
+reset()
+# A raw chemical STOP (value 0 on pH port 4) passes the gate (stops always allowed),
+# executes, then fails verification + retry -> the chemical freeze fires. Uses a NON-SIM
+# token so verification actually runs (SIM skips it). This is the safety link the freeze
+# was built for and was previously untested.
+ai_advisor.execute_actions(
+    {"actions": [{"device": "TestRes", "port": 4, "action": "set_speed", "value": 0}]},
+    DEVS, "TOKEN", snapshot=snap())
+check("unverified chem STOP freezes dosing", safety_state.is_dosing_disabled() is True)
+# Happy path: a verified stop must NOT freeze.
+acic.verify_port_state = lambda *a, **k: {"ok": True, "reason": "", "observed": {"speed_actual": 0},
+                                          "elapsed_sec": 1, "attempts": 1}
+reset()
+ai_advisor.execute_actions(
+    {"actions": [{"device": "TestRes", "port": 4, "action": "set_speed", "value": 0}]},
+    DEVS, "TOKEN", snapshot=snap())
+check("verified chem STOP does NOT freeze", safety_state.is_dosing_disabled() is False)
+acic.set_port_speed, acic.verify_port_state, acic.stop_and_verify = _orig_v
 
 
 print("\n== reason collectors: precise ledger reasons ==")

@@ -553,6 +553,13 @@ def main():
     print()
 
     ai_failure_count = 0
+    # Seed the trend-store dedup set ONCE so self-logging doesn't re-read + re-parse the
+    # whole growing JSONL store every cycle (O(n) per poll). record_snapshot mutates it
+    # in place. Best-effort -- a read failure just falls back to per-call dedup.
+    try:
+        trend_seen = history.load_seen() if TREND_LOG_ENABLED else None
+    except Exception:
+        trend_seen = None
     try:
         while True:
             try:
@@ -585,7 +592,7 @@ def main():
                 # Logging never raises.
                 if TREND_LOG_ENABLED:
                     try:
-                        history.record_snapshot(snapshot)
+                        history.record_snapshot(snapshot, seen=trend_seen)
                     except Exception:
                         pass
 
@@ -681,6 +688,14 @@ def main():
                 if te and te.get("active"):
                     print(f"  [!!! HIGH TEMP ALERT !!!] {te['sensor']}={te['temp_f']}F "
                           f">= {te['trigger']}F -- exhaust to max until < {te['clear']}F")
+                # CO2 emergency: alert ALWAYS (even ADVISORY), same detect-always contract
+                # as the leak/burst/temp alerts above -- a dangerous CO2 level is never
+                # silent. enforce_co2_emergency only ACTUATES in LIVE; this just alerts.
+                ce = snapshot.get("co2_emergency")
+                if ce and ce.get("active"):
+                    print(f"  [!!! HIGH CO2 ALERT !!!] co2={ce['co2_ppm']} ppm "
+                          f">= {ce['trigger']} ppm -- exhaust to max / valve OFF until "
+                          f"< {ce['clear']} ppm")
 
                 executed_actions: list[dict] = []
 
@@ -802,9 +817,11 @@ def main():
                     sleep_for = min(INTERVAL * (2 ** min(ai_failure_count - 1, 5)), 1800)
                     print(f"  [AI] backing off {sleep_for}s after failure #{ai_failure_count}")
                 else:
-                    # Deterministic-only mode (no AI). Faster cadence when actions
-                    # fired this cycle, regular interval otherwise.
-                    sleep_for = ACTIVE_INTERVAL if executed_actions else INTERVAL
+                    # Deterministic-only mode (no AI). Re-check at least as fast after
+                    # firing actions as when idle -- never SLOWER (ACTIVE_INTERVAL can be
+                    # configured above INTERVAL for AI mode, which would otherwise make a
+                    # cycle that just acted poll less often than an idle one).
+                    sleep_for = min(ACTIVE_INTERVAL, INTERVAL) if executed_actions else INTERVAL
                     mode_str  = "DET-ACTIVE" if executed_actions else "DET-IDLE"
                     print(f"  [--] Mode: {mode_str}  next poll in {sleep_for}s  (no AI)")
 

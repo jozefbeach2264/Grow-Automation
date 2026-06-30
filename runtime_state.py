@@ -84,7 +84,14 @@ def _save(state: dict) -> None:
     try:
         _STATE_FILE.parent.mkdir(exist_ok=True)
         tmp = _STATE_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state, indent=2))
+        # fsync the tmp file before the atomic rename so a power loss can't leave the
+        # file renamed-but-empty. Losing the active-dose record (vs corrupting it) would
+        # silently skip the crash-recovery freeze that depends on it -- worse than the
+        # corrupt->fresh load policy, which at least the watchdog backstops.
+        with tmp.open("w", encoding="utf-8") as fh:
+            fh.write(json.dumps(state, indent=2))
+            fh.flush()
+            os.fsync(fh.fileno())
         tmp.replace(_STATE_FILE)
     except Exception as e:
         print(f"[RUNTIME] Could not write {_STATE_FILE.name}: {e}")
@@ -173,6 +180,12 @@ def begin_active_dose(record: dict) -> None:
     rec.setdefault("started_wall_time_utc", _utc_now_iso())
     rec.setdefault("started_wall_ts", time.time())
     rec.setdefault("started_monotonic", time.monotonic())
+    # Stamp the owning process so active_dose_window_ports() can tell a live in-process
+    # dose (its monotonic stop timer still running) from a record that survived a crash
+    # (the timer is dead). Without this, startup recovery's window vouches for -- and so
+    # skips stopping -- the very orphan pump it exists to catch.
+    rec.setdefault("pid", os.getpid())
+    rec.setdefault("boot_id", boot_id())
     rec["status"] = "pump_running"
     state["active_dose"] = rec
     _save(state)
@@ -226,6 +239,13 @@ def active_dose_window_ports() -> set:
     ad = get_active_dose()
     if not ad or ad.get("status") != "pump_running":
         return set()
+    # Only an active dose from THIS live process vouches for a running pump. A record
+    # that survived a crash/restart (different pid, or a different boot_id after a
+    # reboot) must NOT protect a still-spinning pump -- otherwise startup recovery would
+    # skip the orphan it exists to stop. pid alone catches the cross-process case;
+    # boot_id additionally guards a (theoretical) pid reuse across a reboot.
+    if ad.get("pid") != os.getpid() or ad.get("boot_id") != boot_id():
+        return set()
     planned_stop = ad.get("planned_stop_wall_ts")
     if planned_stop is None:
         # Running with no planned stop recorded -> cannot vouch for it; treat as orphan.
@@ -252,7 +272,14 @@ def estimate_interrupted_dose(active_dose: dict, stop_wall_ts: float) -> dict:
       best_ml -- planned target when known, else the max bracket.
     Strength factor scales actual mL to full-strength-equivalent mL."""
     speed = int(active_dose.get("speed") or 0)
-    flow_ml_min = speed * 21.0
+    # Use the real per-port flow rate the dose was planned with (persisted in the record)
+    # so a FLOW_ML_MIN_* override isn't silently ignored -- a hardcoded 21 UNDER-counts
+    # delivered chem on a faster pump (the misleading direction). Fall back to the spec.
+    rec_flow = active_dose.get("flow_ml_min")
+    try:
+        flow_ml_min = float(rec_flow) * speed if rec_flow else speed * 21.0
+    except (TypeError, ValueError):
+        flow_ml_min = speed * 21.0
     started_ts = active_dose.get("started_wall_ts")
     target_ml = active_dose.get("target_ml")
     strength = float(active_dose.get("strength_factor") or 1.0)
@@ -275,6 +302,7 @@ def estimate_interrupted_dose(active_dose: dict, stop_wall_ts: float) -> dict:
         min_ml = 0.0
 
     best_ml = float(target_ml) if target_ml is not None else max_ml
+    min_ml = min(min_ml, max_ml)   # the bracket can never invert
 
     return {
         "estimated_actual_ml_min": min_ml,
@@ -426,10 +454,13 @@ def diagnose_restart() -> dict:
                 "last_heartbeat_utc": None, "disconnect_sec": None}
     last_ts = hb.get("wall_ts")
     disconnect = round(time.time() - float(last_ts), 1) if last_ts else None
+    cur_boot = boot_id()
     return {
         "fresh": False,
         "clean": hb.get("phase") == "shutdown",
-        "rebooted": bool(hb.get("boot_id")) and hb.get("boot_id") != boot_id(),
+        # Only call it a reboot when BOTH boot ids are readable and differ. An unreadable
+        # current boot_id ('') must not masquerade as a machine reboot.
+        "rebooted": bool(cur_boot) and bool(hb.get("boot_id")) and hb.get("boot_id") != cur_boot,
         "had_active_dose": had_active_dose,
         "last_phase": hb.get("phase"),
         "last_heartbeat_utc": hb.get("wall_time_utc"),

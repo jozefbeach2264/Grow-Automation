@@ -260,14 +260,135 @@ try:
 except ValueError:
     threw = True
 check("ramp_rate=0 raises ValueError", threw is True)
-os.environ["FLOW_ML_MIN_RDWC_CONTROL_3"] = "0"
-check("env flow=0 clamps back to default",
-      dosing._flow_ml_min("RDWC Control", 3) == dosing.DEFAULT_FLOW_ML_MIN)
-os.environ.pop("FLOW_ML_MIN_RDWC_CONTROL_3", None)
 os.environ["RAMP_SPEED_PER_SEC"] = "0"
 check("env ramp=0 clamps back to default",
       dosing._ramp_rate() == dosing.DEFAULT_RAMP_SPEED_PER_SEC)
 os.environ.pop("RAMP_SPEED_PER_SEC", None)
+
+
+print("\n== _flow_ml_min: explicit non-positive override aborts LOUDLY (F8) ==")
+# A set-but-bad FLOW_ML_MIN must never silently substitute the 21 spec default: if the
+# pump's true calibrated flow is ~40 mL/min, dosing at "21" runs ~1.9x long -- a silent
+# overdose. The abort must land BEFORE any pump start (no client writes).
+reset(); _writes.clear()
+_verify_ok = True; _precheck_speed = 0; _start_raise_on.clear()
+os.environ["FLOW_ML_MIN_RDWC_CONTROL_3"] = "0"
+threw = False
+try:
+    dosing.timed_dose("TEST", DEV, 3, 1, 0.5, solution="ph_up")
+except ValueError:
+    threw = True
+check("override=0 raises ValueError before dosing", threw is True)
+check("override=0 issues NO client writes", _writes == [])
+os.environ["FLOW_ML_MIN_RDWC_CONTROL_3"] = "-1"
+threw = False
+try:
+    dosing._flow_ml_min("RDWC Control", 3)
+except ValueError:
+    threw = True
+check("override=-1 raises ValueError", threw is True)
+for _bad in ("nan", "inf", "40,5"):
+    os.environ["FLOW_ML_MIN_RDWC_CONTROL_3"] = _bad
+    threw = False
+    try:
+        dosing._flow_ml_min("RDWC Control", 3)
+    except ValueError:
+        threw = True
+    check(f"override={_bad!r} raises ValueError (no silent 21 fallback)", threw is True)
+os.environ.pop("FLOW_ML_MIN_RDWC_CONTROL_3", None)
+check("unset override still uses the spec default",
+      dosing._flow_ml_min("RDWC Control", 3) == dosing.DEFAULT_FLOW_ML_MIN)
+_writes.clear()
+os.environ["FLOW_ML_MIN_RDWC_CONTROL_2"] = "0"
+threw = False
+try:
+    dosing.timed_dose_pair("TEST", DEV, [1, 2], 2, 5.0)
+except ValueError:
+    threw = True
+check("pair with bad override on one port raises before dosing", threw is True)
+check("pair with bad override issues NO client writes", _writes == [])
+os.environ.pop("FLOW_ML_MIN_RDWC_CONTROL_2", None)
+
+
+print("\n== timed_dose_pair: exception mid-pair -> ALL stop writes before any verify (F5) ==")
+# On Ctrl-C / any exception while both pumps run, the finally must fire the raw stop
+# WRITES to BOTH ports first and only then start the per-port verify/retry loop --
+# verifying port 1 first would leave port 2 pumping through the verify latency
+# (~4-40s, i.e. 3-30 mL of concentrate over-run).
+reset(); _writes.clear(); _op_log.clear()
+_verify_ok = True; _precheck_speed = 0; _start_raise_on.clear()
+_orig_sleep = dosing._sleep_ms
+def _raising_sleep(ms):
+    raise KeyboardInterrupt("simulated Ctrl-C mid-pair")
+dosing._sleep_ms = _raising_sleep
+raised = False
+try:
+    dosing.timed_dose_pair("TEST", DEV, [1, 2], 2, 5.0, solution="nutrient")
+except KeyboardInterrupt:
+    raised = True
+dosing._sleep_ms = _orig_sleep
+check("exception propagates out of the pair", raised is True)
+first_verify = next((i for i, op in enumerate(_op_log) if op[0] == "verify"), None)
+stops_before_verify = {op[1] for op in _op_log[:first_verify]
+                       if op[0] == "write" and op[2] == 0}
+check("BOTH stop writes issued before the first verify on the exception path",
+      first_verify is not None and stops_before_verify == {1, 2})
+check("both stops still verified afterward (freeze semantics intact)",
+      safety_state.is_dosing_disabled() is False)
+# Same exception path with an UNVERIFIABLE stop must still freeze (unchanged semantics).
+reset(); _writes.clear(); _op_log.clear()
+_verify_ok = False
+dosing._sleep_ms = _raising_sleep
+try:
+    dosing.timed_dose_pair("TEST", DEV, [1, 2], 2, 5.0, solution="nutrient")
+except KeyboardInterrupt:
+    pass
+dosing._sleep_ms = _orig_sleep
+check("unverified stop on the exception path still freezes dosing",
+      safety_state.is_dosing_disabled() is True)
+_verify_ok = True
+safety_state.clear_dosing_disable()
+
+
+print("\n== timed_dose_pair: partial start exposes started ports + delivered est (F7) ==")
+reset(); _writes.clear()
+_verify_ok = True; _precheck_speed = 0
+_start_raise_on = {2}
+r = dosing.timed_dose_pair("TEST", DEV, [1, 2], 2, 5.0, solution="nutrient")
+check("partial pair reports failure", r["ok"] is False and r["start_failed"] == 2)
+check("partial pair exposes started=[1]", r.get("started") == [1])
+check("partial pair delivered est: never-started port 2 is 0.0",
+      r.get("delivered_ml_each", {}).get(2) == 0.0)
+check("partial pair delivered est for port 1 is bounded by the plan",
+      0.0 <= r["delivered_ml_each"][1] <= r["estimated_actual_ml_each"][1])
+_start_raise_on.clear()
+r = dosing.timed_dose_pair("TEST", DEV, [1, 2], 2, 5.0, solution="nutrient")
+check("clean pair also carries delivered_ml_each for both ports",
+      set(r.get("delivered_ml_each", {}).keys()) == {1, 2})
+r = dosing.timed_dose("TEST", DEV, 4, 1, 0.5, solution="ph_down")
+check("single dose exposes started=[port] + delivered est",
+      r.get("started") == [4] and r.get("delivered_ml_each", {}).get(4) == r["estimated_actual_ml"])
+
+
+print("\n== timed_dose_pair: active-dose record stamps per-port flows (F14) ==")
+reset(); _writes.clear()
+_verify_ok = True; _precheck_speed = 0; _start_raise_on.clear()
+os.environ["FLOW_ML_MIN_RDWC_CONTROL_1"] = "21"
+os.environ["FLOW_ML_MIN_RDWC_CONTROL_2"] = "42"
+_captured_ad = {}
+_orig_begin = runtime_state.begin_active_dose
+def _capture_begin(record):
+    _captured_ad.update(record)
+    _orig_begin(record)
+runtime_state.begin_active_dose = _capture_begin
+r = dosing.timed_dose_pair("TEST", DEV, [1, 2], 2, 5.0, solution="nutrient")
+runtime_state.begin_active_dose = _orig_begin
+check("pair record carries flow_ml_min_by_port for BOTH pumps",
+      _captured_ad.get("flow_ml_min_by_port") == {1: 21.0, 2: 42.0})
+check("pair record keeps the scalar flow for old readers",
+      _captured_ad.get("flow_ml_min") == 42.0)
+os.environ.pop("FLOW_ML_MIN_RDWC_CONTROL_1", None)
+os.environ.pop("FLOW_ML_MIN_RDWC_CONTROL_2", None)
 
 
 # =========================================================================== #

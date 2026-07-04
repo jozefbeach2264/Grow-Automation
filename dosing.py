@@ -23,6 +23,7 @@ This module is the execution primitive. Reservoir-gate / schema / lockout enforc
 stays in ai_advisor.filter_actions/validate_actions; callers should gate before dosing.
 """
 
+import math
 import os
 import time
 
@@ -79,15 +80,27 @@ PLAYBOOKS = {
 # config helpers
 # --------------------------------------------------------------------------- #
 def _flow_ml_min(device: str, port: int) -> float:
-    v = os.getenv(f"FLOW_ML_MIN_{name_slug(device)}_{port}", "").strip()
-    try:
-        f = float(v) if v else DEFAULT_FLOW_ML_MIN
-    except ValueError:
+    key = f"FLOW_ML_MIN_{name_slug(device)}_{port}"
+    v = os.getenv(key, "").strip()
+    if not v:
         return DEFAULT_FLOW_ML_MIN
-    # A zero/negative override would divide-by-zero or invert the dose timing in
-    # calculate_timed_dose -- fall back to the spec default rather than blow up the
-    # most safety-critical module on a fat-fingered env value.
-    return f if f > 0 else DEFAULT_FLOW_ML_MIN
+    try:
+        f = float(v)
+    except ValueError:
+        f = None
+    if f is None or not math.isfinite(f) or f <= 0:
+        # An EXPLICITLY-set but invalid flow (unparseable, NaN/inf, or <= 0) is an
+        # operator error, never a case for the spec default: silently substituting
+        # 21 mL/min under a pump whose true calibrated flow is e.g. ~40 mL/min would
+        # run the dose ~2x long -- a silent chemical overdose. Abort loudly BEFORE
+        # any pump starts (the callers plan doses before any client write). Only the
+        # UNSET case falls back to the spec default.
+        runtime_state.record_event("dose_config_error", device=device, port=port,
+                                   env_key=key, value=v,
+                                   reason="invalid FLOW_ML_MIN override")
+        raise ValueError(f"{key}={v}: FLOW_ML_MIN override must be a finite number > 0 "
+                         "(unset it to use the 21 mL/min spec default)")
+    return f
 
 
 def _ramp_rate() -> float:
@@ -313,9 +326,14 @@ def timed_dose(token: str, dev: dict, port: int, speed: int, target_ml: float, *
         if not stop_ok:
             _freeze_after_failed_stop(device, port)
 
+    # Reaching here means the pump ran (every no-start path returned earlier), so even
+    # an ok=False result (unverified stop) delivered chem -- expose which port started
+    # and the best delivered estimate so the caller can stamp lockouts / track outcome.
     return {"ok": stop_ok, "estimated_actual_ml": plan["estimated_actual_ml"],
             "full_strength_equivalent_ml": fse, "stop_verified": stop_ok,
-            "start_verified": start_verified, "estimate": est, **plan}
+            "start_verified": start_verified, "estimate": est,
+            "started": [port],
+            "delivered_ml_each": {port: plan["estimated_actual_ml"]}, **plan}
 
 
 # --------------------------------------------------------------------------- #
@@ -368,11 +386,15 @@ def timed_dose_pair(token: str, dev: dict, ports: list, speed: int, target_ml_ea
         "solution": solution, "target_ml_each": target_ml_each, "start_verified": False,
         "started_wall_ts": started_ts, "planned_stop_wall_ts": planned_stop_ts,
         "planned_on_ms": on_ms,
-        # Conservative (max) per-port flow so a crash estimate never under-counts.
+        # Scalar kept for backward compat (old readers); the per-port map is what the
+        # crash estimate SUMS -- both pumps run concurrently, so max() alone models one
+        # pump and under-counts a mid-pair power-loss estimate by ~2x.
         "flow_ml_min": max(plans[p]["flow_ml_min"] for p in ports),
+        "flow_ml_min_by_port": {p: plans[p]["flow_ml_min"] for p in ports},
     })
 
     start_mono = {}            # port -> monotonic clock at its own start
+    stop_mono = {}             # port -> monotonic clock at its stop WRITE (delivered est)
     started = []
     start_failed = None
     stop_results = {}
@@ -399,7 +421,18 @@ def timed_dose_pair(token: str, dev: dict, ports: list, speed: int, target_ml_ea
                 deadline = start_mono[p] + plans[p]["on_ms"] / 1000.0
                 _sleep_ms((deadline - time.monotonic()) * 1000.0)
                 _fast_stop(token, dev, p)
+                stop_mono[p] = time.monotonic()
     finally:
+        # First fire the raw stop WRITES for every port still missing one (the
+        # exception / failed-start paths) BEFORE any verification wait. Verifying port
+        # 1's stop first would leave port 2 pumping through that whole verify + retry
+        # (~4-40s, i.e. 3-30 mL of concentrate) -- the exact over-run the per-port fast
+        # stop prevents on the normal path. On the normal path every started port was
+        # already fast-stopped above, so this loop adds nothing.
+        for p in ports:
+            if p not in stop_mono:
+                _fast_stop(token, dev, p)
+                stop_mono[p] = time.monotonic()
         # Verify (with retry) EVERY port's stop now -- the ones fast-stopped above and
         # any never-started port -- and freeze on any unverified stop. This is also the
         # ONLY stop path on an exception. Runs on every exit path; _force_stop is
@@ -422,9 +455,22 @@ def timed_dose_pair(token: str, dev: dict, ports: list, speed: int, target_ml_ea
     per_port = {p: round(plans[p]["estimated_actual_ml"], 4) for p in ports}
     fse_each = {p: round(plans[p]["estimated_actual_ml"] * strength_factor(device, p), 4)
                 for p in ports}
+    # Best-available DELIVERED estimate per port so a partial pair (one pump ran, the
+    # other never started) is visible to the caller's lockout/outcome tracking: 0 for a
+    # never-started port, otherwise flow over the port's actual start->stop-write window,
+    # capped at the plan (ramp-up is charged at full flow, so this never under-counts).
+    delivered = {}
+    for p in ports:
+        if p not in start_mono:
+            delivered[p] = 0.0
+        else:
+            elapsed = max(0.0, stop_mono.get(p, time.monotonic()) - start_mono[p])
+            run_ml = plans[p]["flow_ml_min"] * speed * elapsed / 60.0
+            delivered[p] = round(min(plans[p]["estimated_actual_ml"], run_ml), 4)
     return {"ok": ok, "stop_results": stop_results, "started": started,
             "estimated_actual_ml_each": per_port,
             "full_strength_equivalent_ml_each": fse_each,
+            "delivered_ml_each": delivered,
             "start_failed": start_failed[0] if start_failed else None, "plans": plans}
 
 

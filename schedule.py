@@ -23,6 +23,7 @@ Env reference:
 """
 
 import os
+import time
 from datetime import datetime, time as dtime
 
 
@@ -84,6 +85,7 @@ def expected_light_state(now: datetime | None = None) -> dict:
     """
     {'on': bool, 'speed': int, 'device': str, 'port': int, 'reason': str}
     """
+    injected = now                      # None -> live clock (epoch anchor uses time.time())
     now = now or datetime.now()
     hours_on  = max(0, min(24, int(os.getenv("LIGHT_HOURS_ON",  "24"))))
     hours_off = max(0, min(24, int(os.getenv("LIGHT_HOURS_OFF", "0"))))
@@ -110,14 +112,23 @@ def expected_light_state(now: datetime | None = None) -> dict:
     cycle_total  = hours_on + hours_off  # normally 24
     minutes_now  = now.hour * 60 + now.minute
     minutes_zero = cycle_start.hour * 60 + cycle_start.minute
-    # Anchor the cycle phase to an ABSOLUTE, non-wrapping minute timeline so it stays
-    # continuous across midnight for ANY photoperiod -- not just ones whose hours_on +
-    # hours_off divides 24. Minute-of-day wraps 1439->0 at midnight; a cycle whose total
-    # doesn't divide 24 (e.g. 12/6 = 18h period) would otherwise reset its phase every
-    # midnight and silently run the wrong schedule (12/6 -> 18h on / 6h off). For a
-    # 24-summing cycle this reduces exactly to the old (minutes_now - minutes_zero) math.
-    abs_minutes  = now.toordinal() * 1440 + minutes_now
-    offset_min   = (abs_minutes - minutes_zero) % (cycle_total * 60)
+    if cycle_total == 24:
+        # Standard 24h-summing photoperiod: phase = wall-clock minute-of-day vs
+        # cycle_start. Local-clock anchored ON PURPOSE -- a 12/12 that starts at
+        # 18:00 stays pinned to 18:00 local across DST changes.
+        offset_min = (minutes_now - minutes_zero) % (cycle_total * 60)
+    else:
+        # Non-24h photoperiods (e.g. 12/6 = 18h period) free-run continuously, so
+        # anchor the phase to REAL elapsed time (epoch minutes), never local
+        # calendar math. Local-day arithmetic (toordinal*1440 + minute-of-day)
+        # assumes every day has 1440 minutes: the fall-back DST night repeats
+        # 01:00-01:59, replaying 60 phase minutes (lights could flip
+        # OFF->ON->OFF mid-dark-period), and any DST change permanently shifts
+        # the cycle 60 real minutes. Epoch time is DST-immune. minutes_zero
+        # stays in as the operator's phase knob (LIGHT_CYCLE_START); nothing is
+        # persisted -- phase is a pure function of the clock.
+        epoch_min  = int((now.timestamp() if injected is not None else time.time()) // 60)
+        offset_min = (epoch_min - minutes_zero) % (cycle_total * 60)
     on_total     = hours_on * 60
     cycle_tag    = (f"{hours_on}/{hours_off} cycle starting "
                     f"{cycle_start.strftime('%H:%M')}")

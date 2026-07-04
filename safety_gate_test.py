@@ -292,6 +292,104 @@ check("bloom wk9 CO2 clamps to wk8 (400)", ai_advisor._get_co2_target() == 400)
 check("bloom wk9 pH clamps to wk8 (6.0-6.5)", ai_advisor._get_ph_range() == (6.0, 6.5))
 
 
+print("\n== record_actions: executed STOPS never re-stamp lockout clocks (F6) ==")
+import time
+reset()
+# Drive nutrient + pH ports into lockout, note the clocks, then record executed stops.
+ai_advisor.record_actions([
+    {"device": "TestRes", "action": "dose", "playbook": "timed_nutrient_microdose", "ports": [1, 2]},
+    {"device": "TestRes", "action": "dose", "playbook": "timed_ph_down_microdose", "ports": [4]},
+])
+dose_clock_before = dict(ai_advisor._last_dose_time)
+ph_clock_before = ai_advisor._last_ph_time
+time.sleep(0.05)
+ai_advisor.record_actions([
+    {"device": "TestRes", "port": 1, "action": "set_speed", "value": 0},
+    {"device": "TestRes", "port": 4, "action": "set_speed", "value": 0},
+    {"device": "TestRes", "port": 2, "action": "set_outlet", "value": False},
+])
+check("executed stop leaves per-port dose clocks unchanged",
+      ai_advisor._last_dose_time == dose_clock_before)
+check("executed stop leaves the global pH clock unchanged",
+      ai_advisor._last_ph_time == ph_clock_before)
+ai_advisor.record_actions([{"device": "TestRes", "port": 1, "action": "set_speed", "value": 3}])
+check("a chemical-moving action still stamps its clock",
+      ai_advisor._last_dose_time["TestRes:1"] > dose_clock_before["TestRes:1"])
+
+# Full path: an executed stop DURING an active lockout must not restart it.
+reset()
+_orig_sps = acic.set_port_speed
+acic.set_port_speed = lambda *a, **k: None
+ai_advisor.record_actions([{"device": "TestRes", "action": "dose",
+                            "playbook": "timed_ph_down_microdose", "ports": [4]}])
+ph_before = ai_advisor._last_ph_time
+dose_before = dict(ai_advisor._last_dose_time)
+time.sleep(0.05)
+executed = ai_advisor.execute_actions(
+    {"actions": [{"device": "TestRes", "port": 4, "action": "set_speed", "value": 0}]},
+    DEVS, "SIM", snapshot=snap())
+check("stop executes during the active lockout (stops always allowed)", len(executed) == 1)
+check("in-lockout executed stop leaves the pH expiry unchanged",
+      ai_advisor._last_ph_time == ph_before)
+check("in-lockout executed stop leaves the dose clocks unchanged",
+      ai_advisor._last_dose_time == dose_before)
+acic.set_port_speed = _orig_sps
+
+
+print("\n== _execute_dose: PARTIAL pair delivery is tracked + stamps lockout (F7) ==")
+reset()
+os.environ["AUTONOMOUS_DOSING"] = "true"
+# Port 1 started and ran, port 2's start write failed -> ok=False but chem moved.
+dosing.timed_dose_pair = lambda *a, **k: {
+    "ok": False, "started": [1], "start_failed": 2,
+    "delivered_ml_each": {1: 3.2, 2: 0.0}, "stop_results": {1: True, 2: True}}
+executed = ai_advisor.execute_actions(
+    {"actions": [dose("timed_nutrient_microdose")]}, DEVS, "SIM", snapshot=snap())
+check("partial dose IS tracked (returned as executed)",
+      len(executed) == 1 and executed[0].get("partial") is True)
+check("partial tracked under its ':partial' playbook (own calibration bucket)",
+      executed[0]["playbook"] == "timed_nutrient_microdose:partial")
+check("partial tracks only the STARTED port(s)", executed[0]["ports"] == [1])
+check("partial carries the best delivered estimate",
+      executed[0]["delivered_ml_each"] == {1: 3.2, 2: 0.0})
+check("partial stamps the started port's dose lockout",
+      "TestRes:1" in ai_advisor._last_dose_time)
+check("never-started port is NOT locked out",
+      "TestRes:2" not in ai_advisor._last_dose_time)
+out = ai_advisor.filter_actions([dose("timed_nutrient_microdose")], snapshot=snap())
+check("next-cycle full re-dose blocked by the partial's lockout", out == [])
+
+# ok=False with NOTHING started (pre-check abort / frozen) stays untracked.
+reset()
+dosing.timed_dose_pair = lambda *a, **k: {"ok": False,
+                                          "reason": "port 2 not at 0 before pair dose"}
+executed = ai_advisor.execute_actions(
+    {"actions": [dose("timed_nutrient_microdose")]}, DEVS, "SIM", snapshot=snap())
+check("no-start failure stays untracked (no phantom lockout)",
+      executed == [] and ai_advisor._last_dose_time == {})
+
+# pH single-port partial (unverified stop) stamps the global pH clock too.
+reset()
+dosing.timed_dose = lambda *a, **k: {"ok": False, "started": [4],
+                                     "delivered_ml_each": {4: 0.5}, "stop_verified": False}
+executed = ai_advisor.execute_actions(
+    {"actions": [dose("timed_ph_down_microdose")]}, DEVS, "SIM", snapshot=snap())
+check("pH partial stamps the global pH lockout",
+      len(executed) == 1 and ai_advisor._last_ph_time > 0)
+
+# A dose that RAISES leaves chem state unknown -> conservatively stamps resolved ports.
+reset()
+def _raise_dose(*a, **k):
+    raise RuntimeError("boom mid-dose")
+dosing.timed_dose_pair = _raise_dose
+executed = ai_advisor.execute_actions(
+    {"actions": [dose("timed_nutrient_microdose")]}, DEVS, "SIM", snapshot=snap())
+check("raised dose is not in executed", executed == [])
+check("raised dose still stamps lockout for its resolved ports (conservative)",
+      "TestRes:1" in ai_advisor._last_dose_time and "TestRes:2" in ai_advisor._last_dose_time)
+os.environ.pop("AUTONOMOUS_DOSING", None)
+
+
 # =========================================================================== #
 print(f"\n{'='*48}\n  {_PASS} passed, {_FAIL} failed\n{'='*48}")
 import shutil

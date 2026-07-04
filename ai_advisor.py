@@ -640,6 +640,17 @@ def record_actions(actions: list):
             device = a.get("device")
             ports  = a.get("ports") or (a.get("_resolved") or {}).get("ports", [])
         else:
+            # STOPS never stamp the lockout clocks: an executed set_speed=0 / outlet-off
+            # moves no chemical, and re-stamping would let an AI that emits a stop each
+            # cycle hold the dose/pH lockout open FOREVER while the reservoir drifts.
+            # Only chemical-moving actions restart the clocks. (Mirrors the
+            # is_safety_dir stop exemption in filter_actions; a partial `dose` is NOT a
+            # stop -- it took the branch above and stamps.)
+            value = a.get("value", 0)
+            if a.get("action") == "set_speed" and int(value or 0) == 0:
+                continue
+            if a.get("action") == "set_outlet" and not bool(value):
+                continue
             device = a.get("device")
             ports  = [a.get("port")]
         for p in ports:
@@ -1567,6 +1578,24 @@ def _execute_dose(a: dict, dev: dict, token: str) -> dict | None:
     else:
         r = dosing.timed_dose_pair(token, dev, ports, speed, target_ml, solution=playbook)
     if not r.get("ok"):
+        started = r.get("started") or []
+        if started:
+            # PARTIAL delivery: at least one pump ran even though the dose did not
+            # complete cleanly (e.g. port 2's start write failed after port 1 was
+            # already pumping). Chem left the bottle, so the control loop MUST see it:
+            # return a tracked action so the started ports get their dose/pH lockout
+            # stamped and the outcome queued -- otherwise the next cycle re-fires the
+            # FULL playbook on top of this partial shot with no record of it. The
+            # ':partial' playbook tag keeps its outcome out of the clean playbook's
+            # calibration bucket (a cut-short delivery would skew the averages).
+            delivered = r.get("delivered_ml_each") or {}
+            print(f"  [EXEC] dose {playbook} on {device}: PARTIAL -- port(s) {started} "
+                  f"ran (est delivered {delivered} mL) before failure; tracking for "
+                  "lockout + outcome")
+            return {"device": device, "action": "dose",
+                    "playbook": f"{playbook}:partial", "kind": kind,
+                    "ports": list(started), "speed": speed, "target_ml": target_ml,
+                    "partial": True, "delivered_ml_each": delivered}
         print(f"  [EXEC] dose {playbook} on {device}: did NOT complete cleanly "
               f"({r.get('reason') or 'see [DOSE] log'}) -- not tracked")
         return None
@@ -1636,7 +1665,11 @@ def execute_actions(result: dict, devices: list[dict], token: str,
                 # timed_dose/timed_dose_pair already ran their finally (stop +
                 # freeze-on-unverified-stop) before this propagated -- the safety action
                 # is done. Just don't let the exception abort the rest of the loop.
+                # Chem state is UNKNOWN here (the dose may have partially delivered
+                # before raising), so conservatively stamp the resolved ports' dose/pH
+                # lockout: it only blocks chemical STARTS next cycle, never stops.
                 print(f"  [EXEC] dose {a.get('playbook')} on {a.get('device')} raised: {e}")
+                record_actions([a])
                 event_log.log_action_execution(
                     cycle_id, aid, executed=True, success=False, error=str(e),
                     device=a.get("device"), command_type="dose",
@@ -1644,8 +1677,9 @@ def execute_actions(result: dict, devices: list[dict], token: str,
                 continue
             event_log.log_action_execution(
                 cycle_id, aid, executed=done is not None,
-                success=done is not None, device=a.get("device"),
-                command_type="dose", playbook=a.get("playbook"),
+                success=bool(done) and not done.get("partial"),
+                device=a.get("device"), command_type="dose", playbook=a.get("playbook"),
+                partial=bool(done.get("partial")) if isinstance(done, dict) else None,
                 target_ml=(done or {}).get("target_ml") if isinstance(done, dict) else None)
             if done is not None:
                 executed.append(done)

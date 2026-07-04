@@ -408,6 +408,97 @@ def test_photoperiod_continuous_across_midnight():
         os.environ.pop(k, None)
 
 
+def test_photoperiod_dst_fallback_continuity():
+    # F12: the non-24h free-run anchor must be REAL elapsed time, not local
+    # calendar minutes. On the fall-back DST night the wall clock repeats
+    # 01:00-01:59; the old toordinal*1440 anchor replayed those 60 phase minutes
+    # (lights could flip OFF->ON->OFF mid-dark-period) and shifted the whole
+    # cycle 60 real minutes forever after. Sample a 12/6 cycle in real 5-min
+    # steps across America/New_York's 2026-11-01 fall-back and require every
+    # complete ON run to be 12h and every OFF run 6h of REAL time.
+    from datetime import datetime, timedelta, timezone
+    from zoneinfo import ZoneInfo
+    for k in ("PPFD_CONTROL", "LIGHT_SUNRISE_MIN", "LIGHT_SUNSET_MIN",
+              "GROW_START_DATE", "GROW_STAGE"):
+        os.environ.pop(k, None)
+    os.environ.update({"LIGHT_HOURS_ON": "12", "LIGHT_HOURS_OFF": "6",
+                       "LIGHT_CYCLE_START": "18:00", "LIGHT_INTENSITY": "10"})
+    ny = ZoneInfo("America/New_York")
+    t = datetime(2026, 10, 31, 16, 0, tzinfo=timezone.utc)   # noon EDT, day before
+    runs: list[tuple[bool, int]] = []
+    cur_state, cur_len = None, 0
+    for _ in range(48 * 12):                                 # 48 REAL hours, 5-min steps
+        on = schedule.expected_light_state(t.astimezone(ny))["on"]
+        if on == cur_state:
+            cur_len += 5
+        else:
+            if cur_state is not None:
+                runs.append((cur_state, cur_len))
+            cur_state, cur_len = on, 5
+        t += timedelta(minutes=5)
+    complete = runs[1:]   # drop the leading partial run; trailing partial never appended
+    on_runs  = [ln for st, ln in complete if st]
+    off_runs = [ln for st, ln in complete if not st]
+    check("DST fall-back: 12/6 ON runs stay 12h of REAL time (F12)",
+          on_runs and all(720 - 5 <= ln <= 720 + 5 for ln in on_runs))
+    check("DST fall-back: 12/6 OFF runs stay 6h of REAL time (F12)",
+          off_runs and all(360 - 5 <= ln <= 360 + 5 for ln in off_runs))
+    for k in ("LIGHT_HOURS_ON", "LIGHT_HOURS_OFF", "LIGHT_CYCLE_START", "LIGHT_INTENSITY"):
+        os.environ.pop(k, None)
+
+
+def test_photoperiod_24h_sum_byte_identical():
+    # F12 guard: 24h-summing cycles must NOT route through the epoch anchor --
+    # they stay pure wall-clock minute-of-day math, byte-identical to before
+    # (a 12/12 pinned to its local start time across DST). _NoEpoch trips if
+    # the code consults .timestamp() on the injected datetime.
+    from datetime import datetime
+
+    class _NoEpoch(datetime):
+        def timestamp(self):
+            raise AssertionError("24h-sum cycle consulted the epoch anchor")
+
+    for k in ("PPFD_CONTROL", "LIGHT_SUNRISE_MIN", "LIGHT_SUNSET_MIN",
+              "GROW_START_DATE", "GROW_STAGE"):
+        os.environ.pop(k, None)
+    os.environ.update({"LIGHT_HOURS_ON": "18", "LIGHT_HOURS_OFF": "6",
+                       "LIGHT_CYCLE_START": "06:00", "LIGHT_INTENSITY": "10"})
+    st = schedule.expected_light_state(_NoEpoch(2026, 6, 16, 12, 0))
+    check("24h-sum noon: ON plateau via minute-of-day math (no epoch anchor)",
+          st["on"] and st["speed"] == 10)
+    check("24h-sum noon: reason byte-identical to the old math",
+          st["reason"] == "18/6 cycle starting 06:00 -> ON plateau (t+6h00m)")
+    st = schedule.expected_light_state(_NoEpoch(2026, 6, 16, 5, 0))
+    check("24h-sum 05:00: OFF with the old t+23h phase",
+          not st["on"] and st["reason"] ==
+          "18/6 cycle starting 06:00 -> currently OFF (t+23h00m into cycle)")
+    for k in ("LIGHT_HOURS_ON", "LIGHT_HOURS_OFF", "LIGHT_CYCLE_START", "LIGHT_INTENSITY"):
+        os.environ.pop(k, None)
+
+
+def test_photoperiod_live_clock_epoch_anchor():
+    # F12: with no injected datetime the free-run anchor must come from
+    # time.time() epoch minutes. Parse the t+XhYYm phase tag out of the reason
+    # and match it against the offset computed straight from the epoch
+    # (tolerating a minute tick between the two reads).
+    import re
+    import time as _time
+    for k in ("PPFD_CONTROL", "LIGHT_SUNRISE_MIN", "LIGHT_SUNSET_MIN",
+              "GROW_START_DATE", "GROW_STAGE"):
+        os.environ.pop(k, None)
+    os.environ.update({"LIGHT_HOURS_ON": "12", "LIGHT_HOURS_OFF": "6",
+                       "LIGHT_CYCLE_START": "18:00", "LIGHT_INTENSITY": "10"})
+    e_before = int(_time.time() // 60)
+    st = schedule.expected_light_state()
+    e_after = int(_time.time() // 60)
+    m = re.search(r"t\+(\d+)h(\d\d)m", st["reason"])
+    got = int(m.group(1)) * 60 + int(m.group(2)) if m else -1
+    want = {(e - 1080) % 1080 for e in (e_before, e_after)}   # zero = 18:00 knob
+    check("live-clock free-run phase comes from epoch minutes (F12)", got in want)
+    for k in ("LIGHT_HOURS_ON", "LIGHT_HOURS_OFF", "LIGHT_CYCLE_START", "LIGHT_INTENSITY"):
+        os.environ.pop(k, None)
+
+
 def main():
     print("Schedule / emergency deterministic self-tests")
     print("=" * 44)
@@ -437,6 +528,9 @@ def main():
         test_schedule_delta_fan_mismatch,
         test_ppfd_controlled_light,
         test_photoperiod_continuous_across_midnight,
+        test_photoperiod_dst_fallback_continuity,
+        test_photoperiod_24h_sum_byte_identical,
+        test_photoperiod_live_clock_epoch_anchor,
     ):
         fn()
     print("=" * 44)

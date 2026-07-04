@@ -29,17 +29,31 @@ import asyncio
 import logging
 import os
 import signal
+import sqlite3
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from dotenv import load_dotenv
+
+# Load the same env files the poller/config layer loads. The daemon runs as
+# its own process -- without this, DOSER_PORTS_<SLUG> / PH_PORTS_<SLUG> /
+# CO2_VALVE are unset, the executor-side chemical guard classifies every port
+# as climate (silently voided), and BLE_<SLUG>_MAC resolution can't work.
+ENV_PATH    = Path(__file__).resolve().parent / ".env"
+LABELS_PATH = Path(__file__).resolve().parent / "labels.env"
+load_dotenv(ENV_PATH)
+load_dotenv(LABELS_PATH)
+
 from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
 from ac_infinity_ble.protocol import Protocol
+from ac_infinity_ble.util import crc16
 
 from utils import name_slug
+from ac_infinity_client import SENSOR_TYPE
 from aci_ble_lab import db
 from aci_ble_lab.safety import SafetyBlocked, guard_chemical_write
 
@@ -75,8 +89,22 @@ def resolve_address(device_name: str, cli_address: str | None) -> str:
     )
 
 
+# port_id in the sensor tail == the cloud sensorType integer, so the per-type
+# divisors from ac_infinity_client.SENSOR_TYPE apply (EC uS/cm + TDS ppm are
+# /10, most others /100 -- never a blanket /100). Zero-value handling mirrors
+# _parse_sensors: 0 means "no reading" except light(12)/water_level(20) where
+# 0 is legitimate (lights off, empty reservoir).
+_ALLOW_ZERO_TYPES = {12, 20}
+
+
 def decode_sensor_tail(data: bytes) -> list[dict]:
-    """Scan a 1EFF status packet's sensor tail for [port, type, v1, v2] groups."""
+    """Scan a 1EFF status packet's sensor tail for [port, type, v1, v2] groups.
+
+    Values are signed int16 scaled by the per-type divisor from
+    ac_infinity_client.SENSOR_TYPE (fallback /100 for unknown types, matching
+    the old behavior). The no-sensor sentinels (-32768/0x8000, and 0 outside
+    _ALLOW_ZERO_TYPES) are SKIPPED, not stored -- a disconnected probe must
+    not poison sensor_readings with phantom values like pH 327.68."""
     out: list[dict] = []
     i = 100
     while i <= len(data) - 4:
@@ -84,14 +112,57 @@ def decode_sensor_tail(data: bytes) -> list[dict]:
         if (0 <= port_id <= 31) and (
             (0x20 <= sensor_type <= 0x7F) or sensor_type in (0x91, 0x92, 0x93)
         ):
-            out.append({
-                "port": port_id, "sensor_type": sensor_type,
-                "value": ((v1 << 8) | v2) / 100.0,
-            })
-            i += 4
+            raw = (v1 << 8) | v2
+            if raw >= 0x8000:
+                raw -= 0x10000                      # signed int16
+            if raw != -32768 and (raw != 0 or port_id in _ALLOW_ZERO_TYPES):
+                _, divisor = SENSOR_TYPE.get(port_id, ("", 100.0))
+                out.append({
+                    "port": port_id, "sensor_type": sensor_type,
+                    "value": raw / divisor,
+                })
+            i += 4                                  # group consumed either way
         else:
             i += 1
     return out
+
+
+def frame_seq(data: bytes) -> int | None:
+    """Echoed request sequence from an A5 response header, or None.
+
+    The A5 header is `A5 xx [len16] [seq16] [crc16] ...` where the crc16
+    covers bytes 0-5 (same layout Protocol._add_head builds). Only trust the
+    seq bytes when that header CRC verifies, so an unknown firmware variant
+    degrades to order-based matching instead of dropping every poll."""
+    if len(data) < 8:
+        return None
+    if crc16(list(data[:6])) != [data[6], data[7]]:
+        return None
+    return (data[4] << 8) | data[5]
+
+
+def _next_seq(seq: int) -> int:
+    """Advance the request sequence, wrapped to the 16-bit field the protocol
+    header actually carries (Protocol._add_head truncates to two bytes). An
+    unbounded counter would stop matching frame_seq echoes after 65535 writes
+    -- a few days of 24/7 polling -- and every poll would then look 'late'."""
+    return (seq + 1) & 0xFFFF
+
+
+async def _next_a5(queue: "asyncio.Queue[bytes]", seq: int) -> bytes:
+    """Next A5 frame that belongs to request `seq`.
+
+    decode_port_response carries no port identifier, so matching by queue
+    order mis-attributes a late frame (one port times out, its A5 lands in
+    the NEXT port's window and gets credited to the wrong port). Frames whose
+    verifiable echoed sequence differs from `seq` are dropped; frames without
+    a verifiable header (frame_seq None) are accepted as before."""
+    while True:
+        frame = await queue.get()
+        echoed = frame_seq(frame)
+        if echoed is None or echoed == seq:
+            return frame
+        log.warning("Dropped late A5 frame (echoed seq=%d, expected %d)", echoed, seq)
 
 
 def decode_port_response(data: bytes) -> dict | None:
@@ -136,14 +207,22 @@ async def _pop_filtered(device_name: str) -> dict | None:
     The shared queue can carry rows for multiple controllers; the device-scoped claim
     simply never touches another daemon's rows -- they stay 'pending' for their own
     daemon (no cross-device requeue, so no livelock / unbounded queue growth / requeue
-    crash). A row enqueued under a now-frozen chemical port is rejected here (marked
-    failed) so the freeze is honored even if the writer raced the safety state change."""
+    crash). A stale chemical-START row is rejected here (marked failed) so the
+    interlock is honored even if the row predates an env/safety change -- chemical
+    STOPS (speed 0) always drain, freeze or not. A transient sqlite3 error (e.g. a
+    lock timeout from another daemon) skips this drain tick instead of killing the
+    session."""
     while True:
-        row = db.claim_next_command(device_name)
+        try:
+            row = db.claim_next_command(device_name)
+        except sqlite3.Error as e:
+            log.warning("Queue claim failed (%s); skipping this drain tick.", e)
+            return None
         if row is None:
             return None
         try:
-            guard_chemical_write(row["device"], row["port"])
+            guard_chemical_write(row["device"], row["port"],
+                                 work_type=row["work_type"], speed=row["speed"])
         except SafetyBlocked as e:
             db.mark_command_failed(row["id"], str(e))
             log.warning("Executor dropped row %d: %s", row["id"], e)
@@ -153,6 +232,12 @@ async def _pop_filtered(device_name: str) -> dict | None:
 
 async def _run_session(device_name: str, address: str,
                        poll_ports: list[int], poll_sec: int) -> None:
+    # Rows a dead daemon left in 'sent' (claim commits BEFORE the GATT write)
+    # would otherwise be lost silently -- fail them so the loss is visible.
+    swept = db.sweep_stale_sent(device_name)
+    if swept:
+        log.warning("Failed %d stale 'sent' row(s) from a previous daemon run.", swept)
+
     log.info("Scanning for %s (device=%s) ...", address, device_name)
     if not await _scan_until_found(address, timeout=60):
         log.warning("Controller not found within 60s scan window.")
@@ -172,7 +257,10 @@ async def _run_session(device_name: str, address: str,
             elif d[:2] == b"\x1e\xff":
                 sensors = decode_sensor_tail(d)
                 if sensors:
-                    db.add_sensor_readings(time.time(), device_name, sensors)
+                    try:
+                        db.add_sensor_readings(time.time(), device_name, sensors)
+                    except sqlite3.Error as e:
+                        log.warning("Sensor write skipped: %s", e)
                 nonlocal reading_count
                 reading_count += 1
 
@@ -206,17 +294,20 @@ async def _run_session(device_name: str, address: str,
 
             if poll_ports and (now - t_last_poll) >= poll_sec:
                 t_last_poll = now
-                while not a5_queue.empty():
-                    a5_queue.get_nowait()
                 for port in poll_ports:
-                    seq += 1
+                    seq = _next_seq(seq)
+                    # Flush before EACH request (not once per sweep) and match
+                    # the response by echoed seq -- a late frame from a
+                    # timed-out port must never be credited to the next one.
+                    while not a5_queue.empty():
+                        a5_queue.get_nowait()
                     try:
                         await client.write_gatt_char(
                             CHAR_WRITE,
                             proto.get_model_data(TYPE_MULTIPORT, port, seq),
                             response=False,
                         )
-                        resp = await asyncio.wait_for(a5_queue.get(), 3.0)
+                        resp = await asyncio.wait_for(_next_a5(a5_queue, seq), 3.0)
                         state = decode_port_response(resp)
                         if state:
                             db.add_port_state(
@@ -231,7 +322,7 @@ async def _run_session(device_name: str, address: str,
             pending = await _pop_filtered(device_name)
             if pending is not None:
                 try:
-                    seq += 1
+                    seq = _next_seq(seq)
                     ble_cmd = proto.set_level(
                         TYPE_MULTIPORT,
                         pending["work_type"], pending["speed"],
@@ -276,7 +367,10 @@ async def _main(device_name: str, address: str, poll_ports: list[int],
     while not stop.is_set():
         try:
             await _run_session(device_name, address, poll_ports, poll_sec)
-        except (BleakError, OSError) as e:
+        except (BleakError, OSError, sqlite3.Error) as e:
+            # sqlite3.Error: transient contention on the shared DB (e.g.
+            # BEGIN IMMEDIATE lock timeout) must back off + retry like a BLE
+            # drop, not kill the daemon -- queued stops still need draining.
             log.warning("Session error: %s", e)
         except asyncio.CancelledError:
             break

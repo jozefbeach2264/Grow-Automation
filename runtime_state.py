@@ -231,6 +231,26 @@ def get_active_dose() -> dict | None:
     return _load().get("active_dose")
 
 
+def _pid_alive(pid) -> bool:
+    """True if `pid` is a live process. os.kill(pid, 0) probes without signaling;
+    EPERM still means alive (a process owned by another user)."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
 def active_dose_window_ports() -> set:
     """Ports the watchdog should leave alone because an active dose genuinely still
     vouches for them (planned stop + ramp grace not yet passed). Returns a set so a
@@ -239,12 +259,14 @@ def active_dose_window_ports() -> set:
     ad = get_active_dose()
     if not ad or ad.get("status") != "pump_running":
         return set()
-    # Only an active dose from THIS live process vouches for a running pump. A record
-    # that survived a crash/restart (different pid, or a different boot_id after a
-    # reboot) must NOT protect a still-spinning pump -- otherwise startup recovery would
-    # skip the orphan it exists to stop. pid alone catches the cross-process case;
-    # boot_id additionally guards a (theoretical) pid reuse across a reboot.
-    if ad.get("pid") != os.getpid() or ad.get("boot_id") != boot_id():
+    # Only a LIVE writer's active dose vouches for a running pump -- and the writer is
+    # not always this process: the supervised bucket-calibration harnesses dose through
+    # timed_dose/timed_dose_pair while the poller's watchdog looks on, so the gate is
+    # LIVENESS (same boot AND the writer pid still running), not identity. A record that
+    # survived a crash (dead pid) or a reboot (boot_id changed) must NOT protect a
+    # still-spinning pump -- otherwise startup recovery would skip the very orphan it
+    # exists to stop.
+    if ad.get("boot_id") != boot_id() or not _pid_alive(ad.get("pid")):
         return set()
     planned_stop = ad.get("planned_stop_wall_ts")
     if planned_stop is None:
@@ -275,7 +297,17 @@ def estimate_interrupted_dose(active_dose: dict, stop_wall_ts: float) -> dict:
     # Use the real per-port flow rate the dose was planned with (persisted in the record)
     # so a FLOW_ML_MIN_* override isn't silently ignored -- a hardcoded 21 UNDER-counts
     # delivered chem on a faster pump (the misleading direction). Fall back to the spec.
+    # A PAIR record carries flow_ml_min_by_port: BOTH pumps run concurrently, so the
+    # bracket must SUM the per-port flows -- the scalar (max) alone models one pump and
+    # under-counts a mid-pair power loss by ~2x. Old single-flow records are unchanged.
+    # (Keys may be strings after a JSON round-trip; only the values matter here.)
     rec_flow = active_dose.get("flow_ml_min")
+    flows_by_port = active_dose.get("flow_ml_min_by_port")
+    if isinstance(flows_by_port, dict) and flows_by_port:
+        try:
+            rec_flow = sum(float(f) for f in flows_by_port.values())
+        except (TypeError, ValueError):
+            pass   # malformed map -> fall back to the scalar / spec below
     try:
         flow_ml_min = float(rec_flow) * speed if rec_flow else speed * 21.0
     except (TypeError, ValueError):

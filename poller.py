@@ -797,7 +797,11 @@ def main():
                 # --- Away-mode triage (deterministic; inert unless AWAY_MODE) ---
                 # Runs in both modes: detects + alerts + logs intent always,
                 # actuates LIVE climate playbooks only when not ADVISORY_MODE.
-                away_fired = away_mode.run(snapshot, devices, token, cycle_id)
+                # executed_actions is passed so planning sees the speeds already
+                # written this cycle -- never step a port below a same-cycle raise
+                # planned off the stale snapshot.
+                away_fired = away_mode.run(snapshot, devices, token, cycle_id,
+                                           cycle_actions=executed_actions)
                 if away_fired:
                     executed_actions.extend(away_fired)
                     active = True

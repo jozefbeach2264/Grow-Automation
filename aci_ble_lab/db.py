@@ -43,6 +43,22 @@ def _conn() -> sqlite3.Connection:
 
 _VALID_WORK_TYPES = {0, 1, 2, 3, 4}  # 0=off-mode, 2=on-mode, etc per protocol
 
+# Commands are only meaningful near the moment they were issued -- a stale
+# set_speed firing hours after a BLE outage could land against a completely
+# different reservoir/climate state. Rows older than the TTL are marked
+# 'expired' at claim time and never executed. STOPS (speed 0) are exempt:
+# executing an old stop is at worst a no-op, dropping one could leave a pump
+# running. Env-overridable via BLE_CMD_TTL_S (re-read each call, same dynamic
+# model as the port classification).
+_DEFAULT_CMD_TTL_S = 180.0
+
+
+def _cmd_ttl_s() -> float:
+    try:
+        return float(os.getenv("BLE_CMD_TTL_S", "").strip() or _DEFAULT_CMD_TTL_S)
+    except ValueError:
+        return _DEFAULT_CMD_TTL_S
+
 
 def init_schema() -> None:
     with _conn() as c:
@@ -91,8 +107,10 @@ def enqueue_command(device: str, port: int, work_type: int, speed: int,
                     source: str = "poller") -> int:
     """Validate, gate, and enqueue a BLE control command. Returns the new row id.
 
-    Raises ValueError on out-of-range inputs and SafetyBlocked on a chemical
-    write during a dosing freeze."""
+    Raises ValueError on out-of-range inputs and SafetyBlocked on any chemical
+    START (the BLE layer moves no chemicals -- delivery goes through the
+    bounded dose verb on the cloud path). Chemical STOPS (speed 0) always
+    pass, dosing freeze or not."""
     if not (0 <= port <= 15):
         raise ValueError(f"port {port} out of range (0-15)")
     if not (0 <= speed <= 10):
@@ -102,7 +120,7 @@ def enqueue_command(device: str, port: int, work_type: int, speed: int,
     if not device:
         raise ValueError("device name is required")
 
-    guard_chemical_write(device, port)
+    guard_chemical_write(device, port, work_type=work_type, speed=speed)
 
     with _conn() as c:
         r = c.execute(
@@ -122,11 +140,22 @@ def claim_next_command(device: str) -> dict | None:
     SELECT-then-UPDATE allowed a double-claim -> double dose), and a daemon never touches
     another controller's rows -- foreign rows stay 'pending' for their own daemon instead
     of being requeued (which livelocked the drain loop and could grow the queue without
-    bound)."""
+    bound).
+
+    Staleness cutoff: pending non-stop rows older than BLE_CMD_TTL_S are marked
+    'expired' inside the same transaction and skipped -- a start enqueued during a
+    BLE outage must not fire hours later. Stops are exempt (see _cmd_ttl_s)."""
     c = _conn()
     c.isolation_level = None                 # manage the transaction explicitly
     try:
         c.execute("BEGIN IMMEDIATE")         # take the write lock up front
+        now = time.time()
+        c.execute(
+            "UPDATE command_queue SET status='expired', done_at=?, "
+            "error='expired: exceeded BLE_CMD_TTL_S before a daemon claimed it' "
+            "WHERE status='pending' AND device=? AND speed>0 AND ts<?",
+            (now, device, now - _cmd_ttl_s()),
+        )
         row = c.execute(
             "SELECT * FROM command_queue WHERE status='pending' AND device=? "
             "ORDER BY id LIMIT 1",
@@ -182,6 +211,25 @@ def mark_command_failed(cmd_id: int, error: str = "") -> None:
             "UPDATE command_queue SET status='failed', done_at=?, error=? WHERE id=?",
             (time.time(), error[:500], cmd_id),
         )
+
+
+def sweep_stale_sent(device: str) -> int:
+    """Fail rows stuck in 'sent' longer than BLE_CMD_TTL_S. Returns the count.
+
+    The claim commits 'sent' BEFORE the GATT write goes out, so a daemon that
+    crashed between the two leaves the row 'sent' forever -- never retried,
+    never failed, silently lost while the caller believes it was handled.
+    Called at daemon session start so the loss becomes visible instead."""
+    now = time.time()
+    with _conn() as c:
+        cur = c.execute(
+            "UPDATE command_queue SET status='failed', done_at=?, "
+            "error='stale sent row swept at daemon start -- a previous daemon "
+            "likely died before/at the GATT write' "
+            "WHERE status='sent' AND device=? AND sent_at<?",
+            (now, device, now - _cmd_ttl_s()),
+        )
+        return cur.rowcount
 
 
 def add_port_state(ts: float, device: str, port: int,

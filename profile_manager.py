@@ -300,13 +300,28 @@ def record_outcomes(current_snapshot: dict):
 
         print(f"  [CAL] {key}  ->  {entry['averages']}  ({entry['count']} obs)")
 
-    # Persist calibration BEFORE dropping the settled entries from the queue. A crash
-    # between the two writes then re-settles those entries next cycle (a second, slightly
-    # later observation for a noise-averaged table) instead of losing them entirely.
-    _save(strain, profile)
+    # Drain the settled entries from the IN-MEMORY queue FIRST. The disk writes below
+    # can fail (unwritable profiles dir), and if the batch stayed queued in memory it
+    # would re-settle and re-raise identically on EVERY poll cycle -- record_outcomes
+    # runs ahead of the poller's deterministic safety enforcement (doser watchdog,
+    # res-burst, CO2/temp emergencies, schedule), so a persistent raise here would
+    # starve all of it indefinitely.
     _pending.clear()
     _pending.extend(keep)
-    _save_pending()
+
+    # Persist calibration BEFORE dropping the settled entries from the ON-DISK queue. A
+    # crash between the two writes then re-settles those entries after restart (a second,
+    # slightly later observation for a noise-averaged table) instead of losing them
+    # entirely. A disk FAILURE is contained -- logged loudly, never raised -- so one bad
+    # disk costs at most this batch's calibration, never the poll cycle's safety checks.
+    try:
+        _save(strain, profile)
+        _save_pending()
+    except Exception as e:
+        print(f"  [CAL] WARNING: could not persist calibration/pending queue: {e}")
+        from runtime_state import record_event
+        record_event("calibration_save_failed", strain=strain,
+                     settled=len(settle), error=str(e))
 
 
 # ---------------------------------------------------------------------------

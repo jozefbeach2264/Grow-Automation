@@ -70,7 +70,27 @@ def _light_floor() -> int:
 # playbook can't help right now (role missing/offline, or already at the cap so
 # the action would be a no-op). A None means "try the next playbook".
 # --------------------------------------------------------------------------- #
-def _plan_increase_exhaust(snapshot: dict) -> dict | None:
+def _same_cycle_speed(cycle_actions: list | None, dev: str, port: int) -> int | None:
+    """Highest set_speed already WRITTEN to (dev, port) earlier this cycle (the
+    AI / schedule fallback / emergency layers all run before away-mode), or None.
+    The snapshot speed predates those writes, so planning from it alone could
+    command a speed BELOW a stronger correction that just went out."""
+    best = None
+    for a in cycle_actions or []:
+        if not isinstance(a, dict) or a.get("action") != "set_speed":
+            continue
+        if a.get("device") != dev or a.get("port") != port:
+            continue
+        try:
+            v = int(a.get("value"))
+        except (TypeError, ValueError):
+            continue
+        if best is None or v > best:
+            best = v
+    return best
+
+
+def _plan_increase_exhaust(snapshot: dict, cycle_actions: list | None = None) -> dict | None:
     # The high-temp guardrail AND the CO2 dump both force the exhaust to max during an
     # active emergency -- don't fight either with a +1 step. The snapshot speed read
     # below predates this cycle's emergency enforcement, so a stale value could otherwise
@@ -83,6 +103,12 @@ def _plan_increase_exhaust(snapshot: dict) -> dict | None:
     if p is None:
         return None
     cur = int(p.get("speed") or 0)
+    # Effective current speed = max(snapshot, same-cycle write): if the AI or the
+    # schedule already raised this port this cycle, step up FROM that raise --
+    # never overwrite it with a lower speed planned off the stale snapshot.
+    written = _same_cycle_speed(cycle_actions, dev, port)
+    if written is not None and written > cur:
+        cur = written
     mx = _exhaust_max()
     if cur >= mx:
         return None  # already at cap -> no-op
@@ -91,7 +117,7 @@ def _plan_increase_exhaust(snapshot: dict) -> dict | None:
             "reason": f"exhaust {cur}->{target} to shed heat/VPD/CO2 load"}
 
 
-def _plan_reduce_light(snapshot: dict) -> dict | None:
+def _plan_reduce_light(snapshot: dict, cycle_actions: list | None = None) -> dict | None:
     dev, port = _parse_role("ROLE_LIGHT", ("4 x 4", 1))
     p = _find_port(snapshot, dev, port)
     if p is None:
@@ -104,7 +130,7 @@ def _plan_reduce_light(snapshot: dict) -> dict | None:
             "reason": f"light {cur}->{cur - 1} to ease heat/VPD (advisory: schedule pins intensity)"}
 
 
-def _plan_disable_co2(snapshot: dict) -> dict | None:
+def _plan_disable_co2(snapshot: dict, cycle_actions: list | None = None) -> dict | None:
     valve = _co2_outlet()
     if valve is None:
         return None
@@ -130,7 +156,8 @@ _DISPATCH: dict[str, tuple[str, object]] = {
 }
 
 
-def _plan_for(playbook: str, snapshot: dict) -> dict | None:
+def _plan_for(playbook: str, snapshot: dict,
+              cycle_actions: list | None = None) -> dict | None:
     """Return a bounded action for `playbook`, or None if not applicable. Chemical
     playbooks (no planner) return an intent stub -- they are dry-run/logged only."""
     mode, planner = _DISPATCH.get(playbook, (None, None))
@@ -139,16 +166,18 @@ def _plan_for(playbook: str, snapshot: dict) -> dict | None:
             return {"playbook": playbook, "intent": True,
                     "reason": f"{playbook} would be considered (chemical, gated/dry-run)"}
         return None
-    return planner(snapshot)
+    return planner(snapshot, cycle_actions)
 
 
 # --------------------------------------------------------------------------- #
 # selection
 # --------------------------------------------------------------------------- #
-def select(snapshot: dict) -> dict | None:
+def select(snapshot: dict, cycle_actions: list | None = None) -> dict | None:
     """Pick the dispatch for this cycle from snapshot.diagnostics. Returns
     {worst, dispatch} or None when there are no stressors. `dispatch` is the
-    chosen {stressor, severity, playbook, mode, plan} or None (alert-only)."""
+    chosen {stressor, severity, playbook, mode, plan} or None (alert-only).
+    `cycle_actions` = actions already executed this cycle, so planners see
+    same-cycle writes the snapshot predates."""
     stressors = (snapshot.get("diagnostics") or {}).get("stressors") or []
     if not stressors:
         return None
@@ -158,7 +187,7 @@ def select(snapshot: dict) -> dict | None:
         for pb in s.get("allowed_playbooks", []):
             if pb == ALERT_ONLY:
                 continue
-            plan = _plan_for(pb, snapshot)
+            plan = _plan_for(pb, snapshot, cycle_actions)
             if plan is not None:
                 mode, _ = _DISPATCH.get(pb, ("alert", None))
                 chosen = {"stressor": s["name"], "severity": s["severity"],
@@ -174,14 +203,18 @@ def select(snapshot: dict) -> dict | None:
 # run
 # --------------------------------------------------------------------------- #
 def run(snapshot: dict, devices: list, token: str,
-        cycle_id: str | None = None) -> list:
+        cycle_id: str | None = None,
+        cycle_actions: list | None = None) -> list:
     """Evaluate + (when live) actuate away-mode triage. Inert unless AWAY_MODE.
     Always alerts on the worst stressor and logs the chosen dispatch; actuates a
-    LIVE climate playbook only when not ADVISORY_MODE. Returns executed actions."""
+    LIVE climate playbook only when not ADVISORY_MODE. `cycle_actions` = the
+    actions already executed earlier this cycle (poller's running list), so
+    step-up planning never downgrades a same-cycle raise. Returns executed
+    actions."""
     if not _enabled():
         return []
 
-    sel = select(snapshot)
+    sel = select(snapshot, cycle_actions)
     if sel is None:
         return []
 

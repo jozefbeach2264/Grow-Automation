@@ -323,6 +323,78 @@ finally:
     runtime_state.boot_id = _orig_boot
 
 
+print("\n== runtime_state: LIVE cross-process dose vouches; dead/rebooted does not (F9) ==")
+# The supervised bucket-calibration harnesses dose from a DIFFERENT process while the
+# poller's watchdog looks on -- a live foreign writer's in-window record must vouch for
+# the pump (liveness, not identity), or the watchdog kills the calibration dose and
+# trips the persistent freeze mid-observation.
+reset_state()
+
+
+def _pair_record(pid=None, boot=None):
+    runtime_state.begin_active_dose({
+        "device": "RDWC Control", "dev_id": "d-rdwc", "port": 4, "speed": 2,
+        "started_wall_ts": time.time(), "planned_stop_wall_ts": time.time() + 60,
+    })
+    ad = runtime_state.get_active_dose()
+    if pid is not None:
+        ad["pid"] = pid
+    if boot is not None:
+        ad["boot_id"] = boot
+    runtime_state._save({"heartbeat": None, "active_dose": ad, "high_alert": None})
+
+
+# pid 1 (init) is always alive but not ours: os.kill(1, 0) -> EPERM -> alive.
+_pair_record(pid=1)
+check("LIVE foreign pid + same boot vouches for the dose window",
+      runtime_state.active_dose_window_ports() == {4})
+
+# A reaped child is a deterministic DEAD pid on this boot.
+import subprocess
+_proc = subprocess.Popen(["true"]); _proc.wait()
+_pair_record(pid=_proc.pid)
+check("DEAD writer pid does not vouch (crash orphan still caught)",
+      runtime_state.active_dose_window_ports() == set())
+
+# Live pid but a different boot_id (record survived a reboot; theoretical pid reuse).
+_pair_record(pid=1, boot="not-this-boot")
+check("different boot_id does not vouch even with a live pid",
+      runtime_state.active_dose_window_ports() == set())
+
+check("_pid_alive: own pid alive", runtime_state._pid_alive(os.getpid()) is True)
+check("_pid_alive: None/garbage/nonpositive are dead",
+      runtime_state._pid_alive(None) is False and
+      runtime_state._pid_alive("x") is False and runtime_state._pid_alive(0) is False)
+runtime_state.clear_active_dose()
+
+
+print("\n== runtime_state: pair crash-estimate SUMS concurrent pumps (F14) ==")
+# Both nutrient pumps run at once; a power loss 30s into the pair must estimate the
+# TOTAL delivered (both pumps), not one pump's worth -- the old max()-flow record
+# under-counted the overdose window ~2x and the operator under-reacts.
+ad_pair = {"speed": 2, "start_verified": True, "started_wall_ts": 1000.0,
+           "flow_ml_min": 21.0, "flow_ml_min_by_port": {1: 21.0, 2: 21.0}}
+est_pair = runtime_state.estimate_interrupted_dose(ad_pair, stop_wall_ts=1030.0)
+check("pair record sums per-port flows (42 mL, ~2x the single-pump 21)",
+      abs(est_pair["estimated_actual_ml_max"] - 42.0) < 0.01)
+ad_single = {"speed": 2, "start_verified": True, "started_wall_ts": 1000.0,
+             "flow_ml_min": 21.0}
+est_single = runtime_state.estimate_interrupted_dose(ad_single, stop_wall_ts=1030.0)
+check("old single-flow record unchanged (21 mL)",
+      abs(est_single["estimated_actual_ml_max"] - 21.0) < 0.01)
+# After a crash the record round-trips through JSON -> dict keys become strings.
+ad_json = {"speed": 2, "start_verified": True, "started_wall_ts": 1000.0,
+           "flow_ml_min": 21.0, "flow_ml_min_by_port": {"1": 21.0, "2": 42.0}}
+est_json = runtime_state.estimate_interrupted_dose(ad_json, stop_wall_ts=1030.0)
+check("JSON string-keyed pair map still sums (63 * 2 * 0.5 = 63 mL)",
+      abs(est_json["estimated_actual_ml_max"] - 63.0) < 0.01)
+ad_bad = {"speed": 2, "start_verified": True, "started_wall_ts": 1000.0,
+          "flow_ml_min": 21.0, "flow_ml_min_by_port": {"1": "garbage"}}
+est_bad = runtime_state.estimate_interrupted_dose(ad_bad, stop_wall_ts=1030.0)
+check("malformed pair map falls back to the scalar (21 mL)",
+      abs(est_bad["estimated_actual_ml_max"] - 21.0) < 0.01)
+
+
 # =========================================================================== #
 print(f"\n{'='*48}")
 print(f"  {_PASS} passed, {_FAIL} failed")

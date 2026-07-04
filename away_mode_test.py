@@ -81,9 +81,10 @@ def snap_with(stressors, **extra):
     return s
 
 
-def run(snapshot):
+def run(snapshot, cycle_actions=None):
     _writes.clear()
-    return away_mode.run(snapshot, DEVS, "TOK", cycle_id="C1")
+    return away_mode.run(snapshot, DEVS, "TOK", cycle_id="C1",
+                         cycle_actions=cycle_actions)
 
 
 # --- gating ------------------------------------------------------------------
@@ -141,6 +142,66 @@ def test_custom_step():
           AWAY_EXHAUST_STEP="3", AWAY_EXHAUST_MAX="10")
     run(snap_with(["tent_temp_high"], exhaust_speed=4))
     check("custom step 4->7", _writes == [("speed", "D1", 2, 7)])
+
+
+# --- same-cycle writes: never downgrade a raise that already went out ---------
+
+def test_same_cycle_raise_not_downgraded():
+    # AI raised exhaust 4->8 earlier this cycle; the snapshot still says 4.
+    # Away-mode must plan from the effective 8, never write below it.
+    reset(AWAY_MODE="true", ADVISORY_MODE="false", ROLE_EXHAUST="4 x 4:2",
+          AWAY_EXHAUST_STEP="1", AWAY_EXHAUST_MAX="10")
+    acts = [{"device": "4 x 4", "port": 2, "action": "set_speed", "value": 8}]
+    run(snap_with(["tent_temp_high"], exhaust_speed=4), cycle_actions=acts)
+    check("same-cycle raise: steps from 8 not 4", _writes == [("speed", "D1", 2, 9)])
+    check("same-cycle raise: nothing written below 8",
+          all(w[3] >= 8 for w in _writes if w[0] == "speed" and w[2] == 2))
+
+
+def test_same_cycle_raise_at_cap_no_op():
+    # Same-cycle write already at the cap -> exhaust step is a no-op (falls
+    # through to reduce_light, which is advisory) -> no write at all.
+    reset(AWAY_MODE="true", ADVISORY_MODE="false", ROLE_EXHAUST="4 x 4:2",
+          AWAY_EXHAUST_MAX="10")
+    acts = [{"device": "4 x 4", "port": 2, "action": "set_speed", "value": 10}]
+    out = run(snap_with(["tent_temp_high"], exhaust_speed=4), cycle_actions=acts)
+    check("same-cycle write at cap: no exhaust write", _writes == [] and out == [])
+
+
+def test_same_cycle_write_other_port_ignored():
+    # A raise on a DIFFERENT port must not affect exhaust planning.
+    reset(AWAY_MODE="true", ADVISORY_MODE="false", ROLE_EXHAUST="4 x 4:2",
+          AWAY_EXHAUST_STEP="1", AWAY_EXHAUST_MAX="10")
+    acts = [{"device": "4 x 4", "port": 1, "action": "set_speed", "value": 8}]
+    run(snap_with(["tent_temp_high"], exhaust_speed=4), cycle_actions=acts)
+    check("other-port write ignored (4->5)", _writes == [("speed", "D1", 2, 5)])
+
+
+def test_same_cycle_lower_write_uses_snapshot():
+    # Effective speed = max(snapshot, same-cycle write): a same-cycle STOP/lower
+    # write never pulls the planning base below the snapshot.
+    reset(AWAY_MODE="true", ADVISORY_MODE="false", ROLE_EXHAUST="4 x 4:2",
+          AWAY_EXHAUST_STEP="1", AWAY_EXHAUST_MAX="10")
+    acts = [{"device": "4 x 4", "port": 2, "action": "set_speed", "value": 0}]
+    run(snap_with(["tent_temp_high"], exhaust_speed=4), cycle_actions=acts)
+    check("same-cycle lower write: plans from snapshot (4->5)",
+          _writes == [("speed", "D1", 2, 5)])
+
+
+def test_same_cycle_junk_entries_tolerated():
+    # Non-set_speed / malformed entries (dose, set_outlet, bad value) in the
+    # cycle-actions list must be skipped, not crash planning.
+    reset(AWAY_MODE="true", ADVISORY_MODE="false", ROLE_EXHAUST="4 x 4:2",
+          AWAY_EXHAUST_STEP="1", AWAY_EXHAUST_MAX="10")
+    acts = [
+        {"device": "Hydroponics Control", "action": "dose", "playbook": "timed_ph_down_microdose"},
+        {"device": "4 x 4", "port": 2, "action": "set_outlet", "value": True},
+        {"device": "4 x 4", "port": 2, "action": "set_speed", "value": "junk"},
+        {"device": "4 x 4", "port": 2, "action": "set_speed", "value": 7},
+    ]
+    run(snap_with(["tent_temp_high"], exhaust_speed=4), cycle_actions=acts)
+    check("junk entries skipped, valid raise honored (7->8)",
+          _writes == [("speed", "D1", 2, 8)])
 
 
 # --- advisory / dry: log intent, never actuate -------------------------------
@@ -209,6 +270,11 @@ def main():
         test_exhaust_yields_to_guardrail,
         test_exhaust_yields_to_co2_emergency,
         test_custom_step,
+        test_same_cycle_raise_not_downgraded,
+        test_same_cycle_raise_at_cap_no_op,
+        test_same_cycle_write_other_port_ignored,
+        test_same_cycle_lower_write_uses_snapshot,
+        test_same_cycle_junk_entries_tolerated,
         test_advisory_mode_no_actuation,
         test_reduce_light_is_advisory,
         test_chemical_playbook_dry_run,

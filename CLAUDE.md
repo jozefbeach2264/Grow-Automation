@@ -101,7 +101,7 @@ Ports 3+4 are pH ports via `PH_PORTS_HYDROPONICS_CONTROL=3,4` — safety gate ap
 | `diagnostics.py` | Deterministic stressor list + code-owned playbook registry (away-mode triage foundation; READ-ONLY, no actuation) |
 | `diagnostics_test.py` | Self-tests for the stressor list + registry (32 cases) |
 | `away_mode.py` | Away-mode triage executor: code-driven worst-first playbook dispatch (climate-only live, chemical/CO2 dry-run) |
-| `away_mode_test.py` | Self-tests for the away-mode executor (17 cases) |
+| `away_mode_test.py` | Self-tests for the away-mode executor (24 checks) |
 | `ppfd.py` | Light/PPFD framework: PPFD-map loader, grid stats, height interpolation, DLI math, level recommendation (advisory) |
 | `ppfd_capture.py` | Interactive ingest tool — records an Apogee PPFD grid per level x height into `ppfd_map.json` |
 | `ppfd_test.py` | Self-tests for the PPFD framework (37 cases, synthetic map) |
@@ -150,17 +150,26 @@ existing safety code can use.
 
 **Safety model -- defense in depth.** `aci_ble_lab.safety.guard_chemical_write`
 classifies a port as chemical (it's in `DOSER_PORTS_<SLUG>`,
-`PH_PORTS_<SLUG>`, or it is the `CO2_VALVE` outlet) and rejects the write if
-`safety_state.dosing_disable_status()` is active. This guard runs in BOTH
+`PH_PORTS_<SLUG>`, or it is the `CO2_VALVE` outlet) and rejects ALL chemical
+STARTS at the BLE layer, freeze or not -- chemicals move ONLY via the bounded
+cloud dose verb; the dosing freeze merely annotates the rejection message.
+Stops (speed 0) ALWAYS pass, in any state. Legacy calls without a speed arg
+are conservatively treated as starts. The guard runs in BOTH
 `enqueue_command` AND the executor in `ble_logger.py` -- a row that became
-stale during a freeze drops at the daemon before the write goes out.
-Classification is recomputed on every call so `.env` edits take effect
-mid-run (same model as `schedule.py`).
+stale before the daemon drained it drops at the executor before the write
+goes out. Queued commands also carry a TTL (`BLE_CMD_TTL_S`, default 180s):
+stale pending STARTS are marked `expired` at claim instead of firing late,
+and rows stuck in `sent` after a daemon crash are swept to `failed` at
+session start (stops are exempt from both). Classification is recomputed on
+every call so `.env` edits take effect mid-run (same model as `schedule.py`).
 
 **Wiring.** Each controller needs `BLE_<SLUG>_MAC=AA:BB:CC:DD:EE:FF` in
-`.env`, where `<SLUG>` is `name_slug(device_name)`. Run the daemon as:
-`python ble_logger.py --device-name "4 x 4"`. Per-device daemons share the
-queue; each silently re-queues rows addressed to a different device.
+`.env`, where `<SLUG>` is `name_slug(device_name)`. `ble_logger.py`
+self-loads `.env` + `labels.env` at import, so port classification and MAC
+resolution work in the daemon's own process (no exported env needed). Run the
+daemon as: `python ble_logger.py --device-name "4 x 4"`. Per-device daemons
+share the queue; each silently re-queues rows addressed to a different
+device.
 
 **What the BLE channel buys you.** ~1Hz local telemetry vs the cloud poller's
 60s active interval, no dependency on AC Infinity's cloud (works during
@@ -581,7 +590,10 @@ stressor's top allowed playbook (one dispatch + one alert per cycle).
     1), capped at `AWAY_EXHAUST_MAX` (10). No-op (skips to next playbook) when already at cap.
     **Yields to the high-temp guardrail** -- returns None while `temp_emergency` is active so it
     doesn't fight the fan the guardrail is slamming to max. Composes nicely: away-mode ramps
-    exhaust as the tent climbs 85->95F, the guardrail catches >=95F.
+    exhaust as the tent climbs 85->95F, the guardrail catches >=95F. Plans from
+    `max(snapshot speed, same-cycle writes)`: `run()` takes `cycle_actions` (the poller passes
+    its `executed_actions` list), so a stale snapshot can never downgrade a stronger raise
+    written earlier in the same cycle; if that write is already at/above the cap, no-op.
   - `reduce_light_one_step` -> **advisory** (never actuates yet): the schedule enforcer pins
     light intensity, so going live needs a schedule-aware light override (deferred).
   - `disable_co2` -> **dry** (valve disconnected); `timed_*_microdose` -> **dry** (Tier 3,
@@ -592,7 +604,7 @@ stressor's top allowed playbook (one dispatch + one alert per cycle).
   worst stressor (always alerted) + the chosen dispatch (or None -> alert-only).
 - **Ledger.** Every dispatch logs an `action_request` (source `away_mode`) + `action_validation`
   (stage `away_dispatch`) + `action_execution`; alerts log an `alert` event. Tests:
-  `away_mode_test.py` (17 cases).
+  `away_mode_test.py` (24 checks).
 - Config: `AWAY_MODE`, `AWAY_EXHAUST_STEP`, `AWAY_EXHAUST_MAX`, `AWAY_LIGHT_FLOOR`.
 - **Deferred:** the AI `selected_playbook` contract change; live light reduction (needs the
   schedule override); live chemical/CO2 playbooks (need HDS3 + reconnected hardware); a real

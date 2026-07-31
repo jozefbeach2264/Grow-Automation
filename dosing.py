@@ -29,6 +29,7 @@ import time
 
 from utils import name_slug
 from ac_infinity_client import set_port_speed, read_port_state, stop_and_verify
+import proc_lock
 import runtime_state
 import safety_state
 
@@ -185,10 +186,102 @@ def calculate_timed_dose(speed: int, target_ml: float,
 # --------------------------------------------------------------------------- #
 # stop helper (command 0 -> verify -> one retry). Freeze policy is the caller's.
 # --------------------------------------------------------------------------- #
+def _ble_fallback_enabled() -> bool:
+    return os.getenv("BLE_STOP_FALLBACK", "true").strip().lower() != "false"
+
+
+def _ble_configured(device: str) -> bool:
+    """True when a BLE MAC is configured for this controller -- i.e. a `ble_logger`
+    daemon could plausibly be draining the queue. Same resolution order the daemon
+    itself uses (BLE_<SLUG>_MAC, then BLE_DEFAULT_MAC). Checked before falling back
+    so that on a system with no BLE set up the fallback costs nothing: with no daemon
+    the wait below could only ever time out, delaying the freeze during an emergency
+    for no possible gain."""
+    return bool(os.getenv(f"BLE_{name_slug(device)}_MAC", "").strip()
+                or os.getenv("BLE_DEFAULT_MAC", "").strip())
+
+
+def _ble_fallback_wait_s() -> float:
+    """Budget for the BLE fallback to CONFIRM the port off. The daemon polls port
+    state every 30s by default, so the default here must span a full sweep plus its
+    3s response timeout or confirmation can never arrive. Override
+    BLE_STOP_FALLBACK_WAIT_S (and shorten it if you run --poll-interval lower)."""
+    try:
+        return max(0.0, float(os.getenv("BLE_STOP_FALLBACK_WAIT_S", "").strip() or 35.0))
+    except ValueError:
+        return 35.0
+
+
+def ble_stop_fallback(dev: dict, port: int) -> bool:
+    """Independent LOCAL stop path, used only after the cloud stop failed to verify.
+
+    The cloud is the sole stop transport on the normal path, so an AC Infinity outage
+    (or an expired token, or the laptop's WAN dropping) mid-dose leaves a chemical
+    pump running with no way to command it off -- the freeze that follows protects
+    FUTURE doses but does nothing about the pump that is already spinning. The BLE
+    channel does not depend on the cloud at all, and its chemical guard has always
+    permitted stops (speed 0) unconditionally, precisely so it could be used here.
+
+    Returns True only when a post-stop BLE readback PROVES the port off; a queued
+    write that we cannot confirm still counts as an unverified stop, so the caller's
+    freeze fires exactly as before."""
+    device = dev["name"]
+    if not _ble_fallback_enabled():
+        return False
+    if not _ble_configured(device):
+        print(f"  [DOSE] no BLE MAC configured for {device} -- no local stop fallback")
+        return False
+    try:
+        from aci_ble_lab import db as ble_db
+    except Exception as e:      # BLE lab absent/unimportable -- never mask the real fault
+        print(f"  [DOSE] BLE stop fallback unavailable ({e})")
+        return False
+
+    issued_ts = time.time()
+    try:
+        # work_type 0 + speed 0 = off-mode at level 0. guard_chemical_write lets every
+        # stop through, freeze or not -- stopping a pump is never gated.
+        cmd_id = ble_db.enqueue_command(device, port, 0, 0, source="dosing_stop_fallback")
+    except Exception as e:
+        print(f"  [DOSE] BLE stop fallback could not enqueue {device} p{port}: {e}")
+        runtime_state.record_event("dose_stop_ble_enqueue_failed", device=device,
+                                   port=port, reason=str(e))
+        return False
+
+    print(f"  [DOSE] cloud stop unverified -- queued BLE stop {device} p{port} "
+          f"(cmd {cmd_id}); waiting up to {_ble_fallback_wait_s():.0f}s for confirmation")
+    deadline = issued_ts + _ble_fallback_wait_s()
+    status = None
+    while time.time() < deadline:
+        status = ble_db.command_status(cmd_id)
+        if status in ("failed", "expired"):
+            break
+        # Confirmation is the readback, not the queue row: 'done' only means the GATT
+        # write went out. Check every pass so a port poll landing mid-wait is caught.
+        if ble_db.port_confirmed_off(device, port, issued_ts):
+            print(f"  [DOSE] BLE fallback CONFIRMED {device} p{port} off "
+                  f"({round(time.time() - issued_ts, 1)}s)")
+            runtime_state.record_event("dose_stop_ble_fallback_ok", device=device,
+                                       port=port, cmd_id=cmd_id,
+                                       elapsed_sec=round(time.time() - issued_ts, 1))
+            return True
+        time.sleep(1.0)
+
+    print(f"  [DOSE] BLE fallback did NOT confirm {device} p{port} off "
+          f"(queue status {status or 'unknown'}) -- treating stop as unverified")
+    runtime_state.record_event("dose_stop_ble_fallback_unconfirmed", device=device,
+                               port=port, cmd_id=cmd_id, queue_status=status)
+    return False
+
+
 def _force_stop(token: str, dev: dict, port: int) -> bool:
     """Stop the pump and confirm it via the shared stop primitive. Returns True only
     when the port is confirmed at 0. Freeze policy stays with the caller -- timed_dose
-    freezes dosing + raises high-alert on a False return."""
+    freezes dosing + raises high-alert on a False return.
+
+    A cloud stop that will not verify falls back to the local BLE transport before
+    giving up (see ble_stop_fallback), so a cloud outage mid-dose has a second,
+    independent way to actually stop the pump rather than only freezing after it."""
     device = dev["name"]
     verify = os.getenv("VERIFY_WRITES", "true").strip().lower() != "false"
     res = stop_and_verify(token, dev, port, retries=1, verify=verify)
@@ -198,6 +291,15 @@ def _force_stop(token: str, dev: dict, port: int) -> bool:
         return True
     obs = (res.get("observed") or {}).get("speed_actual")
     print(f"  [DOSE] stop UNVERIFIED {device} p{port} (observed {obs}) -- {res['reason']}")
+    if token == "SIM":
+        return False        # sim_runner never touches the BLE queue
+    if ble_stop_fallback(dev, port):
+        # The pump is confirmed off by an independent transport, so the freeze would be
+        # a false alarm -- but the cloud control path IS degraded, so raise the
+        # high-alert window (faster reservoir polling) rather than continuing silently.
+        runtime_state.start_high_alert(
+            f"cloud stop unverified on {device} p{port}; stopped via BLE fallback")
+        return True
     return False
 
 
@@ -223,6 +325,31 @@ def _freeze_after_failed_stop(device: str, ports) -> None:
     safety_state.disable_dosing(
         f"timed dose stop NOT verified on {device} port(s) {list(plist)} -- pump may run")
     runtime_state.start_high_alert(f"timed dose stop failed on {device} port(s) {list(plist)}")
+
+
+def _busy_result(device: str, ports, err: Exception) -> dict:
+    """Uniform refusal when another process already holds the chemical-dose lock.
+    Nothing was written and no pump was touched -- the caller can retry next cycle."""
+    plist = ports if isinstance(ports, (list, tuple, set)) else [ports]
+    print(f"  [DOSE] BLOCKED {device} port(s) {list(plist)}: another chemical dose is "
+          f"in flight ({err})")
+    runtime_state.record_event("dose_blocked_concurrent", device=device,
+                               ports=list(plist), reason=str(err))
+    return {"ok": False, "reason": f"another chemical dose is in flight ({err})"}
+
+
+def _record_write_failure(device: str, ports, err: Exception) -> dict:
+    """Uniform refusal when the crash-safe active-dose record would not persist.
+    The record is what makes a dose recoverable; without it a crash leaves a pump
+    running with nothing for startup recovery to reconcile against, so we refuse to
+    start rather than dose blind."""
+    plist = ports if isinstance(ports, (list, tuple, set)) else [ports]
+    msg = (f"active-dose record could not be persisted ({err}) -- refusing to start "
+           "the pump (a dose with no crash-recovery record is unrecoverable)")
+    print(f"  [DOSE] ABORT {device} port(s) {list(plist)}: {msg}")
+    runtime_state.record_event("dose_aborted_no_record", device=device,
+                               ports=list(plist), reason=str(err))
+    return {"ok": False, "reason": msg}
 
 
 # --------------------------------------------------------------------------- #
@@ -253,6 +380,30 @@ def timed_dose(token: str, dev: dict, port: int, speed: int, target_ml: float, *
     if advisory:
         return {"ok": True, "advisory": True, "full_strength_equivalent_ml": fse, **plan}
 
+    # Serialize chemical execution system-wide before touching anything. The poller
+    # and the supervised bucket harnesses are SEPARATE PROCESSES that both dose
+    # through here, nothing else stops them overlapping, and the crash-recovery
+    # active-dose record is a single slot -- two concurrent doses overwrite each
+    # other's record, so the watchdog vouches for the wrong port and whichever pump
+    # finishes first clears the protection the other is still relying on.
+    # Non-blocking on purpose: refuse the dose rather than park the control loop
+    # behind another process's pump (it can retry next cycle).
+    try:
+        with proc_lock.ProcessLock(proc_lock.CHEMICAL_DOSE):
+            return _run_timed_dose(token, dev, port, speed, plan,
+                                   fse=fse, strength=strength, solution=solution)
+    except proc_lock.LockBusy as e:
+        return _busy_result(device, port, e)
+
+
+def _run_timed_dose(token: str, dev: dict, port: int, speed: int, plan: dict, *,
+                    fse: float, strength: float, solution: str | None) -> dict:
+    """Actuating half of `timed_dose`, run with the chemical-dose lock HELD.
+
+    Split out so the lock's scope is exactly the dangerous span -- freeze check,
+    pre-check, active-dose record, pump, verified stop -- and no wider."""
+    device, dev_id, dev_type = dev["name"], dev["dev_id"], dev["type"]
+
     # 0. Honor the chemical freeze at the execution primitive too. A freeze tripped
     # mid-cycle (e.g. by a prior action's failed stop) must block the NEXT dose in the
     # same batch -- those actions already cleared filter_actions before the freeze.
@@ -273,17 +424,24 @@ def timed_dose(token: str, dev: dict, port: int, speed: int, target_ml: float, *
         runtime_state.record_event("dose_aborted", device=device, port=port, reason=msg)
         return {"ok": False, "reason": msg}
 
-    # 2. Persist active-dose record BEFORE the pump starts.
+    # 2. Persist active-dose record BEFORE the pump starts. The durable write is a
+    # HARD PRECONDITION, not bookkeeping: it is the only thing that lets startup
+    # recovery distinguish "a dose was in flight when we died" from "nothing was
+    # running", so if it cannot be written we must not start a pump we would be
+    # unable to account for afterwards.
     started_ts = time.time()
     planned_stop_ts = (started_ts + plan["on_ms"] / 1000.0
                        + plan["ramp_down_ms"] / 1000.0 + 5)
-    runtime_state.begin_active_dose({
-        "device": device, "dev_id": dev_id, "port": port, "speed": speed,
-        "solution": solution, "target_ml": plan["estimated_actual_ml"],
-        "strength_factor": strength, "start_verified": False,
-        "started_wall_ts": started_ts, "planned_stop_wall_ts": planned_stop_ts,
-        "planned_on_ms": plan["on_ms"], "flow_ml_min": plan["flow_ml_min"],
-    })
+    try:
+        runtime_state.begin_active_dose({
+            "device": device, "dev_id": dev_id, "port": port, "speed": speed,
+            "solution": solution, "target_ml": plan["estimated_actual_ml"],
+            "strength_factor": strength, "start_verified": False,
+            "started_wall_ts": started_ts, "planned_stop_wall_ts": planned_stop_ts,
+            "planned_on_ms": plan["on_ms"], "flow_ml_min": plan["flow_ml_min"],
+        })
+    except runtime_state.StateWriteError as e:
+        return _record_write_failure(device, port, e)
 
     start_verified = False
     stop_ok = False
@@ -362,6 +520,22 @@ def timed_dose_pair(token: str, dev: dict, ports: list, speed: int, target_ml_ea
     if advisory:
         return {"ok": True, "advisory": True, "plans": plans, "on_ms": on_ms}
 
+    # Same system-wide chemical-dose mutex as timed_dose -- a pair dose and a pH
+    # dose are equally exclusive, and they share the one active-dose record slot.
+    try:
+        with proc_lock.ProcessLock(proc_lock.CHEMICAL_DOSE):
+            return _run_timed_dose_pair(token, dev, ports, speed, plans,
+                                        on_ms=on_ms, target_ml_each=target_ml_each,
+                                        solution=solution)
+    except proc_lock.LockBusy as e:
+        return _busy_result(device, ports, e)
+
+
+def _run_timed_dose_pair(token: str, dev: dict, ports: list, speed: int, plans: dict, *,
+                         on_ms: float, target_ml_each, solution: str) -> dict:
+    """Actuating half of `timed_dose_pair`, run with the chemical-dose lock HELD."""
+    device, dev_id, dev_type = dev["name"], dev["dev_id"], dev["type"]
+
     # Honor the chemical freeze at the execution primitive (see timed_dose step 0).
     if safety_state.is_dosing_disabled():
         reason = safety_state.dosing_disable_status()[1]
@@ -381,17 +555,22 @@ def timed_dose_pair(token: str, dev: dict, ports: list, speed: int, target_ml_ea
     started_ts = time.time()
     planned_stop_ts = (started_ts + on_ms / 1000.0
                        + max(pl["ramp_down_ms"] for pl in plans.values()) / 1000.0 + 5)
-    runtime_state.begin_active_dose({
-        "device": device, "dev_id": dev_id, "ports": list(ports), "speed": speed,
-        "solution": solution, "target_ml_each": target_ml_each, "start_verified": False,
-        "started_wall_ts": started_ts, "planned_stop_wall_ts": planned_stop_ts,
-        "planned_on_ms": on_ms,
-        # Scalar kept for backward compat (old readers); the per-port map is what the
-        # crash estimate SUMS -- both pumps run concurrently, so max() alone models one
-        # pump and under-counts a mid-pair power-loss estimate by ~2x.
-        "flow_ml_min": max(plans[p]["flow_ml_min"] for p in ports),
-        "flow_ml_min_by_port": {p: plans[p]["flow_ml_min"] for p in ports},
-    })
+    # Durable record is a hard precondition here too (see timed_dose step 2).
+    try:
+        runtime_state.begin_active_dose({
+            "device": device, "dev_id": dev_id, "ports": list(ports), "speed": speed,
+            "solution": solution, "target_ml_each": target_ml_each,
+            "start_verified": False,
+            "started_wall_ts": started_ts, "planned_stop_wall_ts": planned_stop_ts,
+            "planned_on_ms": on_ms,
+            # Scalar kept for backward compat (old readers); the per-port map is what the
+            # crash estimate SUMS -- both pumps run concurrently, so max() alone models one
+            # pump and under-counts a mid-pair power-loss estimate by ~2x.
+            "flow_ml_min": max(plans[p]["flow_ml_min"] for p in ports),
+            "flow_ml_min_by_port": {p: plans[p]["flow_ml_min"] for p in ports},
+        })
+    except runtime_state.StateWriteError as e:
+        return _record_write_failure(device, ports, e)
 
     start_mono = {}            # port -> monotonic clock at its own start
     stop_mono = {}             # port -> monotonic clock at its stop WRITE (delivered est)

@@ -197,6 +197,44 @@ def pop_next_command() -> dict | None:
         return dict(row)
 
 
+def command_status(cmd_id: int) -> str | None:
+    """Current status of one queued command ('pending'/'sent'/'done'/'failed'/
+    'expired'), or None if the row is gone. Lets a caller that enqueued a STOP wait
+    for the daemon to actually issue it instead of assuming the queue was drained."""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT status FROM command_queue WHERE id=?", (cmd_id,)
+        ).fetchone()
+        return row["status"] if row else None
+
+
+def latest_port_state(device: str, port: int, since_ts: float = 0.0) -> dict | None:
+    """Most recent port_state row for (device, port) observed at/after `since_ts`,
+    or None. `since_ts` is the point of the whole helper: confirming a stop needs
+    evidence recorded AFTER the stop went out, never a stale pre-stop row."""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT ts, device, port, work_type, level_off, level_on FROM port_state "
+            "WHERE device=? AND port=? AND ts>=? ORDER BY ts DESC LIMIT 1",
+            (device, port, since_ts),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def port_confirmed_off(device: str, port: int, since_ts: float = 0.0) -> bool:
+    """True only when a port_state row recorded at/after `since_ts` PROVES the port
+    is not running: off-mode (work_type 0) with level_off 0.
+
+    Deliberately narrow. An off-type work_type still programs level_off and the port
+    RUNS at level_off while "off" (see safety.guard_chemical_write), so only
+    work_type 0 AND level_off 0 is conclusive; every other combination -- including
+    modes where level_on is what runs -- reads as "not proven off"."""
+    row = latest_port_state(device, port, since_ts)
+    if not row:
+        return False
+    return int(row["work_type"]) == 0 and int(row["level_off"]) == 0
+
+
 def mark_command_done(cmd_id: int) -> None:
     with _conn() as c:
         c.execute(

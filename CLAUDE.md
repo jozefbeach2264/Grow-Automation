@@ -118,8 +118,11 @@ Ports 3+4 are pH ports via `PH_PORTS_HYDROPONICS_CONTROL=3,4` — safety gate ap
 | `trend_db_test.py` | Self-tests for trend_db + trend_features (22 cases, throwaway schema, real TimescaleDB) |
 | `sql/trend_schema.sql`, `sql/trend_policies.sql` | Trend hypertable + continuous aggregates; cagg refresh policies |
 | `scripts/setup_timescaledb.sh` | One-time TimescaleDB bring-up (install, initdb, role/db, extension) |
-| `utils.py` | Shared text utils (currently just `name_slug`) |
+| `utils.py` | Shared utils: `name_slug`, `preserve_corrupt` (quarantine-copy an unparseable state file) |
+| `proc_lock.py` | Interprocess `flock` mutex -- the system-wide chemical-dose lock + the poller singleton |
+| `proc_lock_test.py` | Self-tests for the lock (20 checks, incl. cross-process + SIGKILL release) |
 | `safety_state.py` | Persistent chemical-only freeze (dosers + pH + CO2 valve); never cuts climate |
+| `safety_state_test.py` | Self-tests for the freeze + fail-closed corrupt-state handling (20 checks) |
 | `ble_logger.py` | Persistent BLE daemon: 1Hz telemetry + drains `command_queue` for one controller |
 | `aci_ble_lab/db.py` | SQLite command queue + sensor cache; gates chemical writes at enqueue |
 | `aci_ble_lab/safety.py` | Port classification + `guard_chemical_write` (the universal chemical write check) |
@@ -416,7 +419,17 @@ ventilation/lighting is itself a hazard and must never cascade from a chemical f
   `profiles/.safety_state.json` (atomic write, survives restart).
 - API: `safety_state.disable_dosing(reason)` to trip (use for fail-safe auto-trips like
   a failed pump-stop once read-after-write lands), `clear_dosing_disable()` to lift.
-- Corrupt/missing state file → treated as NOT disabled (won't silently block).
+- **MISSING state file → NOT disabled** (fresh install: no trip has ever existed to lose).
+  **CORRUPT state file → DISABLED, fail-closed** (2026-07-31 review P0-3): a file that
+  exists but won't parse means a trip may have been lost, so `_load()` preserves a
+  `.corrupt.<utc>` copy, persists a tripped state over the live path, and returns
+  disabled. The copy (not a move) is deliberate — if the rewrite also fails, the corrupt
+  file stays and the next read trips again rather than reading as a fresh install.
+  `clear_dosing_disable()` still lifts it after inspection.
+- The persisted **lockout** file (`profiles/.lockouts.json`) follows the same rule:
+  corrupt → `ai_advisor._lockout_floor` is set to now, so every port is treated as
+  just-dosed instead of handing them all a free immediate re-dose. Read dose clocks via
+  `_last_dose_ts(key)`, never `_last_dose_time[key]` directly.
 
 **2. Reservoir-burst shutdown — WATER/CHEMICAL ONLY. Never cuts lights or ventilation.**
 - `ai_advisor.compute_res_burst()` detects; `poller.enforce_res_burst()` actuates as the
@@ -447,11 +460,38 @@ and ramp-down each deliver ~(S/2)*flow over the ramp time, the hold delivers the
 a `target_ml` below the minimum ramp-only pulse is rejected as below hardware resolution.
 
 `timed_dose(token, dev, port, speed, target_ml, solution, strength, advisory)`:
-1. verify port at 0, 2. persist a crash-safe active-dose record (watchdog leaves it alone),
-3. start pump, best-effort start-confirm for long doses, 4. hold `on_ms` on a monotonic
-clock, 5. ALWAYS stop in `finally` + verify (retry once), 6. on unverified stop ->
-`safety_state.disable_dosing()` + high-alert. `timed_dose_pair(ports=[1,2], ...)` doses
-nutrient V1+V2 together: both start, both stop, freeze if either start/stop fails.
+0. take the system-wide chemical-dose lock, 1. verify port at 0, 2. persist a crash-safe
+active-dose record (watchdog leaves it alone), 3. start pump, best-effort start-confirm
+for long doses, 4. hold `on_ms` on a monotonic clock, 5. ALWAYS stop in `finally` +
+verify (retry once), 6. on unverified stop -> `safety_state.disable_dosing()` +
+high-alert. `timed_dose_pair(ports=[1,2], ...)` doses nutrient V1+V2 together: both
+start, both stop, freeze if either start/stop fails.
+
+**Three preconditions before any pump turns on** (2026-07-31 review, P0):
+- **Chemical-dose mutex** (`proc_lock.CHEMICAL_DOSE`, an `flock`). The poller and the
+  bucket harnesses are separate processes that both dose through here, and the
+  active-dose record is a SINGLE slot — overlapping doses used to overwrite each
+  other's record, so the watchdog vouched for the wrong port and the first pump to
+  finish cleared the other's protection. Non-blocking: a busy lock REFUSES the dose
+  (`ok=False, "another chemical dose is in flight"`), it never waits. Advisory doses
+  skip the lock (they actuate nothing). The kernel frees the lock if the holder dies,
+  so a crash can't wedge dosing. `poller.main()` takes `proc_lock.POLLER` the same way.
+- **Durable active-dose record.** `runtime_state.begin_active_dose()` now raises
+  `StateWriteError` instead of logging and continuing; the dose aborts without starting
+  the pump. A dose with no crash-recovery record is unrecoverable, so the write is a
+  precondition, not bookkeeping. (`runtime_state._save` stays best-effort for the
+  heartbeat/streak/high-alert paths; `_write_state` is the strict one.)
+- **The freeze**, re-checked at the execution primitive as before.
+
+**Local BLE stop fallback.** `dosing.ble_stop_fallback(dev, port)` — when the CLOUD stop
+will not verify, queue a BLE stop (`work_type 0, speed 0`; the BLE guard has always
+allowed stops unconditionally) and wait up to `BLE_STOP_FALLBACK_WAIT_S` (default 35s,
+sized for the daemon's 30s port-poll sweep) for `aci_ble_lab.db.port_confirmed_off()` to
+PROVE the port off. Confirmed → the stop counts as verified (no freeze) but high-alert
+opens because the cloud path is degraded; unconfirmed → unchanged freeze-on-unverified.
+`poller._verified_doser_stop` (orphan watchdog + res-burst) uses the same fallback.
+Self-disables when no `BLE_<SLUG>_MAC`/`BLE_DEFAULT_MAC` is set — with no daemon it
+could only time out and delay the freeze. Kill switch: `BLE_STOP_FALLBACK=false`.
 
 - Flow model 21 mL/min/speed (override `FLOW_ML_MIN_<SLUG>_<port>`); ramp 1 speed/sec
   (`RAMP_SPEED_PER_SEC`). Dose sizes: `PH_MICRODOSE_ML`, `PH_SMALL_DOSE_ML`,
@@ -482,7 +522,7 @@ nutrient V1+V2 together: both start, both stop, freeze if either start/stop fail
   quick-settle (observed 2026-06-02). Enforced in BOTH the test harness (`bucket_dose_test.py`,
   no early exit) and the autonomous outcome-readback (`profile_manager._wait_for` -> doser/pH
   actions wait `max(OUTCOME_WAIT_CYCLES window, DOSE_SETTLE_SEC)`).
-- Tests: `dosing_test.py` (34 cases). Live validation pending HDS3 + `RESERVOIR_VOLUME_GAL`.
+- Tests: `dosing_test.py` (101 cases). Live validation pending HDS3 + `RESERVOIR_VOLUME_GAL`.
 
 ## Watchdog & crash recovery (`runtime_state.py`)
 
@@ -508,6 +548,8 @@ with the wall clock -- NTP can jump it).
   written BEFORE a pump starts so a crash is recoverable. Structure wired now; timed dosing
   (#7) populates the planned fields. `active_dose_window_port()` returns None until then,
   so the watchdog treats every running doser as an orphan (correct -- nothing should dose yet).
+  **The write is a hard precondition:** `begin_active_dose` raises `StateWriteError` when it
+  cannot persist, and `dosing` aborts without starting the pump (2026-07-31 review P0-1).
 - **High-alert window** (`start_high_alert` / `high_alert_status`): persisted faster
   reservoir polling after a scare; clamps the sleep down to `HIGH_ALERT_POLL_INTERVAL` for
   `HIGH_ALERT_DURATION_MINUTES`, auto-expires on read. Does not itself gate chemicals

@@ -15,7 +15,8 @@ Two independent safety concepts, deliberately kept separate:
    below), plus an optional evac pump (`compute_evac_pump`). Lights and ventilation
    are NEVER cut -- there is deliberately no "full power kill" anywhere in the system.
 
-State file: profiles/.safety_state.json   (atomic tmp+replace, corrupt-tolerant)
+State file: profiles/.safety_state.json   (atomic tmp+replace; missing -> not
+disabled, corrupt -> DISABLED and quarantined -- see _load)
   {
     "dosing_disabled": false,
     "dosing_disabled_reason": null,
@@ -32,6 +33,8 @@ import os
 import time
 from pathlib import Path
 
+import utils
+
 _STATE_FILE = Path(__file__).parent / "profiles" / ".safety_state.json"
 
 _DEFAULT = {
@@ -42,21 +45,51 @@ _DEFAULT = {
 
 
 def _load() -> dict:
-    """Read state from disk. Missing or corrupt file -> safe default (not disabled).
-    A corrupt file does NOT auto-disable dosing -- it would be indistinguishable
-    from a fresh install, and the env override / explicit trips remain available."""
+    """Read state from disk.
+
+    MISSING file -> not disabled. That is a fresh install: there has never been a
+    trip to lose, and auto-freezing every new deployment would only train operators
+    to clear the freeze reflexively.
+
+    CORRUPT file -> DISABLED (fail closed). A file that EXISTS but will not parse
+    means the state was lost, and the state we can least afford to lose is a trip --
+    reading it as "not disabled" silently un-freezes chemicals after exactly the kind
+    of event (power loss mid-write, disk fault) that most warrants a look. Corruption
+    is distinguishable from a fresh install precisely because the file is there, so
+    the fresh-install argument above does not apply. The bad file is preserved for
+    inspection, the freeze is persisted so it survives restart, and
+    clear_dosing_disable() still lifts it once a human has looked."""
     if not _STATE_FILE.exists():
         return dict(_DEFAULT)
     try:
         data = json.loads(_STATE_FILE.read_text())
-        if not isinstance(data, dict):
-            return dict(_DEFAULT)
+        problem = None if isinstance(data, dict) else "state file is not a JSON object"
     except Exception as e:
-        print(f"[SAFETY] Could not read {_STATE_FILE.name} ({e}) -- assuming not disabled")
-        return dict(_DEFAULT)
+        problem = f"state file is unreadable ({e})"
+    if problem is not None:
+        return _trip_on_corruption(problem)
     merged = dict(_DEFAULT)
     merged.update({k: data[k] for k in _DEFAULT if k in data})
     return merged
+
+
+def _trip_on_corruption(problem: str) -> dict:
+    """Fail-closed response to an unparseable state file: preserve the evidence,
+    persist a tripped state over the live path, and return it.
+
+    If the persist fails, the corrupt file is still there (preserve_corrupt copies
+    rather than moves), so the next _load() trips again -- the freeze can degrade to
+    "re-decided every read", never to "silently lifted"."""
+    note = utils.preserve_corrupt(_STATE_FILE, problem)
+    state = {
+        "dosing_disabled": True,
+        "dosing_disabled_reason": f"fail-closed: {note}",
+        "dosing_disabled_at": time.time(),
+    }
+    print(f"[SAFETY] {note} -- chemical control DISABLED (fail closed). Inspect the "
+          "preserved copy, then clear_dosing_disable(). (Climate/ventilation unaffected.)")
+    _save(state)
+    return state
 
 
 def _save(state: dict) -> None:

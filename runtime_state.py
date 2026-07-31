@@ -80,21 +80,44 @@ def _load() -> dict:
     return merged
 
 
-def _save(state: dict) -> None:
+class StateWriteError(RuntimeError):
+    """The runtime-state file could not be durably written.
+
+    Raised only on the paths where the write is a SAFETY PRECONDITION rather than
+    bookkeeping -- currently `begin_active_dose`. Everything else (heartbeat,
+    streaks, high-alert) stays best-effort: losing a heartbeat tick degrades
+    diagnosis, losing the active-dose record loses crash recovery."""
+
+
+def _write_state(state: dict) -> None:
+    """Atomically persist state. Raises StateWriteError on any failure.
+
+    fsync the tmp file before the atomic rename so a power loss can't leave the
+    file renamed-but-empty. Losing the active-dose record (vs corrupting it) would
+    silently skip the crash-recovery freeze that depends on it -- worse than the
+    corrupt->fresh load policy, which at least the watchdog backstops."""
     try:
         _STATE_FILE.parent.mkdir(exist_ok=True)
         tmp = _STATE_FILE.with_suffix(".tmp")
-        # fsync the tmp file before the atomic rename so a power loss can't leave the
-        # file renamed-but-empty. Losing the active-dose record (vs corrupting it) would
-        # silently skip the crash-recovery freeze that depends on it -- worse than the
-        # corrupt->fresh load policy, which at least the watchdog backstops.
         with tmp.open("w", encoding="utf-8") as fh:
             fh.write(json.dumps(state, indent=2))
             fh.flush()
             os.fsync(fh.fileno())
         tmp.replace(_STATE_FILE)
     except Exception as e:
-        print(f"[RUNTIME] Could not write {_STATE_FILE.name}: {e}")
+        raise StateWriteError(f"could not write {_STATE_FILE.name}: {e}") from e
+
+
+def _save(state: dict) -> bool:
+    """Best-effort persist -- logs and returns False instead of raising. Returns
+    True when the state reached disk. Use `_write_state` where the write must be
+    a precondition for touching hardware."""
+    try:
+        _write_state(state)
+        return True
+    except StateWriteError as e:
+        print(f"[RUNTIME] {e}")
+        return False
 
 
 def read_state() -> dict:
@@ -168,7 +191,13 @@ def begin_active_dose(record: dict) -> None:
     """Persist an active-dose record BEFORE the pump starts, so a crash mid-dose is
     recoverable. `record` should carry at least: device, dev_id, port, speed, and
     (when known) target_ml, strength_factor, started_wall_ts, planned_stop_wall_ts,
-    start_verified. status is forced to 'pump_running'."""
+    start_verified. status is forced to 'pump_running'.
+
+    Raises StateWriteError if the record cannot be durably written -- the caller
+    MUST NOT start the pump. This record is the ONLY thing that lets startup
+    recovery tell "a dose was in flight when we died" from "nothing was running":
+    without it a crash mid-dose leaves a pump spinning with nothing to reconcile
+    against, so a best-effort write here would be a silently-disarmed safety net."""
     state = _load()
     rec = dict(record)
     # Accept either a single `port` or a list of `ports` (nutrient pair). Keep both
@@ -188,7 +217,7 @@ def begin_active_dose(record: dict) -> None:
     rec.setdefault("boot_id", boot_id())
     rec["status"] = "pump_running"
     state["active_dose"] = rec
-    _save(state)
+    _write_state(state)      # hard precondition -- no durable record, no pump
     record_event("active_dose_started", **{k: rec.get(k) for k in
                  ("device", "port", "speed", "target_ml", "planned_stop_wall_ts")})
 

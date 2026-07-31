@@ -12,6 +12,7 @@ from pathlib import Path
 
 import requests
 
+import utils
 from utils import name_slug
 from grow_state import current_grow_week_and_stage, days_into_current_stage
 from schedule import (compute_schedule_deltas, expected_light_state,
@@ -72,19 +73,41 @@ def _reservoir_volume_gal() -> float:
 #   }
 _last_dose_time: dict[str, float] = {}
 _last_ph_time: float = 0.0
+# Fail-closed floor under every per-port dose clock. Nonzero only when the persisted
+# lockout file existed but could not be read -- see _load_lockouts.
+_lockout_floor: float = 0.0
+
+
+def _last_dose_ts(key: str) -> float:
+    """Dose-lockout clock for one 'device:port', never earlier than the fail-closed
+    floor. 0.0 means genuinely no lockout. Read through this everywhere instead of
+    indexing _last_dose_time directly, so a lost lockout file cannot hand a port a
+    free immediate re-dose."""
+    return max(_last_dose_time.get(key, 0.0), _lockout_floor)
 
 
 def _load_lockouts():
     """Populate _last_dose_time and _last_ph_time from disk if the file exists.
-    Silently tolerates missing or corrupt files -- worst case the lockouts reset,
-    which matches the pre-persistence behaviour."""
-    global _last_dose_time, _last_ph_time
+
+    A MISSING file is a fresh install -- no lockouts, nothing was lost. A file that
+    exists but will not parse is different: those cooldown clocks were real and we
+    just lost them, so resetting to "no lockouts" would hand every port a free
+    immediate re-dose right after a restart -- the exact double-dose the lockouts
+    exist to prevent. Corruption therefore fails CLOSED: assume every port just
+    dosed, restart all the cooldowns from now, and preserve the bad file."""
+    global _last_dose_time, _last_ph_time, _lockout_floor
     if not _LOCKOUT_FILE.exists():
         return
     try:
         data = json.loads(_LOCKOUT_FILE.read_text())
+        if not isinstance(data, dict):
+            raise ValueError("lockout file is not a JSON object")
     except Exception as e:
-        print(f"[LOCKOUTS] Could not read {_LOCKOUT_FILE.name} ({e}) -- starting fresh")
+        note = utils.preserve_corrupt(_LOCKOUT_FILE, f"could not read {_LOCKOUT_FILE.name} ({e})")
+        _lockout_floor = time.time()
+        _last_ph_time = _lockout_floor
+        print(f"[LOCKOUTS] {note} -- assuming every port just dosed (fail closed); "
+              f"all cooldowns restart now.")
         return
     dt = data.get("last_dose_time") or {}
     if isinstance(dt, dict):
@@ -437,9 +460,9 @@ def _dose_gate(a: dict, dose_gate: str, ph_gate: str, dosing_off: bool,
         return False, False, f"res_health.dose_gate={dose_gate}"
 
     for p in ports:
-        k = f"{device}:{p}"
-        if k in _last_dose_time:
-            remaining = _dose_lockout_sec() - (now - _last_dose_time[k])
+        last = _last_dose_ts(f"{device}:{p}")
+        if last:
+            remaining = _dose_lockout_sec() - (now - last)
             if remaining > 0:
                 m, s = divmod(int(remaining), 60)
                 return False, is_ph, f"port {p} lockout {m}m{s:02}s remaining"
@@ -579,8 +602,9 @@ def filter_actions(actions: list, snapshot: dict | None = None,
         # 1. Per-port dose lockout -- only applies to doser ports (not fans/lights/outlets).
         #    Exempt stops (is_safety_dir): a STOP must ALWAYS be allowed through, even on a
         #    port still inside its dose lockout window ("stops are always allowed").
-        if is_doser and not is_safety_dir and key in _last_dose_time:
-            remaining = _dose_lockout_sec() - (now - _last_dose_time[key])
+        last_dose = _last_dose_ts(key)
+        if is_doser and not is_safety_dir and last_dose:
+            remaining = _dose_lockout_sec() - (now - last_dose)
             if remaining > 0:
                 m, s = divmod(int(remaining), 60)
                 print(f"  [SAFETY] Blocked {key}: lockout {m}m{s:02}s remaining")

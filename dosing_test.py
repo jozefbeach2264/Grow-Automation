@@ -8,6 +8,7 @@ run instantly. Run: python3 dosing_test.py
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -19,6 +20,8 @@ runtime_state._STATE_FILE = _TMP / ".runtime_state.json"
 runtime_state._EVENT_LOG = _TMP / "events.jsonl"
 import safety_state
 safety_state._STATE_FILE = _TMP / ".safety_state.json"
+import proc_lock
+proc_lock._LOCK_DIR = _TMP                        # keep test lock files out of profiles/
 
 os.environ["VERIFY_WRITES"] = "true"
 os.environ.pop("DOSING_DISABLED", None)
@@ -389,6 +392,144 @@ check("pair record keeps the scalar flow for old readers",
       _captured_ad.get("flow_ml_min") == 42.0)
 os.environ.pop("FLOW_ML_MIN_RDWC_CONTROL_1", None)
 os.environ.pop("FLOW_ML_MIN_RDWC_CONTROL_2", None)
+
+
+# =========================================================================== #
+# 2026-07-31 review, P0 findings
+# =========================================================================== #
+print("\n== P0-1: an unwritable active-dose record ABORTS before the pump ==")
+
+
+def _unwritable_state(fn, *a, **kw):
+    """Run fn with runtime_state's durable write failing (read-only fs / full disk)."""
+    orig = runtime_state._write_state
+
+    def boom(_state):
+        raise runtime_state.StateWriteError("simulated: could not write state file")
+    runtime_state._write_state = boom
+    try:
+        return fn(*a, **kw)
+    finally:
+        runtime_state._write_state = orig
+
+
+reset(); _writes.clear()
+_verify_ok = True; _precheck_speed = 0; _start_raise_on.clear()
+r = _unwritable_state(dosing.timed_dose, "TEST", DEV, 4, 1, 0.5, solution="ph_down")
+check("dose refused when the crash-recovery record will not persist", r["ok"] is False)
+check("refusal names the record", "record" in r["reason"])
+check("NO pump start was issued", _writes == [])
+check("no active dose left behind", runtime_state.get_active_dose() is None)
+
+reset(); _writes.clear()
+r = _unwritable_state(dosing.timed_dose_pair, "TEST", DEV, [1, 2], 2, 5.0)
+check("pair dose refused too", r["ok"] is False and "record" in r["reason"])
+check("neither pump started", _writes == [])
+
+reset(); _writes.clear()
+r = dosing.timed_dose("TEST", DEV, 4, 1, 0.5, solution="ph_down")
+check("dosing works again once the record can be written", r["ok"] is True)
+
+
+print("\n== P0-2: chemical doses are serialized across processes ==")
+
+
+def _dose_lock_free() -> bool:
+    lock = proc_lock.ProcessLock(proc_lock.CHEMICAL_DOSE)
+    try:
+        lock.acquire()
+    except proc_lock.LockBusy:
+        return False
+    lock.release()
+    return True
+
+
+reset(); _writes.clear()
+check("dose lock is free before we start", _dose_lock_free() is True)
+_held = proc_lock.ProcessLock(proc_lock.CHEMICAL_DOSE).acquire()   # stand in for the poller
+
+r = dosing.timed_dose("TEST", DEV, 4, 1, 0.5, solution="ph_down")
+check("dose refused while another process is dosing", r["ok"] is False)
+check("refusal says another dose is in flight", "in flight" in r["reason"])
+check("no pump start while the lock is held", _writes == [])
+check("no active-dose record was overwritten", runtime_state.get_active_dose() is None)
+
+rp = dosing.timed_dose_pair("TEST", DEV, [1, 2], 2, 5.0)
+check("pair dose is refused by the same lock", rp["ok"] is False and "in flight" in rp["reason"])
+check("still no writes", _writes == [])
+
+ra = dosing.timed_dose("TEST", DEV, 4, 1, 0.5, advisory=True)
+check("advisory dose is NOT blocked (it actuates nothing)",
+      ra["ok"] is True and ra.get("advisory") is True)
+
+_held.release()
+r = dosing.timed_dose("TEST", DEV, 4, 1, 0.5, solution="ph_down")
+check("dose proceeds once the lock frees", r["ok"] is True)
+check("lock is released after a completed dose", _dose_lock_free() is True)
+
+reset(); _writes.clear()
+_verify_ok = False
+r = dosing.timed_dose("TEST", DEV, 4, 1, 0.5, solution="ph_down")
+check("lock is released even after a FAILED dose", _dose_lock_free() is True)
+_verify_ok = True
+
+
+print("\n== P0-4: local BLE stop fallback when the cloud stop will not verify ==")
+from aci_ble_lab import db as ble_db
+
+_ble_enqueued = []
+_ble_confirms = True
+_ble_status = "done"
+
+
+def fake_enqueue(device, port, work_type, speed, source="poller"):
+    _ble_enqueued.append((device, port, work_type, speed, source))
+    return 99
+
+
+ble_db.enqueue_command = fake_enqueue
+ble_db.command_status = lambda cmd_id: _ble_status
+ble_db.port_confirmed_off = lambda device, port, since_ts=0.0: _ble_confirms
+os.environ["BLE_STOP_FALLBACK_WAIT_S"] = "2"
+
+# No BLE MAC configured -> the fallback must not even be attempted (it could only
+# time out, delaying the freeze during an emergency).
+os.environ.pop("BLE_DEFAULT_MAC", None)
+reset(); _writes.clear(); _ble_enqueued.clear()
+_verify_ok = False
+r = dosing.timed_dose("TEST", DEV, 4, 1, 0.5, solution="ph_down")
+check("no BLE MAC configured -> no fallback attempted", _ble_enqueued == [])
+check("unverified stop still FREEZES dosing", safety_state.is_dosing_disabled() is True)
+
+os.environ["BLE_DEFAULT_MAC"] = "AA:BB:CC:DD:EE:FF"
+reset(); _writes.clear(); _ble_enqueued.clear()
+_verify_ok = False; _ble_confirms = True; _ble_status = "done"
+r = dosing.timed_dose("TEST", DEV, 4, 1, 0.5, solution="ph_down")
+check("cloud stop failure queues a BLE stop", len(_ble_enqueued) == 1)
+check("BLE fallback enqueues off-mode speed 0 on the dosed port",
+      _ble_enqueued[0][1:4] == (4, 0, 0))
+check("BLE-confirmed stop counts as verified", r["ok"] is True)
+check("BLE-confirmed stop does NOT freeze dosing", safety_state.is_dosing_disabled() is False)
+active, _, _ = runtime_state.high_alert_status()
+check("degraded cloud path still opens high-alert", active is True)
+
+reset(); _writes.clear(); _ble_enqueued.clear()
+_verify_ok = False; _ble_confirms = False; _ble_status = "done"
+r = dosing.timed_dose("TEST", DEV, 4, 1, 0.5, solution="ph_down")
+check("BLE fallback that cannot confirm leaves the stop unverified", r["ok"] is False)
+check("unconfirmed fallback still freezes dosing", safety_state.is_dosing_disabled() is True)
+
+reset(); _writes.clear(); _ble_enqueued.clear()
+_verify_ok = False; _ble_confirms = False; _ble_status = "failed"
+_t0 = time.monotonic()
+r = dosing.timed_dose("TEST", DEV, 4, 1, 0.5, solution="ph_down")
+check("a failed BLE queue row gives up immediately (no dead wait)",
+      time.monotonic() - _t0 < 2.0)
+check("failed BLE row still freezes dosing", safety_state.is_dosing_disabled() is True)
+
+_verify_ok = True
+os.environ.pop("BLE_DEFAULT_MAC", None)
+os.environ.pop("BLE_STOP_FALLBACK_WAIT_S", None)
 
 
 # =========================================================================== #

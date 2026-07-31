@@ -391,6 +391,52 @@ os.environ.pop("AUTONOMOUS_DOSING", None)
 
 
 # =========================================================================== #
+# 2026-07-31 review, P0-3: a corrupt lockout file must not hand every port a free
+# immediate re-dose. Kept last -- it deliberately leaves a fail-closed floor set.
+# =========================================================================== #
+print("\n== corrupt lockout persistence fails CLOSED ==")
+import json
+reset()
+ai_advisor._last_dose_time = {}
+ai_advisor._last_ph_time = 0.0
+ai_advisor._lockout_floor = 0.0
+
+ai_advisor._LOCKOUT_FILE.write_text(json.dumps(
+    {"last_dose_time": {"TestRes:1": time.time() - 10}, "last_ph_time": 0}))
+ai_advisor._load_lockouts()
+check("a VALID lockout file loads with no fail-closed floor",
+      ai_advisor._lockout_floor == 0.0)
+check("valid file restores the real per-port clock",
+      "TestRes:1" in ai_advisor._last_dose_time)
+
+ai_advisor._last_dose_time = {}
+ai_advisor._last_ph_time = 0.0
+ai_advisor._LOCKOUT_FILE.write_text('{"last_dose_time": {"TestRes:1": 17')  # truncated
+_before = time.time()
+ai_advisor._load_lockouts()
+check("corrupt lockout file sets a fail-closed floor",
+      ai_advisor._lockout_floor >= _before)
+check("a port with NO restored record is locked out anyway",
+      ai_advisor._last_dose_ts("TestRes:1") == ai_advisor._lockout_floor)
+check("the global pH clock restarts too",
+      ai_advisor._last_ph_time == ai_advisor._lockout_floor)
+check("the corrupt lockout file is preserved for inspection",
+      any(p.name.startswith(".lockouts.json.corrupt.") for p in _TMP.iterdir()))
+
+# The real proof: the dose verb (which is how chemicals actually move) is gated by
+# the floor even though no per-port record survived the corrupt file.
+blocked = ai_advisor.filter_actions([dose("timed_nutrient_microdose")], snapshot=snap())
+check("the dose verb is blocked by the fail-closed floor", blocked == [])
+blocked_ph = ai_advisor.filter_actions([dose("timed_ph_down_microdose")], snapshot=snap())
+check("pH doses are blocked by the fail-closed floor too", blocked_ph == [])
+stop = ai_advisor.filter_actions(
+    [{"device": "TestRes", "port": 1, "action": "set_speed", "value": 0}], snapshot=snap())
+check("a STOP still passes under the fail-closed floor", len(stop) == 1)
+
+ai_advisor._lockout_floor = 0.0     # do not leak the floor into any later case
+
+
+# =========================================================================== #
 print(f"\n{'='*48}\n  {_PASS} passed, {_FAIL} failed\n{'='*48}")
 import shutil
 shutil.rmtree(_TMP, ignore_errors=True)

@@ -26,6 +26,7 @@ from ac_infinity_client import (
     stop_and_verify,
 )
 from utils import name_slug
+import proc_lock
 import runtime_state
 import event_log
 import away_mode
@@ -298,7 +299,11 @@ def enforce_res_burst(snapshot: dict, devices: list, token: str) -> list:
 def _verified_doser_stop(token: str, dev: dict, port: int, tag: str) -> bool:
     """Stop a doser/pH port and confirm it via the shared stop primitive; one retry if
     the first stop will not verify. Returns True only when the port is confirmed at 0.
-    Caller owns the freeze/alert policy on a False return."""
+    Caller owns the freeze/alert policy on a False return.
+
+    Like the dosing module's stop, a cloud stop that will not verify falls back to the
+    local BLE transport before giving up. These are the two paths that exist to get a
+    chemical pump OFF -- an AC Infinity outage must not be able to disarm both."""
     res = stop_and_verify(token, dev, port, retries=1, verify=VERIFY_WRITES)
     if res["ok"]:
         if res["reason"] != "verify skipped":
@@ -307,6 +312,17 @@ def _verified_doser_stop(token: str, dev: dict, port: int, tag: str) -> bool:
     obs = (res.get("observed") or {}).get("speed_actual")
     print(f"  [{tag}] stop UNVERIFIED {dev['name']} port {port} "
           f"(observed speed {obs}) -- {res['reason']}")
+    if token == "SIM":
+        return False
+    try:
+        from dosing import ble_stop_fallback
+    except Exception as e:
+        print(f"  [{tag}] BLE stop fallback unavailable ({e})")
+        return False
+    if ble_stop_fallback(dev, port):
+        print(f"  [{tag}] {dev['name']} port {port} stopped via the local BLE fallback "
+              "after the cloud stop failed")
+        return True
     return False
 
 
@@ -506,6 +522,18 @@ def enforce_schedule_fallback(snapshot: dict, executed_actions: list,
 def main():
     if not EMAIL or not PASSWORD:
         print("ERROR: Set AC_INFINITY_EMAIL and AC_INFINITY_PASSWORD in .env")
+        sys.exit(1)
+
+    # One poller per machine. Two instances would double-drive every deterministic
+    # emergency, race each other on every write, and -- worst -- both pass the dose
+    # preflight and overlap chemical doses. The lock is an flock, so the kernel frees
+    # it if this process dies; a crashed poller never blocks the next start.
+    singleton = proc_lock.ProcessLock(proc_lock.POLLER)
+    try:
+        singleton.acquire()
+    except proc_lock.LockBusy as e:
+        print(f"ERROR: another poller is already running ({e}). "
+              "Refusing to start a second instance -- stop that one first.")
         sys.exit(1)
 
     print("Authenticating with AC Infinity cloud...")
@@ -860,6 +888,7 @@ def main():
                 runtime_state.mark_clean_shutdown()
             except Exception:
                 pass
+        singleton.release()
 
 
 if __name__ == "__main__":

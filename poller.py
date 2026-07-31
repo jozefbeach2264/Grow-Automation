@@ -373,8 +373,10 @@ def clamp_safety_sleep(sleep_for: int, snapshot: dict) -> tuple[int, str | None]
     the time-to-confirm is (debounce - 1) x the poll interval -- and the poll interval
     is chosen by the AI/idle logic, which knows nothing about leaks. At
     POLL_INTERVAL_STABLE=900 that is ~15 min to confirm on top of up to ~15 min before
-    the first wet read is even taken; the AI-failure backoff can reach 1800s and make
-    it worse. A reservoir can empty in that window.
+    the first wet read is even taken -- ~30 min end to end. The AI-failure backoff is
+    a second long path: it climbs geometrically to POLL_INTERVAL x 32 (hard-capped at
+    1800s), i.e. 960s at the default POLL_INTERVAL=30, and 1800s only once
+    POLL_INTERVAL exceeds ~56s. A reservoir can empty in any of those windows.
 
     Two independent bounds, applied after every sleep branch (including the AI backoff):
 
@@ -928,7 +930,8 @@ def main():
 
                 # Safety cadence: the sleep above is chosen by AI/idle logic that knows
                 # nothing about the leak debounce, so bound it here -- applies to EVERY
-                # branch above, including the AI-failure backoff (which can reach 1800s).
+                # branch above, including the AI-failure backoff (POLL_INTERVAL x 32,
+                # capped at 1800s).
                 sleep_for, safety_note = clamp_safety_sleep(sleep_for, snapshot)
                 if safety_note:
                     print(f"  [SAFETY-POLL] {safety_note}")

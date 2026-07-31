@@ -446,7 +446,9 @@ ventilation/lighting is itself a hazard and must never cascade from a chemical f
   debounce means time-to-confirm = (debounce-1) x the poll interval — and the interval
   is chosen by AI/idle logic that knows nothing about leaks. At
   `POLL_INTERVAL_STABLE=900` that was ~15 min to confirm on top of up to ~15 min to
-  first see it (the AI-failure backoff reaches 1800s and made it worse). Two bounds,
+  first see it (~30 min end to end). The AI-failure backoff is a second long path:
+  `POLL_INTERVAL` x 32, hard-capped at 1800s — 960s at the default `POLL_INTERVAL=30`,
+  and 1800s only once `POLL_INTERVAL` exceeds ~56s. Two bounds,
   applied after EVERY sleep branch, only ever shortening: an **unconfirmed wet streak**
   re-polls at `LEAK_CONFIRM_POLL_SEC` (30s — free, since the streak is 0 in normal
   operation), and while a water responder is **armed** (`RES_BURST_ENABLED=true` or

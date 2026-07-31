@@ -336,6 +336,75 @@ def _doser_watchdog_debounce() -> int:
         return 2
 
 
+def _leak_confirm_poll_sec() -> int:
+    """Cadence to re-poll at while a leak wet-streak is mid-debounce. Override
+    LEAK_CONFIRM_POLL_SEC."""
+    try:
+        return max(5, int(os.getenv("LEAK_CONFIRM_POLL_SEC", "30")))
+    except ValueError:
+        return 30
+
+
+def _safety_poll_max_sec() -> int:
+    """Ceiling on the poll interval while a WATER-emergency responder is armed.
+    Override SAFETY_POLL_MAX_SEC."""
+    try:
+        return max(15, int(os.getenv("SAFETY_POLL_MAX_SEC", "300")))
+    except ValueError:
+        return 300
+
+
+def _water_responder_armed() -> bool:
+    """True when something deterministic is actually watching for a water emergency:
+    the reservoir-burst shutdown (`RES_BURST_ENABLED`) or an evac pump (`EVAC_PUMP`).
+
+    Gated on ARMED rather than applied unconditionally so an install with no leak
+    response configured keeps its gentle idle cadence -- there is nothing to react
+    faster FOR, and the ceiling would only spend API calls. It arms itself the moment
+    the operator turns the leak response on."""
+    return (os.getenv("RES_BURST_ENABLED", "").strip().lower() == "true"
+            or bool(os.getenv("EVAC_PUMP", "").strip()))
+
+
+def clamp_safety_sleep(sleep_for: int, snapshot: dict) -> tuple[int, str | None]:
+    """Bound the chosen sleep by SAFETY cadence, independent of AI state.
+
+    The leak sensor needs `RES_BURST_DEBOUNCE` consecutive wet reads to confirm, so
+    the time-to-confirm is (debounce - 1) x the poll interval -- and the poll interval
+    is chosen by the AI/idle logic, which knows nothing about leaks. At
+    POLL_INTERVAL_STABLE=900 that is ~15 min to confirm on top of up to ~15 min before
+    the first wet read is even taken; the AI-failure backoff can reach 1800s and make
+    it worse. A reservoir can empty in that window.
+
+    Two independent bounds, applied after every sleep branch (including the AI backoff):
+
+      1. A wet streak IN PROGRESS but not yet confirmed -> poll at
+         LEAK_CONFIRM_POLL_SEC. This is free in normal operation (streak is 0) and it
+         is precisely the moment the system most needs another look.
+      2. While a water responder is armed -> cap at SAFETY_POLL_MAX_SEC, so the
+         detection half (leak starts right after a poll) is bounded too.
+
+    Only ever SHORTENS the sleep. Returns (sleep_for, note-or-None)."""
+    leak = (snapshot or {}).get("leak") or {}
+    streak = int(leak.get("streak") or 0)
+    note = None
+
+    if streak > 0 and not leak.get("confirmed"):
+        iv = _leak_confirm_poll_sec()
+        if iv < sleep_for:
+            sleep_for = iv
+            note = (f"leak sensor wet ({streak} read(s), unconfirmed) -- "
+                    f"re-polling in {iv}s to confirm or clear")
+
+    if _water_responder_armed():
+        ceiling = _safety_poll_max_sec()
+        if ceiling < sleep_for:
+            sleep_for = ceiling
+            note = note or (f"water responder armed -- poll capped at {ceiling}s")
+
+    return sleep_for, note
+
+
 def doser_watchdog(devices: list, token: str, startup: bool = False) -> list:
     """Stop any doser/pH port found running outside a legitimate active-dose window.
 
@@ -856,6 +925,13 @@ def main():
                     sleep_for = min(ACTIVE_INTERVAL, INTERVAL) if executed_actions else INTERVAL
                     mode_str  = "DET-ACTIVE" if executed_actions else "DET-IDLE"
                     print(f"  [--] Mode: {mode_str}  next poll in {sleep_for}s  (no AI)")
+
+                # Safety cadence: the sleep above is chosen by AI/idle logic that knows
+                # nothing about the leak debounce, so bound it here -- applies to EVERY
+                # branch above, including the AI-failure backoff (which can reach 1800s).
+                sleep_for, safety_note = clamp_safety_sleep(sleep_for, snapshot)
+                if safety_note:
+                    print(f"  [SAFETY-POLL] {safety_note}")
 
                 # High-alert reservoir polling: after a recovery/scare, poll faster
                 # for a bounded, persisted window. Never lengthens the chosen sleep.

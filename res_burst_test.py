@@ -132,6 +132,66 @@ check("no burst -> nothing fired", fired == [])
 check("no burst -> no freeze", safety_state.is_dosing_disabled() is False)
 
 
+print("\n== clamp_safety_sleep: the leak debounce bounds the poll cadence ==")
+# 2026-07-31 review P1-6: the sleep is chosen by AI/idle logic that knows nothing
+# about the leak debounce. At POLL_INTERVAL_STABLE=900 with RES_BURST_DEBOUNCE=2 that
+# is ~15 min to CONFIRM a leak on top of up to ~15 min to first see it, and the
+# AI-failure backoff can reach 1800s.
+_armed = os.environ.get("RES_BURST_ENABLED")
+os.environ.pop("EVAC_PUMP", None)
+os.environ.pop("LEAK_CONFIRM_POLL_SEC", None)
+os.environ.pop("SAFETY_POLL_MAX_SEC", None)
+
+
+def leak_snap(streak, confirmed):
+    return {"leak": {"raw": 1 if streak else 0, "wet": streak > 0,
+                     "confirmed": confirmed, "streak": streak}}
+
+
+os.environ["RES_BURST_ENABLED"] = "false"          # nothing armed -> ceiling off
+s, note = poller.clamp_safety_sleep(900, leak_snap(0, False))
+check("dry + unarmed leaves the idle cadence alone", s == 900 and note is None)
+
+s, note = poller.clamp_safety_sleep(900, leak_snap(1, False))
+check("ONE wet read collapses a 900s sleep to the confirm cadence", s == 30)
+check("the clamp explains itself", note is not None and "unconfirmed" in note)
+
+s, _ = poller.clamp_safety_sleep(1800, leak_snap(1, False))
+check("the 1800s AI-failure backoff is bounded too", s == 30)
+
+s, note = poller.clamp_safety_sleep(900, leak_snap(2, True))
+check("a CONFIRMED leak does not clamp (res-burst already fired)", s == 900)
+
+s, _ = poller.clamp_safety_sleep(10, leak_snap(1, False))
+check("never LENGTHENS an already-fast sleep", s == 10)
+
+os.environ["RES_BURST_ENABLED"] = "true"           # armed -> detection ceiling on
+s, note = poller.clamp_safety_sleep(900, leak_snap(0, False))
+check("armed responder caps the idle sleep at the safety ceiling", s == 300)
+check("ceiling explains itself", note is not None and "armed" in note)
+
+os.environ["RES_BURST_ENABLED"] = "false"
+os.environ["EVAC_PUMP"] = "Auxiliary Outputs:3"
+s, _ = poller.clamp_safety_sleep(900, leak_snap(0, False))
+check("a configured evac pump arms the ceiling on its own", s == 300)
+os.environ.pop("EVAC_PUMP", None)
+
+os.environ["RES_BURST_ENABLED"] = "true"
+os.environ["SAFETY_POLL_MAX_SEC"] = "120"
+os.environ["LEAK_CONFIRM_POLL_SEC"] = "10"
+s, _ = poller.clamp_safety_sleep(900, leak_snap(0, False))
+check("SAFETY_POLL_MAX_SEC is honored", s == 120)
+s, _ = poller.clamp_safety_sleep(900, leak_snap(1, False))
+check("an unconfirmed streak beats the ceiling (tighter wins)", s == 10)
+os.environ.pop("SAFETY_POLL_MAX_SEC", None)
+os.environ.pop("LEAK_CONFIRM_POLL_SEC", None)
+
+s, note = poller.clamp_safety_sleep(900, {})
+check("a snapshot with no leak block is handled", s == 300 and "armed" in (note or ""))
+if _armed is not None:
+    os.environ["RES_BURST_ENABLED"] = _armed
+
+
 # =========================================================================== #
 print(f"\n{'='*48}\n  {_PASS} passed, {_FAIL} failed\n{'='*48}")
 import shutil

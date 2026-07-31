@@ -442,6 +442,16 @@ ventilation/lighting is itself a hazard and must never cascade from a chemical f
   reading can't freeze dosing. Never triggers off `water_level` or the manual
   `WATER_LEVEL_TREND` (false-trip protection).
 - Detected always (alert printed even in `ADVISORY_MODE`); actuates only in LIVE.
+- **Safety poll cadence (`poller.clamp_safety_sleep`, 2026-07-31 review P1-6).** The
+  debounce means time-to-confirm = (debounce-1) x the poll interval — and the interval
+  is chosen by AI/idle logic that knows nothing about leaks. At
+  `POLL_INTERVAL_STABLE=900` that was ~15 min to confirm on top of up to ~15 min to
+  first see it (the AI-failure backoff reaches 1800s and made it worse). Two bounds,
+  applied after EVERY sleep branch, only ever shortening: an **unconfirmed wet streak**
+  re-polls at `LEAK_CONFIRM_POLL_SEC` (30s — free, since the streak is 0 in normal
+  operation), and while a water responder is **armed** (`RES_BURST_ENABLED=true` or
+  `EVAC_PUMP` set) the sleep is capped at `SAFETY_POLL_MAX_SEC` (300s). Gated on armed
+  so an install with no leak response keeps its gentle idle cadence.
 - Wet/dry raw values confirmed `0=dry / 1=wet` on the ACI water sensors (2026-06).
 
 **3. Evac pump (`compute_evac_pump` / poller).** When the leak sensor is confirmed wet,

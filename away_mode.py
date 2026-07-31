@@ -250,31 +250,31 @@ def run(snapshot: dict, devices: list, token: str,
                                        port=plan.get("port"))
         return []
 
-    # LIVE climate dispatch.
-    from ac_infinity_client import set_port_speed, set_outlet
-    dev = {d["name"]: d for d in devices}.get(plan["device"])
-    aid = event_log.log_action_request(cycle_id, {**plan, "playbook": pb},
-                                       source="away_mode")
-    event_log.log_action_validation(cycle_id, aid, True, stage="away_dispatch")
-    if dev is None:
-        print(f"  [AWAY] unknown device '{plan['device']}' -- cannot dispatch {pb}")
-        event_log.log_action_execution(cycle_id, aid, executed=False, success=False,
-                                       reason="unknown_device", playbook=pb)
-        return []
+    # LIVE climate dispatch -- through the SAME gated, read-after-write path as every
+    # AI action, never a private one.
+    #
+    # This used to call set_port_speed/set_outlet directly, which skipped
+    # validate_actions + filter_actions (schema, speed caps, the chemical interlock) AND
+    # the read-after-write verification -- so a dispatch was logged success=True on
+    # nothing more than an HTTP call that did not raise. Two independent reviews flagged
+    # it, and it is the clearest instance of the pattern they both found: the safety net
+    # is solid on the main path and thin on every path that bypasses execute_actions.
+    # Routing through it makes the gate structural rather than a convention this module
+    # happened not to follow. execute_actions tags the ledger with source="away_mode",
+    # so provenance survives the move.
+    from ai_advisor import execute_actions
+    action = {**plan, "playbook": pb, "source": "away_mode"}
     try:
-        if plan["action"] == "set_outlet":
-            set_outlet(token, dev["dev_id"], plan["port"], bool(plan["value"]), dev["type"])
-        else:
-            set_port_speed(token, dev["dev_id"], plan["port"], int(plan["value"]), dev["type"])
-        print(f"  [AWAY] DISPATCH {pb}: {plan['device']} port {plan['port']} -> "
-              f"{plan['action']}={plan['value']}  ({plan['reason']})")
-        event_log.log_action_execution(cycle_id, aid, executed=True, success=True,
-                                       playbook=pb, device=plan["device"],
-                                       port=plan["port"], command_type=plan["action"],
-                                       value_sent=plan["value"])
-        return [{**plan, "playbook": pb, "source": "away_mode"}]
+        executed = execute_actions({"actions": [action]}, devices, token,
+                                   snapshot=snapshot, cycle_id=cycle_id,
+                                   source="away_mode")
     except Exception as e:
         print(f"  [AWAY] FAILED {pb} on {plan['device']} port {plan['port']}: {e}")
-        event_log.log_action_execution(cycle_id, aid, executed=True, success=False,
-                                       error=str(e), playbook=pb)
         return []
+    if not executed:
+        print(f"  [AWAY] {pb} NOT dispatched -- rejected by the safety gate or the write "
+              f"failed (see the [VALIDATE]/[SAFETY]/[EXEC] lines above)")
+        return []
+    print(f"  [AWAY] DISPATCH {pb}: {plan['device']} port {plan['port']} -> "
+          f"{plan['action']}={plan['value']}  ({plan['reason']})")
+    return [{**a, "playbook": pb, "source": "away_mode"} for a in executed]

@@ -1654,7 +1654,8 @@ def _execute_dose(a: dict, dev: dict, token: str) -> dict | None:
 
 def execute_actions(result: dict, devices: list[dict], token: str,
                     snapshot: dict | None = None,
-                    cycle_id: str | None = None) -> list[dict]:
+                    cycle_id: str | None = None,
+                    source: str = "ai") -> list[dict]:
     """Validate -> safety-gate -> execute approved actions via the AC Infinity API.
     Climate writes are read-after-write verified; chemical `dose` actions run through
     dosing.timed_dose (which verifies + force-stops internally) and are gated by
@@ -1663,7 +1664,12 @@ def execute_actions(result: dict, devices: list[dict], token: str,
     Every proposed action is recorded in the event ledger under cycle_id: an
     action_request, a validation result at the stage that decided it (schema /
     safety_gate / executed) with the precise rejection reason, and an execution
-    record for the ones that ran."""
+    record for the ones that ran.
+
+    `source` tags those ledger entries with what proposed the action ("ai", or
+    "away_mode" for code-driven away-mode triage). This is the ONE hardware-write path
+    that is gated and verified, so every producer routes through it -- the tag keeps
+    the audit trail honest without giving anyone their own private write path."""
     from ac_infinity_client import set_port_speed, set_outlet
 
     proposed = result.get("actions", [])
@@ -1685,17 +1691,17 @@ def execute_actions(result: dict, devices: list[dict], token: str,
     # Best-effort -- logging never breaks execution.
     for action, code in schema_rejected:
         req = action if isinstance(action, dict) else {"reason": repr(action)}
-        aid = event_log.log_action_request(cycle_id, req, source="ai")
+        aid = event_log.log_action_request(cycle_id, req, source=source)
         event_log.log_action_validation(cycle_id, aid, False, reason=code, stage="schema")
     for action, code in safety_blocked:
-        aid = event_log.log_action_request(cycle_id, action, source="ai")
+        aid = event_log.log_action_request(cycle_id, action, source=source)
         event_log.log_action_validation(cycle_id, aid, False, reason=code, stage="safety_gate")
 
     dev_map = {d["name"]: d for d in devices}
     verify_enabled = _verify_writes_enabled(token)
     executed = []
     for a in safe_actions:
-        aid = event_log.log_action_request(cycle_id, a, source="ai")
+        aid = event_log.log_action_request(cycle_id, a, source=source)
         event_log.log_action_validation(cycle_id, aid, True, stage="safety_gate")
         dev = dev_map.get(a["device"])
         if not dev:
@@ -1755,17 +1761,21 @@ def execute_actions(result: dict, devices: list[dict], token: str,
                                            success=False, error=str(e),
                                            device=a["device"], port=a["port"],
                                            command_type=a["action"],
-                                           value_sent=a.get("value"))
+                                           value_sent=a.get("value"),
+                                           playbook=a.get("playbook"))
             continue
         verified = None
         if verify_enabled:
             vres = _verify_executed_action(token, dev, a)
             verified = bool(vres.get("ok")) if isinstance(vres, dict) else None
+        # `playbook` is carried through for code-driven producers (away-mode triage);
+        # it is simply absent on raw AI set_speed/set_outlet actions.
         event_log.log_action_execution(cycle_id, aid, executed=True,
                                        success=True, verified=verified,
                                        device=a["device"], port=a["port"],
                                        command_type=a["action"],
-                                       value_sent=a.get("value"))
+                                       value_sent=a.get("value"),
+                                       playbook=a.get("playbook"))
 
     if executed:
         record_actions(executed)

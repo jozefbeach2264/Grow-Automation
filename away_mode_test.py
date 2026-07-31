@@ -45,12 +45,24 @@ def reset(**env):
 
 # Captured hardware writes.
 _writes = []
+# Captured read-after-write verifications. Away-mode dispatch routes through
+# ai_advisor.execute_actions, which verifies every climate write -- patch the readback
+# too or the suite makes real AC Infinity API calls (8 of them, ~2 min).
+_verifies = []
+_verify_ok = True
+
+
+def _fake_verify(token, dev_id, port, expected, timeout_sec=15.0, **kw):
+    _verifies.append((dev_id, port, dict(expected)))
+    return {"ok": _verify_ok, "observed": expected if _verify_ok else {"speed_actual": -1},
+            "elapsed_sec": 0.1, "attempts": 1, "reason": "" if _verify_ok else "mismatch"}
 
 
 def _install_fake_client():
     import ac_infinity_client as cli
     cli.set_port_speed = lambda token, dev_id, port, speed, dev_type: _writes.append(("speed", dev_id, port, speed))
     cli.set_outlet = lambda token, dev_id, port, val, dev_type: _writes.append(("outlet", dev_id, port, val))
+    cli.verify_port_state = _fake_verify
 
 
 _install_fake_client()
@@ -83,6 +95,7 @@ def snap_with(stressors, **extra):
 
 def run(snapshot, cycle_actions=None):
     _writes.clear()
+    _verifies.clear()
     return away_mode.run(snapshot, DEVS, "TOK", cycle_id="C1",
                          cycle_actions=cycle_actions)
 
@@ -259,6 +272,62 @@ def test_alert_logged():
     check("execution recorded with playbook + success", execs and execs[-1]["success"] is True)
 
 
+# --- the safety gate is not optional for away-mode (2026-07-31 review P1-8) --------
+
+def test_dispatch_is_verified():
+    """A LIVE dispatch must be read back, not assumed from a non-raising write."""
+    global _verify_ok
+    reset(AWAY_MODE="true", ADVISORY_MODE="false", ROLE_EXHAUST="4 x 4:2")
+    _verify_ok = True
+    out = run(snap_with(["tent_temp_high"], exhaust_speed=3))
+    check("live dispatch is read back after the write",
+          _verifies == [("D1", 2, {"speed_actual": 4, "tolerance": 1})])
+    check("verified dispatch is returned as executed", len(out) == 1)
+    import event_log
+    execs = [e for e in event_log._read_events() if e.get("type") == "action_execution"]
+    check("ledger records the dispatch as verified", execs[-1].get("verified") is True)
+    check("ledger keeps the playbook on the execution record",
+          execs[-1].get("playbook") == "increase_exhaust_one_step")
+
+
+def test_dispatch_ledger_source():
+    reset(AWAY_MODE="true", ADVISORY_MODE="false", ROLE_EXHAUST="4 x 4:2")
+    run(snap_with(["tent_temp_high"], exhaust_speed=3))
+    import event_log
+    reqs = [e for e in event_log._read_events() if e.get("type") == "action_request"]
+    check("ledger attributes the action to away_mode, not the AI",
+          reqs[-1].get("source") == "away_mode")
+
+
+def test_unverified_dispatch_reported():
+    """A write the hardware never confirms must not be reported as a dispatch."""
+    global _verify_ok
+    reset(AWAY_MODE="true", ADVISORY_MODE="false", ROLE_EXHAUST="4 x 4:2")
+    _verify_ok = False
+    out = run(snap_with(["tent_temp_high"], exhaust_speed=3))
+    import event_log
+    execs = [e for e in event_log._read_events() if e.get("type") == "action_execution"]
+    check("unconfirmed dispatch is flagged unverified in the ledger",
+          execs[-1].get("verified") is False)
+    _verify_ok = True
+
+
+def test_gate_blocks_chemical_port_dispatch():
+    """The interlock the direct-write path bypassed entirely.
+
+    If ROLE_EXHAUST is ever misconfigured onto a doser port, the old code issued a raw
+    set_speed straight at a chemical pump. filter_actions rejects raw chemical starts
+    outright -- routing through it makes that structurally impossible."""
+    reset(AWAY_MODE="true", ADVISORY_MODE="false", ROLE_EXHAUST="4 x 4:2")
+    os.environ["DOSER_PORTS_4_X_4"] = "2"          # port 2 is now a chemical port
+    try:
+        out = run(snap_with(["tent_temp_high"], exhaust_speed=3))
+        check("no hardware write to a chemical port", _writes == [])
+        check("nothing reported as dispatched", out == [])
+    finally:
+        os.environ.pop("DOSER_PORTS_4_X_4", None)
+
+
 def main():
     print("Away-mode executor self-tests")
     print("=" * 44)
@@ -281,6 +350,10 @@ def main():
         test_alert_only_stressor,
         test_worst_first_actionable,
         test_alert_logged,
+        test_dispatch_is_verified,
+        test_dispatch_ledger_source,
+        test_unverified_dispatch_reported,
+        test_gate_blocks_chemical_port_dispatch,
     ):
         fn()
     print("=" * 44)

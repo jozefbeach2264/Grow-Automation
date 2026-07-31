@@ -101,7 +101,7 @@ Ports 3+4 are pH ports via `PH_PORTS_HYDROPONICS_CONTROL=3,4` — safety gate ap
 | `diagnostics.py` | Deterministic stressor list + code-owned playbook registry (away-mode triage foundation; READ-ONLY, no actuation) |
 | `diagnostics_test.py` | Self-tests for the stressor list + registry (32 cases) |
 | `away_mode.py` | Away-mode triage executor: code-driven worst-first playbook dispatch (climate-only live, chemical/CO2 dry-run) |
-| `away_mode_test.py` | Self-tests for the away-mode executor (24 checks) |
+| `away_mode_test.py` | Self-tests for the away-mode executor (32 checks) |
 | `ppfd.py` | Light/PPFD framework: PPFD-map loader, grid stats, height interpolation, DLI math, level recommendation (advisory) |
 | `ppfd_capture.py` | Interactive ingest tool — records an Apogee PPFD grid per level x height into `ppfd_map.json` |
 | `ppfd_test.py` | Self-tests for the PPFD framework (37 cases, synthetic map) |
@@ -671,9 +671,18 @@ stressor's top allowed playbook (one dispatch + one alert per cycle).
 - **Selection.** `select(snapshot)` walks stressors worst-first (diagnostics already sorts by
   severity); for each it takes the first allowed playbook with an applicable plan. Returns the
   worst stressor (always alerted) + the chosen dispatch (or None -> alert-only).
-- **Ledger.** Every dispatch logs an `action_request` (source `away_mode`) + `action_validation`
-  (stage `away_dispatch`) + `action_execution`; alerts log an `alert` event. Tests:
-  `away_mode_test.py` (24 checks).
+- **LIVE dispatch routes through `ai_advisor.execute_actions(..., source="away_mode")`**
+  (2026-07-31 review P1-8, corroborated by two reviews). It used to call
+  `set_port_speed`/`set_outlet` directly, which skipped `validate_actions` +
+  `filter_actions` AND the read-after-write verification — a dispatch was logged
+  `success=True` on nothing more than a non-raising HTTP call, and a `ROLE_EXHAUST`
+  misconfigured onto a doser port would have fired a raw `set_speed` at a chemical pump.
+  **There is exactly one gated, verified hardware-write path; no producer gets a private
+  one.** `source` keeps the ledger's provenance (`ai` vs `away_mode`) intact.
+- **Ledger.** Every dispatch logs an `action_request` (source `away_mode`) +
+  `action_validation` + `action_execution` (carrying `playbook` and `verified`); the
+  advisory/dry path still logs stage `away_dispatch`. Alerts log an `alert` event. Tests:
+  `away_mode_test.py` (32 checks).
 - Config: `AWAY_MODE`, `AWAY_EXHAUST_STEP`, `AWAY_EXHAUST_MAX`, `AWAY_LIGHT_FLOOR`.
 - **Deferred:** the AI `selected_playbook` contract change; live light reduction (needs the
   schedule override); live chemical/CO2 playbooks (need HDS3 + reconnected hardware); a real

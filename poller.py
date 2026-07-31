@@ -24,6 +24,7 @@ from ac_infinity_client import (
     set_outlet,
     set_port_speed,
     stop_and_verify,
+    verify_port_state,
 )
 from utils import name_slug
 import proc_lock
@@ -336,6 +337,70 @@ def _doser_watchdog_debounce() -> int:
         return 2
 
 
+def enforce_evac_pump(ev: dict, dev: dict, token: str) -> bool:
+    """Drive the evac pump outlet and CONFIRM it physically switched. Returns True if
+    the write went out (so the caller can record the action).
+
+    A 200 only proves the API accepted the write. For a pump whose entire job is to be
+    running while there is water on the floor, "we sent it" is not good enough: an
+    accepted-but-not-actuated ON leaves the leak unattended while the log claims the
+    pump is running. So the write is read back (retry once) and a failure to confirm is
+    a loud alert plus a high-alert polling window -- never a silent success line.
+
+    Deliberately does NOT freeze dosing: the evac pump is not a doser, and a pump that
+    won't start is a reason to look at the tent, not to lock out chemistry."""
+    device, port, want = ev["device"], ev["port"], bool(ev["value"])
+    try:
+        set_outlet(token, dev["dev_id"], port, want, dev["type"])
+    except Exception as e:
+        print(f"  [!!! EVAC FAILED !!!] {device} port {port} write error: {e}")
+        runtime_state.record_event("evac_pump_write_failed", device=device, port=port,
+                                   desired_on=want, error=str(e))
+        runtime_state.start_high_alert(f"evac pump write failed on {device} port {port}")
+        return False
+    print(f"  [EVAC] {device} port {port} -> set_outlet={want}  ({ev['reason']})")
+
+    if not VERIFY_WRITES or token == "SIM":
+        return True
+    ok = False
+    for attempt in (1, 2):
+        try:
+            res = verify_port_state(token, dev["dev_id"], port, {"powered": want})
+        except Exception as e:
+            print(f"  [EVAC] verify error on {device} port {port}: {e}")
+            break
+        if res.get("ok"):
+            ok = True
+            print(f"  [EVAC] verified {device} port {port} powered={want} "
+                  f"({res.get('elapsed_sec')}s)")
+            break
+        if attempt == 1:
+            print(f"  [EVAC] not confirmed (observed {res.get('observed')}) -- re-issuing")
+            try:
+                set_outlet(token, dev["dev_id"], port, want, dev["type"])
+            except Exception as e:
+                print(f"  [EVAC] re-issue failed: {e}")
+                break
+    if not ok:
+        print(f"  [!!! EVAC UNVERIFIED !!!] {device} port {port} would not confirm "
+              f"powered={want} -- water may be UNATTENDED; check the pump")
+        runtime_state.record_event("evac_pump_unverified", device=device, port=port,
+                                   desired_on=want)
+        runtime_state.start_high_alert(
+            f"evac pump {device} port {port} would not confirm powered={want}")
+    return True
+
+
+def _evac_poll_max_sec() -> int:
+    """Poll ceiling while an evac pump is armed. Detection latency IS response latency
+    for immediate evac, so this is much tighter than the general safety ceiling.
+    Override EVAC_POLL_MAX_SEC."""
+    try:
+        return max(10, int(os.getenv("EVAC_POLL_MAX_SEC", "30")))
+    except ValueError:
+        return 30
+
+
 def _leak_confirm_poll_sec() -> int:
     """Cadence to re-poll at while a leak wet-streak is mid-debounce. Override
     LEAK_CONFIRM_POLL_SEC."""
@@ -398,11 +463,19 @@ def clamp_safety_sleep(sleep_for: int, snapshot: dict) -> tuple[int, str | None]
             note = (f"leak sensor wet ({streak} read(s), unconfirmed) -- "
                     f"re-polling in {iv}s to confirm or clear")
 
-    if _water_responder_armed():
+    # An armed EVAC pump is the tightest bound: it fires on the first wet read, so the
+    # poll interval IS the response time. No point promising immediate evac and then
+    # only looking every 5 minutes.
+    if os.getenv("EVAC_PUMP", "").strip():
+        ceiling = _evac_poll_max_sec()
+        if ceiling < sleep_for:
+            sleep_for = ceiling
+            note = note or f"evac pump armed -- poll capped at {ceiling}s"
+    elif _water_responder_armed():
         ceiling = _safety_poll_max_sec()
         if ceiling < sleep_for:
             sleep_for = ceiling
-            note = note or (f"water responder armed -- poll capped at {ceiling}s")
+            note = note or f"water responder armed -- poll capped at {ceiling}s"
 
     return sleep_for, note
 
@@ -815,23 +888,17 @@ def main():
                         executed_actions.extend(burst_fired)
                         active = True
 
-                    # Evac pump tracks the leak sensor (ON when confirmed wet, OFF when
-                    # dry). Independent of RES_BURST_ENABLED; gated by EVAC_PUMP config.
+                    # Evac pump tracks the leak sensor (ON while wet -- on the FIRST wet
+                    # read by default, see compute_evac_pump; OFF when dry). Independent
+                    # of RES_BURST_ENABLED; gated by EVAC_PUMP config.
                     ev = snapshot.get("evac_pump")
                     if ev:
                         evdev = {d["name"]: d for d in devices}.get(ev["device"])
                         if not evdev:
                             print(f"  [EVAC] Unknown device '{ev['device']}' -- cannot run evac pump")
-                        else:
-                            try:
-                                set_outlet(token, evdev["dev_id"], ev["port"],
-                                           bool(ev["value"]), evdev["type"])
-                                print(f"  [EVAC] {ev['device']} port {ev['port']} -> "
-                                      f"set_outlet={ev['value']}  ({ev['reason']})")
-                                executed_actions.append(ev)
-                                active = True
-                            except Exception as e:
-                                print(f"  [EVAC] FAILED {ev['device']} port {ev['port']}: {e}")
+                        elif enforce_evac_pump(ev, evdev, token):
+                            executed_actions.append(ev)
+                            active = True
 
                     # --- Pre-AI CO2 emergency dump ---
                     em_fired = enforce_co2_emergency(snapshot, devices, token)

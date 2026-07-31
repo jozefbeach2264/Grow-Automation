@@ -1215,12 +1215,31 @@ def _evac_pump_target() -> tuple[str, int] | None:
         return None
 
 
+def _evac_immediate() -> bool:
+    """Whether the evac pump fires on the FIRST wet read instead of the debounced one.
+    Default TRUE -- see compute_evac_pump. Set EVAC_IMMEDIATE=false to go back to
+    waiting for RES_BURST_DEBOUNCE consecutive wet reads."""
+    return os.getenv("EVAC_IMMEDIATE", "true").strip().lower() != "false"
+
+
 def compute_evac_pump(snapshot: dict) -> dict | None:
-    """Evac pump tracks the leak sensor: ON once a leak is CONFIRMED wet, OFF when dry.
-    Gated by EVAC_PUMP=<device>:<port> (no config -> no action). Returns a set_outlet
-    delta ONLY when the desired state differs from the pump's current powered state, so
-    it never spams writes or runs the pump dry. Not a doser -- not subject to the
-    dosing freeze; water removal is always desirable during a leak."""
+    """Evac pump tracks the leak sensor: ON while wet, OFF when dry. Gated by
+    EVAC_PUMP=<device>:<port> (no config -> no action). Returns a set_outlet delta ONLY
+    when the desired state differs from the pump's current powered state, so it never
+    spams writes. Not a doser -- not subject to the dosing freeze; water removal is
+    always desirable during a leak.
+
+    IMMEDIATE by default (EVAC_IMMEDIATE, default true): the pump starts on the FIRST
+    wet read, NOT the debounced `confirmed` one. The RES_BURST_DEBOUNCE exists so one
+    noisy reading cannot trip the persistent dosing FREEZE -- a costly, manual-clear
+    action. Getting water off the floor is neither costly nor sticky: it reverses
+    itself on the next dry read. Making evac wait on a debounce built for a different
+    risk cost a full poll interval of pumping for no safety gain.
+
+    The cost of immediate is bounded and deliberate: one spurious wet read runs the
+    pump for at most one poll interval before the next dry read shuts it off. OFF is
+    still evaluated on the raw dry read either way, which is what keeps the pump from
+    running dry."""
     tgt = _evac_pump_target()
     if not tgt:
         return None
@@ -1228,7 +1247,7 @@ def compute_evac_pump(snapshot: dict) -> dict | None:
     leak = snapshot.get("leak") or {}
     if leak.get("raw") is None:
         return None  # no leak sensor reading -- do not command the pump blind
-    desired_on = bool(leak.get("confirmed"))   # ON after debounced wet; OFF when dry
+    desired_on = bool(leak.get("wet") if _evac_immediate() else leak.get("confirmed"))
     current = None
     for dev in snapshot.get("devices", []):
         if dev.get("name") != device:
@@ -1238,9 +1257,14 @@ def compute_evac_pump(snapshot: dict) -> dict | None:
                 current = p.get("powered")
     if current is not None and bool(current) == desired_on:
         return None  # already in the desired state -- no redundant write
+    if desired_on:
+        streak = leak.get("streak") or 0
+        reason = (f"leak WET (read {streak}, immediate) -- evac pump ON"
+                  if _evac_immediate() else "leak confirmed -- evac pump ON")
+    else:
+        reason = "leak clear -- evac pump OFF"
     return {"device": device, "port": port, "action": "set_outlet", "value": desired_on,
-            "reason": ("leak confirmed -- evac pump ON" if desired_on
-                       else "leak clear -- evac pump OFF")}
+            "reason": reason}
 
 
 def build_snapshot(devices: list[dict]) -> dict:

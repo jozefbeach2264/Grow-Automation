@@ -456,13 +456,28 @@ ventilation/lighting is itself a hazard and must never cascade from a chemical f
   so an install with no leak response keeps its gentle idle cadence.
 - Wet/dry raw values confirmed `0=dry / 1=wet` on the ACI water sensors (2026-06).
 
-**3. Evac pump (`compute_evac_pump` / poller).** When the leak sensor is confirmed wet,
-turn an evac pump outlet **ON** to pump water out; turn it **OFF** when the sensor reads
-dry (so it never runs dry). Gated by `EVAC_PUMP=<device>:<port>` (blank = no action),
-independent of `RES_BURST_ENABLED`. Fires a `set_outlet` only when the desired state
-differs from the pump's current `powered` state (no redundant writes). Shares the one
-debounced leak assessment (`snapshot["leak"]`, `_assess_leak`) with res-burst, so both
-react to the same confirmed signal. Not a doser — unaffected by the dosing freeze.
+**3. Evac pump (`compute_evac_pump` / `poller.enforce_evac_pump`).** When the leak sensor
+reads wet, turn an evac pump outlet **ON** to pump water out; turn it **OFF** when the
+sensor reads dry (so it never runs dry). Gated by `EVAC_PUMP=<device>:<port>` (blank = no
+action), independent of `RES_BURST_ENABLED`. Fires a `set_outlet` only when the desired
+state differs from the pump's current `powered` state (no redundant writes). Not a doser —
+unaffected by the dosing freeze.
+
+- **IMMEDIATE by default** (`EVAC_IMMEDIATE=true`, operator requirement 2026-07-31): the
+  pump starts on the **first wet read**, NOT the debounced `confirmed` one. The
+  `RES_BURST_DEBOUNCE` exists so one noisy read cannot trip the persistent dosing FREEZE —
+  a costly, manual-clear action. Getting water off the floor is neither costly nor sticky
+  (it reverses on the next dry read), so it must not wait on a debounce built for a
+  different risk. Cost of immediate: a spurious wet read runs the pump for at most one
+  poll interval. OFF is evaluated on the raw dry read in both modes — that is the dry-run
+  protection. Res-burst keeps its debounce.
+- **The write is verified, not assumed.** `enforce_evac_pump` reads the outlet back
+  (retry once); a pump that will not confirm ON is a loud `[!!! EVAC UNVERIFIED !!!]` plus
+  a high-alert window, never a silent success line. It does NOT freeze dosing — a pump
+  that won't start is a reason to look at the tent, not to lock out chemistry.
+- **Cadence:** with `EVAC_PUMP` set the poll ceiling drops to `EVAC_POLL_MAX_SEC` (30s),
+  overriding the looser `SAFETY_POLL_MAX_SEC` — under immediate evac the poll interval
+  *is* the response time.
 
 ## Timed dosing with forced stop (`dosing.py`)
 

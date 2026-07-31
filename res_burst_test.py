@@ -132,6 +132,107 @@ check("no burst -> nothing fired", fired == [])
 check("no burst -> no freeze", safety_state.is_dosing_disabled() is False)
 
 
+print("\n== evac pump: IMMEDIATE on the first wet read ==")
+# Operator requirement 2026-07-31: "if there is detection on the floor sensor i want
+# IMMEDIATE evac". The RES_BURST_DEBOUNCE exists to stop a noisy read tripping the
+# persistent dosing FREEZE; it must not also delay getting water off the floor.
+os.environ["EVAC_PUMP"] = "Auxiliary Outputs:3"
+os.environ.pop("EVAC_IMMEDIATE", None)
+
+
+def evac_snap(streak, confirmed, powered=False):
+    return {
+        "leak": {"raw": 1 if streak else 0, "wet": streak > 0,
+                 "confirmed": confirmed, "streak": streak},
+        "devices": [{"name": "Auxiliary Outputs",
+                     "ports": [{"port": 3, "powered": powered}]}],
+    }
+
+
+ev = ai_advisor.compute_evac_pump(evac_snap(1, False))
+check("ONE wet read turns the evac pump ON (no debounce wait)",
+      ev is not None and ev["value"] is True)
+check("evac targets the configured outlet",
+      ev["device"] == "Auxiliary Outputs" and ev["port"] == 3)
+check("reason records it fired immediately", "immediate" in ev["reason"])
+
+ev = ai_advisor.compute_evac_pump(evac_snap(1, False, powered=True))
+check("no redundant write when the pump is already running", ev is None)
+
+ev = ai_advisor.compute_evac_pump(evac_snap(0, False, powered=True))
+check("first DRY read turns it OFF (never runs dry)",
+      ev is not None and ev["value"] is False)
+
+os.environ["EVAC_IMMEDIATE"] = "false"
+ev = ai_advisor.compute_evac_pump(evac_snap(1, False))
+check("EVAC_IMMEDIATE=false restores the debounced behavior", ev is None)
+ev = ai_advisor.compute_evac_pump(evac_snap(2, True))
+check("debounced mode still fires once confirmed",
+      ev is not None and ev["value"] is True)
+os.environ.pop("EVAC_IMMEDIATE", None)
+
+ev = ai_advisor.compute_evac_pump({"leak": {"raw": None}, "devices": []})
+check("no leak reading -> never commands the pump blind", ev is None)
+
+os.environ.pop("EVAC_PUMP", None)
+ev = ai_advisor.compute_evac_pump(evac_snap(1, False))
+check("unconfigured evac pump stays inert", ev is None)
+
+
+print("\n== enforce_evac_pump: the write is read back, not assumed ==")
+os.environ["EVAC_PUMP"] = "Auxiliary Outputs:3"
+_outlet_writes = []
+_verify_ok = True
+
+
+def fake_set_outlet(token, dev_id, port, powered, dev_type):
+    _outlet_writes.append((port, powered))
+
+
+def fake_verify(token, dev_id, port, expected, timeout_sec=15.0, **kw):
+    return {"ok": _verify_ok, "observed": {"powered": not expected["powered"]},
+            "elapsed_sec": 1, "attempts": 1, "reason": ""}
+
+
+poller.set_outlet = fake_set_outlet
+poller.verify_port_state = fake_verify
+poller.VERIFY_WRITES = True
+EVDEV = {"name": "Auxiliary Outputs", "dev_id": "d-aux", "type": 21}
+EV_ON = {"device": "Auxiliary Outputs", "port": 3, "action": "set_outlet",
+         "value": True, "reason": "leak WET (read 1, immediate) -- evac pump ON"}
+
+reset(); _outlet_writes.clear(); _verify_ok = True
+sent = poller.enforce_evac_pump(EV_ON, EVDEV, "TOKEN")
+check("evac ON is written and verified", sent is True and _outlet_writes == [(3, True)])
+active, _, _ = runtime_state.high_alert_status()
+check("a verified evac raises no alarm", active is False)
+
+reset(); _outlet_writes.clear(); _verify_ok = False
+sent = poller.enforce_evac_pump(EV_ON, EVDEV, "TOKEN")
+check("an unconfirmed evac re-issues the write", len(_outlet_writes) == 2)
+active, _, reason = runtime_state.high_alert_status()
+check("an unconfirmed evac opens high-alert", active is True)
+check("high-alert names the evac pump", "evac" in (reason or ""))
+check("but does NOT freeze dosing (evac is not a doser)",
+      safety_state.is_dosing_disabled() is False)
+
+reset(); _outlet_writes.clear()
+
+
+def raising_set_outlet(token, dev_id, port, powered, dev_type):
+    raise RuntimeError("simulated cloud outage")
+
+
+poller.set_outlet = raising_set_outlet
+sent = poller.enforce_evac_pump(EV_ON, EVDEV, "TOKEN")
+check("a failed evac write reports not-sent", sent is False)
+active, _, _ = runtime_state.high_alert_status()
+check("a failed evac write opens high-alert", active is True)
+poller.set_outlet = fake_set_outlet
+os.environ.pop("EVAC_PUMP", None)
+reset()
+
+
 print("\n== clamp_safety_sleep: the leak debounce bounds the poll cadence ==")
 # 2026-07-31 review P1-6: the sleep is chosen by AI/idle logic that knows nothing
 # about the leak debounce. At POLL_INTERVAL_STABLE=900 with RES_BURST_DEBOUNCE=2 that
@@ -173,7 +274,8 @@ check("ceiling explains itself", note is not None and "armed" in note)
 os.environ["RES_BURST_ENABLED"] = "false"
 os.environ["EVAC_PUMP"] = "Auxiliary Outputs:3"
 s, _ = poller.clamp_safety_sleep(900, leak_snap(0, False))
-check("a configured evac pump arms the ceiling on its own", s == 300)
+check("a configured evac pump arms a ceiling on its own -- the TIGHT one, "
+      "since immediate evac makes poll interval = response time", s == 30)
 os.environ.pop("EVAC_PUMP", None)
 
 os.environ["RES_BURST_ENABLED"] = "true"
@@ -188,6 +290,18 @@ os.environ.pop("LEAK_CONFIRM_POLL_SEC", None)
 
 s, note = poller.clamp_safety_sleep(900, {})
 check("a snapshot with no leak block is handled", s == 300 and "armed" in (note or ""))
+
+# An armed evac pump is the tightest bound -- it fires on the first wet read, so the
+# poll interval IS the response time.
+os.environ["EVAC_PUMP"] = "Auxiliary Outputs:3"
+s, note = poller.clamp_safety_sleep(900, leak_snap(0, False))
+check("an armed evac pump caps the poll at 30s, not 300s", s == 30)
+check("evac ceiling explains itself", "evac pump armed" in (note or ""))
+os.environ["EVAC_POLL_MAX_SEC"] = "15"
+s, _ = poller.clamp_safety_sleep(900, leak_snap(0, False))
+check("EVAC_POLL_MAX_SEC is honored", s == 15)
+os.environ.pop("EVAC_POLL_MAX_SEC", None)
+os.environ.pop("EVAC_PUMP", None)
 if _armed is not None:
     os.environ["RES_BURST_ENABLED"] = _armed
 

@@ -41,8 +41,10 @@ def snap(temp=None, sensor="temp_f_tent", devname="4 x 4"):
 def reset(**env):
     """Clear guardrail state + relevant env, then apply the given overrides."""
     schedule._temp_emergency_active = False
-    for k in ("AIR_TEMP_EMERGENCY_F", "AIR_TEMP_CLEAR_F",
-              "HIGH_TEMP_SENSOR", "ROLE_EXHAUST"):
+    schedule._temp_missing_since = None
+    schedule._temp_sensor_missing_warned = False
+    for k in ("AIR_TEMP_EMERGENCY_F", "AIR_TEMP_CLEAR_F", "HIGH_TEMP_SENSOR",
+              "ROLE_EXHAUST", "HIGH_TEMP_SENSOR_GRACE_MIN"):
         os.environ.pop(k, None)
     for k, v in env.items():
         os.environ[k] = v
@@ -114,6 +116,68 @@ def test_missing_reading():
     check("no-reading block reports temp_f None", em and em["temp_f"] is None)
 
 
+def test_missing_reading_is_bounded():
+    """2026-07-31 review P1-9: holding forever on a dead sensor is not conservative,
+    it is UNCLEARABLE -- clearing needs `temp < clear`, which needs a reading."""
+    import time as _t
+
+    # Inside the grace window the hold stands, but it is marked stale.
+    reset(AIR_TEMP_EMERGENCY_F="95", HIGH_TEMP_SENSOR_GRACE_MIN="15")
+    schedule.compute_temp_emergency(snap(96))            # trip
+    em = schedule.compute_temp_emergency(snap(None))     # sensor drops out
+    check("within grace: guardrail still holds the exhaust", em is not None and em["active"])
+    check("within grace: the hold is flagged stale", em["stale"] is True)
+    check("a live reading is never flagged stale",
+          schedule.compute_temp_emergency(snap(96))["stale"] is False)
+
+    # Past the grace window it releases rather than pinning hardware forever.
+    reset(AIR_TEMP_EMERGENCY_F="95", HIGH_TEMP_SENSOR_GRACE_MIN="15")
+    schedule.compute_temp_emergency(snap(96))            # trip
+    schedule.compute_temp_emergency(snap(None))          # start the missing clock
+    schedule._temp_missing_since = _t.monotonic() - (16 * 60)   # 16 min ago
+    em = schedule.compute_temp_emergency(snap(None))
+    check("past grace: the exhaust pin is RELEASED", em is None)
+    check("past grace: state is inactive (clearable again)",
+          schedule._temp_emergency_active is False)
+
+    # A reading coming back restarts the grace clock rather than carrying it over.
+    reset(AIR_TEMP_EMERGENCY_F="95", HIGH_TEMP_SENSOR_GRACE_MIN="15")
+    schedule.compute_temp_emergency(snap(96))
+    schedule.compute_temp_emergency(snap(None))
+    schedule._temp_missing_since = _t.monotonic() - (14 * 60)
+    schedule.compute_temp_emergency(snap(96))            # sensor returns
+    check("a returning reading clears the missing clock",
+          schedule._temp_missing_since is None)
+    em = schedule.compute_temp_emergency(snap(None))     # drops out again
+    check("the grace restarts from the new dropout", em is not None and em["active"])
+
+    # A still-hot reading must never be released by the grace path.
+    reset(AIR_TEMP_EMERGENCY_F="95", HIGH_TEMP_SENSOR_GRACE_MIN="0")
+    schedule.compute_temp_emergency(snap(96))
+    em = schedule.compute_temp_emergency(snap(120))
+    check("grace never releases a guardrail that can still read HOT",
+          em is not None and em["active"] and em["stale"] is False)
+
+
+def test_config_change_clears_stale_state():
+    """Disabling or breaking the config must not leave a stale 'active' behind for a
+    later re-enable to resume from."""
+    reset(AIR_TEMP_EMERGENCY_F="95")
+    schedule.compute_temp_emergency(snap(96))
+    check("guardrail is active before the config change",
+          schedule._temp_emergency_active is True)
+    os.environ["AIR_TEMP_EMERGENCY_F"] = "0"             # disabled
+    check("disabled -> None", schedule.compute_temp_emergency(snap(96)) is None)
+    check("disabling clears the active flag", schedule._temp_emergency_active is False)
+
+    reset(AIR_TEMP_EMERGENCY_F="95")
+    schedule.compute_temp_emergency(snap(96))
+    os.environ["AIR_TEMP_EMERGENCY_F"] = "ninety-five"   # malformed
+    check("malformed -> None", schedule.compute_temp_emergency(snap(96)) is None)
+    check("malformed config clears the active flag",
+          schedule._temp_emergency_active is False)
+
+
 def test_custom_sensor_key():
     reset(AIR_TEMP_EMERGENCY_F="95", HIGH_TEMP_SENSOR="temp_f_outside")
     check("ignores other sensors", schedule.compute_temp_emergency(snap(120, sensor="temp_f_tent")) is None)
@@ -152,6 +216,11 @@ def test_enforce():
 
     orig = poller.set_port_speed
     poller.set_port_speed = fake_set_port_speed
+    # These cases cover action construction + dispatch. The read-after-write half of
+    # verified_emergency_write is covered in res_burst_test.py; leaving it on here would
+    # make this suite issue real AC Infinity calls.
+    orig_verify = poller.VERIFY_WRITES
+    poller.VERIFY_WRITES = False
     try:
         devices = [{"name": "4 x 4", "dev_id": "DEV1", "type": 20}]
 
@@ -173,19 +242,22 @@ def test_enforce():
         check("enforce: unknown device skipped safely", fired == [] and calls == [])
     finally:
         poller.set_port_speed = orig
+        poller.VERIFY_WRITES = orig_verify
 
 
 # --- poller.enforce_co2_emergency ------------------------------------------- #
 
 def test_enforce_co2():
     import poller
-    import ac_infinity_client as acic
     speed_calls, outlet_calls = [], []
-    orig_s, orig_o = poller.set_port_speed, acic.set_outlet
-    # enforce_co2_emergency uses the module-global set_port_speed but LOCAL-imports
-    # set_outlet from ac_infinity_client, so patch each at its real source.
+    orig_s, orig_o = poller.set_port_speed, poller.set_outlet
+    # Both writes now route through poller's module-level bindings (the old function-local
+    # `from ac_infinity_client import set_outlet` inside enforce_co2_emergency is gone),
+    # so patch both on poller. Verification is covered in res_burst_test.py.
     poller.set_port_speed = lambda t, d, p, s, dt: speed_calls.append((d, p, s, dt))
-    acic.set_outlet = lambda t, d, p, v, dt: outlet_calls.append((d, p, v, dt))
+    poller.set_outlet = lambda t, d, p, v, dt: outlet_calls.append((d, p, v, dt))
+    orig_verify = poller.VERIFY_WRITES
+    poller.VERIFY_WRITES = False
     try:
         devices = [{"name": "4 x 4", "dev_id": "DEV1", "type": 20},
                    {"name": "Auxiliary Outputs", "dev_id": "DEV2", "type": 21}]
@@ -212,7 +284,8 @@ def test_enforce_co2():
         check("enforce_co2: unknown device skipped safely",
               fired == [] and speed_calls == [] and outlet_calls == [])
     finally:
-        poller.set_port_speed, acic.set_outlet = orig_s, orig_o
+        poller.set_port_speed, poller.set_outlet = orig_s, orig_o
+        poller.VERIFY_WRITES = orig_verify
 
 
 # --- compute_co2_emergency (CO2 dump) --------------------------------------- #
@@ -510,6 +583,8 @@ def main():
         test_clears_below_clear,
         test_clear_gap_enforced,
         test_missing_reading,
+        test_missing_reading_is_bounded,
+        test_config_change_clears_stale_state,
         test_custom_sensor_key,
         test_custom_exhaust_role,
         test_independent_of_chem_emergencies,

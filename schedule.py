@@ -303,6 +303,31 @@ _temp_emergency_active: bool = False
 # Throttle the "armed but sensor missing" warning so it logs once per outage, not every
 # cycle. Reset when the watched sensor reading reappears.
 _temp_sensor_missing_warned: bool = False
+# Monotonic timestamp of the first missing reading while the guardrail was ACTIVE, or
+# None. Clearing requires `temp < clear`, which requires a reading -- so without this a
+# sensor that drops out mid-guardrail pinned the exhaust at max FOREVER (2026-07-31
+# review P1-9). Bounds the hold instead of holding on stale data indefinitely.
+_temp_missing_since: float | None = None
+
+
+def _temp_sensor_grace_sec() -> float:
+    """How long the guardrail keeps holding the exhaust after its sensor stops reading.
+    Long enough to ride out a poll blip or brief dropout, short enough that a dead
+    sensor cannot pin hardware indefinitely. Override HIGH_TEMP_SENSOR_GRACE_MIN."""
+    try:
+        return max(0.0, float(os.getenv("HIGH_TEMP_SENSOR_GRACE_MIN", "15")) * 60.0)
+    except ValueError:
+        return 900.0
+
+
+def _reset_temp_emergency_state() -> None:
+    """Drop all guardrail state. Used on the disabled / malformed-config exits so a
+    later re-enable starts from a clean evaluation rather than resuming a stale
+    'active' from a previous configuration."""
+    global _temp_emergency_active, _temp_missing_since, _temp_sensor_missing_warned
+    _temp_emergency_active = False
+    _temp_missing_since = None
+    _temp_sensor_missing_warned = False
 
 
 def _high_temp_sensor_key() -> str:
@@ -351,8 +376,12 @@ def compute_temp_emergency(snapshot: dict) -> dict | None:
     try:
         trigger = float(os.getenv("AIR_TEMP_EMERGENCY_F", "0"))
     except ValueError:
+        # Malformed config must not leave the module holding a stale 'active' that a
+        # later fix would resume from (2026-07-31 review).
+        _reset_temp_emergency_state()
         return None
     if trigger <= 0:
+        _reset_temp_emergency_state()
         return None  # disabled
 
     try:
@@ -362,9 +391,10 @@ def compute_temp_emergency(snapshot: dict) -> dict | None:
     if clear >= trigger:
         clear = trigger - 7  # enforce a real hysteresis gap
 
-    global _temp_sensor_missing_warned
+    global _temp_sensor_missing_warned, _temp_missing_since
     key  = _high_temp_sensor_key()
     temp = _read_named_temp(snapshot, key)
+    stale_hold = False
     if temp is None:
         # The guardrail is armed (trigger>0) but its watched sensor is absent from the
         # snapshot -- a config drift (renamed sensor / wrong HIGH_TEMP_SENSOR) silently
@@ -374,12 +404,34 @@ def compute_temp_emergency(snapshot: dict) -> dict | None:
                   f"snapshot -- the {trigger:g}F net is INACTIVE until it reads. "
                   f"Check HIGH_TEMP_SENSOR.")
             _temp_sensor_missing_warned = True
-        # No reading -> cannot evaluate safely. Leave prior state alone; if a
-        # previous cycle entered the guardrail, the exhaust ramp still gets issued.
         if not _temp_emergency_active:
             return None
+        # ACTIVE with no reading. Clearing requires `temp < clear`, so holding forever
+        # is not a conservative choice -- it is an UNCLEARABLE one: the exhaust stays
+        # pinned at max on stale data with no path back, fighting every other
+        # controller, until someone restarts the poller. Hold through a bounded grace
+        # (a dropout is usually transient and cooling is cheap), then release with a
+        # loud alert every cycle -- an operator can act on a released-and-shouting
+        # guardrail; they cannot act on a silently stuck fan.
+        now_mono = time.monotonic()
+        if _temp_missing_since is None:
+            _temp_missing_since = now_mono
+        missing_for = now_mono - _temp_missing_since
+        grace = _temp_sensor_grace_sec()
+        if missing_for > grace:
+            print(f"  [!!! GUARDRAIL RELEASED !!!] high-temp guardrail held "
+                  f"{missing_for / 60:.0f} min with no '{key}' reading (grace "
+                  f"{grace / 60:.0f} min) -- releasing the exhaust pin. The {trigger:g}F "
+                  f"net is now INACTIVE and the tent is UNPROTECTED. Fix the sensor.")
+            _temp_emergency_active = False
+            _temp_missing_since = None
+            return None
+        stale_hold = True
+        print(f"  [WARN] high-temp guardrail HOLDING exhaust on a stale reading -- "
+              f"'{key}' missing for {missing_for / 60:.1f} of {grace / 60:.0f} min grace")
     else:
         _temp_sensor_missing_warned = False
+        _temp_missing_since = None
         if temp >= trigger:
             _temp_emergency_active = True
         elif temp < clear:
@@ -404,6 +456,10 @@ def compute_temp_emergency(snapshot: dict) -> dict | None:
         "sensor":  key,
         "trigger": trigger,
         "clear":   clear,
+        # True while holding on a MISSING reading inside the grace window -- the block
+        # is still active, but nothing has confirmed the tent is hot since `temp_f`
+        # went None. Consumers should surface this rather than treat it as a live read.
+        "stale":   stale_hold,
         "actions": actions,
     }
 

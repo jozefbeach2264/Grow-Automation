@@ -25,6 +25,7 @@ from ac_infinity_client import (
     set_port_speed,
     stop_and_verify,
     verify_port_state,
+    ramp_seconds,
 )
 from utils import name_slug
 import proc_lock
@@ -172,6 +173,77 @@ def poll_once(token: str, debug: bool = False) -> list[dict]:
     return [parse_device(r) for r in raw_devices]
 
 
+def verified_emergency_write(a: dict, dev: dict, token: str, tag: str,
+                             unverified_note: str = "") -> bool:
+    """Issue ONE deterministic emergency action and confirm the port physically
+    reached the commanded state. Returns True if the write went out.
+
+    A 200 only proves the API accepted the write -- `ac_infinity_client.verify_port_state`
+    exists precisely because of that gap, and `ai_advisor.execute_actions` has always
+    used it. The deterministic emergency paths did not: the CO2 dump, the high-temp
+    guardrail and the evac pump all treated a non-raising call as actuation and printed
+    success. Those are the paths that run when something has ALREADY gone wrong, so a
+    silently-dropped write is exactly where it costs most (2026-07-31 review P1-5).
+
+    Failure is loud + a high-alert window, never a dosing freeze: these are CLIMATE
+    actions, and a fan that will not ramp is no reason to lock out chemistry."""
+    device, port, act, val = a["device"], a["port"], a["action"], a.get("value")
+    try:
+        if act == "set_outlet":
+            set_outlet(token, dev["dev_id"], port, bool(val), dev["type"])
+        elif act == "set_speed":
+            set_port_speed(token, dev["dev_id"], port, int(val), dev["type"])
+        else:
+            print(f"  [{tag}] Unknown action '{act}' on {device} port {port} -- skipping")
+            return False
+    except Exception as e:
+        print(f"  [!!! {tag} FAILED !!!] {device} port {port}: {e}")
+        runtime_state.record_event("emergency_write_failed", tag=tag, device=device,
+                                   port=port, action=act, value=val, error=str(e))
+        runtime_state.start_high_alert(f"{tag} write failed on {device} port {port}")
+        return False
+    print(f"  [{tag}] {device} port {port} -> {act}={val}  ({a.get('reason')})")
+
+    if not VERIFY_WRITES or token == "SIM":
+        return True
+    if act == "set_outlet":
+        expected, timeout = {"powered": bool(val)}, 15.0
+    else:
+        # tolerance 1: these are climate ports mid-ramp, matching execute_actions.
+        expected = {"speed_actual": int(val), "tolerance": 1}
+        timeout = ramp_seconds(int(val), 10) + 10.0
+
+    for attempt in (1, 2):
+        try:
+            res = verify_port_state(token, dev["dev_id"], port, expected,
+                                    timeout_sec=timeout)
+        except Exception as e:
+            print(f"  [{tag}] verify error on {device} port {port}: {e}")
+            break
+        if res.get("ok"):
+            print(f"  [{tag}] verified {device} port {port} {act}={val} "
+                  f"({res.get('elapsed_sec')}s)")
+            return True
+        if attempt == 1:
+            print(f"  [{tag}] not confirmed (observed {res.get('observed')}) -- re-issuing")
+            try:
+                if act == "set_outlet":
+                    set_outlet(token, dev["dev_id"], port, bool(val), dev["type"])
+                else:
+                    set_port_speed(token, dev["dev_id"], port, int(val), dev["type"])
+            except Exception as e:
+                print(f"  [{tag}] re-issue failed: {e}")
+                break
+    note = f" -- {unverified_note}" if unverified_note else ""
+    print(f"  [!!! {tag} UNVERIFIED !!!] {device} port {port} would not confirm "
+          f"{act}={val}{note}")
+    runtime_state.record_event("emergency_write_unverified", tag=tag, device=device,
+                               port=port, action=act, value=val)
+    runtime_state.start_high_alert(
+        f"{tag} {device} port {port} would not confirm {act}={val}")
+    return True
+
+
 def enforce_co2_emergency(snapshot: dict, devices: list, token: str) -> list:
     """
     Fire the CO2 emergency dump actions deterministically. Highest priority --
@@ -191,22 +263,9 @@ def enforce_co2_emergency(snapshot: dict, devices: list, token: str) -> list:
         if not dev:
             print(f"  [CO2-EM] Unknown device '{a['device']}' -- cannot enforce")
             continue
-        try:
-            if a["action"] == "set_outlet":
-                from ac_infinity_client import set_outlet
-                set_outlet(token, dev["dev_id"], a["port"], bool(a["value"]),
-                           dev["type"])
-            elif a["action"] == "set_speed":
-                set_port_speed(token, dev["dev_id"], a["port"],
-                               int(a["value"]), dev["type"])
-            else:
-                print(f"  [CO2-EM] Unknown action '{a['action']}' -- skipping")
-                continue
-            print(f"  [CO2-EM] {a['device']} port {a['port']} -> "
-                  f"{a['action']}={a['value']}  ({a['reason']})")
+        if verified_emergency_write(a, dev, token, "CO2-EM",
+                                    "CO2 may still be climbing"):
             fired.append(a)
-        except Exception as e:
-            print(f"  [CO2-EM] FAILED {a['device']} port {a['port']}: {e}")
     return fired
 
 
@@ -230,13 +289,9 @@ def enforce_temp_emergency(snapshot: dict, devices: list, token: str) -> list:
         if not dev:
             print(f"  [TEMP-EM] Unknown device '{a['device']}' -- cannot enforce")
             continue
-        try:
-            set_port_speed(token, dev["dev_id"], a["port"], int(a["value"]), dev["type"])
-            print(f"  [TEMP-EM] {a['device']} port {a['port']} -> "
-                  f"{a['action']}={a['value']}  ({a['reason']})")
+        if verified_emergency_write(a, dev, token, "TEMP-EM",
+                                    "the tent is NOT being cooled"):
             fired.append(a)
-        except Exception as e:
-            print(f"  [TEMP-EM] FAILED {a['device']} port {a['port']}: {e}")
     return fired
 
 
@@ -349,46 +404,8 @@ def enforce_evac_pump(ev: dict, dev: dict, token: str) -> bool:
 
     Deliberately does NOT freeze dosing: the evac pump is not a doser, and a pump that
     won't start is a reason to look at the tent, not to lock out chemistry."""
-    device, port, want = ev["device"], ev["port"], bool(ev["value"])
-    try:
-        set_outlet(token, dev["dev_id"], port, want, dev["type"])
-    except Exception as e:
-        print(f"  [!!! EVAC FAILED !!!] {device} port {port} write error: {e}")
-        runtime_state.record_event("evac_pump_write_failed", device=device, port=port,
-                                   desired_on=want, error=str(e))
-        runtime_state.start_high_alert(f"evac pump write failed on {device} port {port}")
-        return False
-    print(f"  [EVAC] {device} port {port} -> set_outlet={want}  ({ev['reason']})")
-
-    if not VERIFY_WRITES or token == "SIM":
-        return True
-    ok = False
-    for attempt in (1, 2):
-        try:
-            res = verify_port_state(token, dev["dev_id"], port, {"powered": want})
-        except Exception as e:
-            print(f"  [EVAC] verify error on {device} port {port}: {e}")
-            break
-        if res.get("ok"):
-            ok = True
-            print(f"  [EVAC] verified {device} port {port} powered={want} "
-                  f"({res.get('elapsed_sec')}s)")
-            break
-        if attempt == 1:
-            print(f"  [EVAC] not confirmed (observed {res.get('observed')}) -- re-issuing")
-            try:
-                set_outlet(token, dev["dev_id"], port, want, dev["type"])
-            except Exception as e:
-                print(f"  [EVAC] re-issue failed: {e}")
-                break
-    if not ok:
-        print(f"  [!!! EVAC UNVERIFIED !!!] {device} port {port} would not confirm "
-              f"powered={want} -- water may be UNATTENDED; check the pump")
-        runtime_state.record_event("evac_pump_unverified", device=device, port=port,
-                                   desired_on=want)
-        runtime_state.start_high_alert(
-            f"evac pump {device} port {port} would not confirm powered={want}")
-    return True
+    return verified_emergency_write(ev, dev, token, "EVAC",
+                                    "water may be UNATTENDED; check the pump")
 
 
 def _evac_poll_max_sec() -> int:
@@ -585,23 +602,38 @@ def recover_on_startup(token: str) -> None:
         runtime_state.record_event("estimated_overdose_window",
                                    device=ad.get("device"), port=ad.get("port"), **est)
 
-    # Poll and stop any running chemical pump.
-    try:
-        devices = poll_once(token)
-    except Exception as e:
-        print(f"  [RECOVERY] could not poll for recovery scan: {e} -- main loop will retry")
-        return
-    fired = doser_watchdog(devices, token, startup=True)
-
     # If the previous run died mid-dose we cannot prove what happened during the gap,
-    # so freeze + high-alert even if nothing is currently running.
-    if not ADVISORY_MODE and not diag["clean"] and diag["had_active_dose"] and not fired:
+    # so freeze + high-alert. This runs BEFORE the recovery poll, deliberately: the poll
+    # can fail on any transient blip, recovery runs exactly ONCE per process (the main
+    # loop never calls this again), and the freeze used to sit after the poll behind an
+    # early `return`. One dropped packet therefore skipped the crash freeze for the
+    # entire run, leaving dosing ENABLED after an unexplained mid-dose death -- the exact
+    # situation the freeze exists for. Deciding it from persisted state only, before any
+    # IO, makes it unskippable (2026-07-31 review P1-7).
+    crashed_mid_dose = (not diag["clean"]) and diag["had_active_dose"]
+    if crashed_mid_dose and not ADVISORY_MODE:
         try:
             from safety_state import disable_dosing
             disable_dosing("crash recovery -- dose state unknown across restart")
         except Exception as e:
             print(f"  [RECOVERY] could not persist dosing freeze: {e}")
         runtime_state.start_high_alert("crash recovery -- interrupted dose, reservoir unverified")
+
+    # Poll and stop any running chemical pump.
+    try:
+        devices = poll_once(token)
+    except Exception as e:
+        # The freeze above already stands. The per-cycle doser_watchdog in the main loop
+        # is the backstop for an orphan pump; what CANNOT be deferred is the freeze, and
+        # it is already done. Leave the active-dose record in place so it is still
+        # visible to the next start.
+        print(f"  [RECOVERY] could not poll for the recovery scan: {e} -- orphan-pump "
+              "check deferred to the per-cycle watchdog"
+              + ("; dosing is FROZEN" if crashed_mid_dose and not ADVISORY_MODE else ""))
+        runtime_state.record_event("recovery_scan_incomplete", error=str(e),
+                                   crashed_mid_dose=crashed_mid_dose)
+        return
+    fired = doser_watchdog(devices, token, startup=True)
 
     if ad:  # the record has now been handled; clear it so it can't re-trigger
         runtime_state.mark_active_dose_stopped(verified=bool(fired), recovered=True)

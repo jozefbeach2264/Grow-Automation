@@ -212,7 +212,7 @@ sent = poller.enforce_evac_pump(EV_ON, EVDEV, "TOKEN")
 check("an unconfirmed evac re-issues the write", len(_outlet_writes) == 2)
 active, _, reason = runtime_state.high_alert_status()
 check("an unconfirmed evac opens high-alert", active is True)
-check("high-alert names the evac pump", "evac" in (reason or ""))
+check("high-alert names the evac pump", "evac" in (reason or "").lower())
 check("but does NOT freeze dosing (evac is not a doser)",
       safety_state.is_dosing_disabled() is False)
 

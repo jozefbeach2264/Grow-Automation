@@ -396,6 +396,76 @@ check("malformed pair map falls back to the scalar (21 mL)",
 
 
 # =========================================================================== #
+# recover_on_startup -- 2026-07-31 review P1-7. The crash freeze must not be
+# skippable by one transient poll failure: recovery runs exactly ONCE per process,
+# so an early return used to skip it for the whole run.
+# =========================================================================== #
+print("\n== recover_on_startup: the crash freeze survives a failed recovery poll ==")
+
+
+def _crashed_mid_dose_state():
+    """Leave behind exactly what a crash mid-dose leaves: an unclean heartbeat plus a
+    pump_running active-dose record."""
+    reset_state()
+    runtime_state.write_heartbeat("dosing")          # NOT 'shutdown' -> unclean
+    runtime_state.begin_active_dose({
+        "device": "RDWC Control", "dev_id": "d-rdwc", "port": 3, "speed": 1,
+        "target_ml": 0.5, "started_wall_ts": time.time() - 30,
+        "planned_stop_wall_ts": time.time() - 25,
+    })
+
+
+_orig_poll_once = poller.poll_once
+
+
+def _poll_raises(token, debug=False):
+    raise RuntimeError("simulated transient poll failure")
+
+
+_crashed_mid_dose_state()
+d = runtime_state.diagnose_restart()
+check("harness really models a crash mid-dose",
+      d["clean"] is False and d["had_active_dose"] is True)
+
+poller.poll_once = _poll_raises
+try:
+    poller.recover_on_startup("SIM")
+finally:
+    poller.poll_once = _orig_poll_once
+check("a failed recovery poll still FREEZES dosing after a mid-dose crash",
+      safety_state.is_dosing_disabled() is True)
+active, _, _ = runtime_state.high_alert_status()
+check("a failed recovery poll still opens high-alert", active is True)
+check("the active-dose record is kept for the next start (not silently cleared)",
+      runtime_state.get_active_dose() is not None)
+check("incomplete recovery is recorded in the event log",
+      "recovery_scan_incomplete" in runtime_state._EVENT_LOG.read_text())
+
+# A clean previous shutdown must NOT freeze just because the poll failed.
+reset_state()
+runtime_state.write_heartbeat("shutdown")
+poller.poll_once = _poll_raises
+try:
+    poller.recover_on_startup("SIM")
+finally:
+    poller.poll_once = _orig_poll_once
+check("a clean restart does not freeze on a failed poll",
+      safety_state.is_dosing_disabled() is False)
+
+# Normal path: poll succeeds, nothing running -> still freezes after a mid-dose crash.
+_crashed_mid_dose_state()
+poller.poll_once = lambda token, debug=False: [dev_with_doser()]
+try:
+    poller.recover_on_startup("SIM")
+finally:
+    poller.poll_once = _orig_poll_once
+check("successful recovery scan still freezes after a mid-dose crash",
+      safety_state.is_dosing_disabled() is True)
+check("successful recovery clears the handled active-dose record",
+      runtime_state.get_active_dose() is None)
+
+
+# =========================================================================== #
 print(f"\n{'='*48}")
 print(f"  {_PASS} passed, {_FAIL} failed")
 print(f"{'='*48}")

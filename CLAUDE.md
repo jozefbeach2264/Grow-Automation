@@ -51,8 +51,17 @@ until < `AIR_TEMP_CLEAR_F` (88, hysteresis). Attached to the snapshot as `temp_e
 actuated pre-AI + re-checked post-AI by `poller.enforce_temp_emergency` (detect-always /
 actuate-in-LIVE, same contract as the CO2 dump). CLIMATE-ONLY: never touches chemicals or the CO2
 valve, so it runs independently of the reservoir/CO2 emergencies. The AI is told (system prompt)
-not to fight an active guardrail. Tests: `schedule_test.py` (29 cases). AIR_TEMP_MAX=85 is just a
+not to fight an active guardrail. Tests: `schedule_test.py` (77 cases). AIR_TEMP_MAX=85 is just a
 soft target band, not the cutoff -- the guardrail's 95F is the hard one.
+**Sensor dropout is BOUNDED (2026-07-31 review P1-9).** Clearing requires `temp < clear`,
+which requires a reading -- so a sensor that vanished while the guardrail was ACTIVE used to
+pin the exhaust at max forever with one warning, unclearable short of a restart. It now holds
+through `HIGH_TEMP_SENSOR_GRACE_MIN` (default 15) with the block flagged `stale: true`, then
+RELEASES the pin with a `[!!! GUARDRAIL RELEASED !!!]` alert -- an operator can act on a
+released-and-shouting guardrail, not on a silently stuck fan. A returning reading restarts
+the grace clock; a still-hot reading is never released by this path. Disabling or malforming
+`AIR_TEMP_EMERGENCY_F` also clears the module state, so a later re-enable re-evaluates
+instead of resuming a stale `active`.
 
 **Device display order** (controlled by `DISPLAY_ORDER_<SLUG>` in `labels.env`):
 1. "4 x 4" — tent climate/lighting
@@ -95,7 +104,7 @@ Ports 3+4 are pH ports via `PH_PORTS_HYDROPONICS_CONTROL=3,4` — safety gate ap
 | `runtime_state.py` | Heartbeat, active-dose record, high-alert window, event log -- crash recovery |
 | `dosing.py` | Timed dosing with forced stop (#7) -- bounded doses, ramp math, playbooks |
 | `schedule.py` | Schedule-driven expected states (light fade, osc fans) + deterministic emergencies: CO2 dump, CO2 pulse, high-temp exhaust guardrail |
-| `schedule_test.py` | Self-tests for the high-temp exhaust guardrail (29 cases, mocked snapshots) |
+| `schedule_test.py` | Self-tests for the schedule + high-temp exhaust guardrail (77 cases, mocked snapshots) |
 | `event_log.py` | Structured cycle + action-lifecycle ledger over `events.jsonl` (cycle_id/action_id threading, `recent_actions()`) |
 | `event_log_test.py` | Self-tests for the event ledger (40 cases, temp JSONL) |
 | `diagnostics.py` | Deterministic stressor list + code-owned playbook registry (away-mode triage foundation; READ-ONLY, no actuation) |
@@ -389,6 +398,18 @@ API call. Rules (all thresholds configurable in `.env`):
 
 ---
 
+### Deterministic emergency writes are verified too (`poller.verified_emergency_write`)
+
+2026-07-31 review P1-5. The CO2 dump, the high-temp guardrail and the evac pump each
+issued a write and treated a non-raising call as actuation — contradicting the whole
+premise of `verify_port_state`. These are the paths that run when something has ALREADY
+gone wrong, so a silently-dropped write costs most there. All three now route through one
+helper that writes, reads back, re-issues once, and on failure raises a
+`[!!! <TAG> UNVERIFIED !!!]` line plus a high-alert window. It never freezes dosing —
+these are climate actions, and a fan that will not ramp is no reason to lock out
+chemistry. (`enforce_res_burst` already verified its doser stops via
+`_verified_doser_stop`, which also carries the BLE fallback.)
+
 ## Read-after-write verification (`VERIFY_WRITES`)
 
 A 200 from the AC Infinity API only proves the write was *accepted*, not that the port
@@ -564,9 +585,14 @@ with the wall clock -- NTP can jump it).
   time, last poll/api/readback ok. Written each cycle by `poller.heartbeat()`. Clean exit
   writes phase `shutdown`; any other phase on next start = unclean. `HEARTBEAT_ENABLED`.
 - **Startup recovery** (`poller.recover_on_startup`, runs before AI/polling): diagnoses the
-  last run (`diagnose_restart`), estimates an interrupted dose, stops any running chemical
-  pump, then freezes dosing + opens high-alert. Crash mid-dose with nothing currently
-  running still freezes (the gap is unknowable).
+  last run (`diagnose_restart`), estimates an interrupted dose, **freezes dosing + opens
+  high-alert on a mid-dose crash BEFORE polling**, then polls and stops any running
+  chemical pump. Crash mid-dose with nothing currently running still freezes (the gap is
+  unknowable). The freeze is decided from persisted state only, before any IO, because
+  recovery runs exactly ONCE per process — it used to sit after the poll behind an early
+  `return`, so one transient poll failure skipped the crash freeze for the whole run
+  (2026-07-31 review P1-7). A failed recovery poll now only defers the orphan-pump scan,
+  which the per-cycle `doser_watchdog` backstops, and logs `recovery_scan_incomplete`.
 - **Nonzero-doser watchdog** (`poller.doser_watchdog`, every cycle): a doser/pH port
   running outside an active-dose window is an orphan -> stop + verify + retry + freeze +
   high-alert. Detect-always / actuate-in-LIVE (same contract as res-burst).
